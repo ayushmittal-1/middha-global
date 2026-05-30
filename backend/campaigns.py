@@ -89,6 +89,15 @@ def get_campaigns_summary() -> str:
     return _campaigns_summary
 
 
+def search_campaigns(query: str) -> str:
+    """Search campaigns by name (case-insensitive). Returns matching campaigns."""
+    query_lower = query.lower()
+    matches = [c for c in _campaigns if query_lower in (c.get("campaignName", "")).lower()]
+    if not matches:
+        return f"No campaigns found matching '{query}'."
+    return f"Found {len(matches)} campaign(s) matching '{query}':\n" + _build_summary(matches)
+
+
 def analyze_performance() -> str:
     """Analyze campaign performance: ACOS, top/bottom performers, recommendations."""
     if not _campaigns:
@@ -155,6 +164,14 @@ def analyze_performance() -> str:
     }
 
     # Generate recommendations
+    if enabled == 0 and len(_campaigns) > 0:
+        analysis["recommendations"].append(
+            f"All {len(_campaigns)} campaigns are paused or archived — no active campaigns running. Consider enabling high-potential campaigns."
+        )
+    if paused > 0:
+        analysis["recommendations"].append(
+            f"{paused} campaign(s) are paused — review and enable ones with good historical performance."
+        )
     if underperformers:
         high_spend_losers = [u for u in underperformers if u["acos"] == "N/A (no sales)"]
         if high_spend_losers:
@@ -173,6 +190,10 @@ def analyze_performance() -> str:
     if overall_acos > 30:
         analysis["recommendations"].append(
             f"Overall ACOS is {round(overall_acos, 1)}% — above healthy threshold. Review underperformers."
+        )
+    if total_spend == 0 and len(_campaigns) > 0:
+        analysis["recommendations"].append(
+            "No spend recorded across any campaign — campaigns may need to be enabled and given budget to start generating data."
         )
 
     return _json.dumps(analysis)
