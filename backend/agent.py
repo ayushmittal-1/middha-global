@@ -1,22 +1,18 @@
 import inspect
 import json
 import os
-from collections import defaultdict
 from collections.abc import AsyncGenerator
 
 from groq import AsyncGroq
 
 from campaigns import get_campaigns_summary, create_campaign, analyze_performance
 from keywords import fetch_amazon_keywords, suggest_negative_keywords
+from database import create_session, get_messages, save_message, update_session_title
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MODEL = "llama-3.3-70b-versatile"
 
 client = AsyncGroq(api_key=GROQ_API_KEY)
-
-# ── In-memory conversation store (keyed by session_id) ──────────────────────
-_sessions: dict[str, list[dict]] = defaultdict(list)
-MAX_HISTORY = 40  # keep last N messages per session to avoid token overflow
 
 SYSTEM_PROMPT = (
     "You are a campaign analyst and creation assistant for Amazon advertising. "
@@ -175,22 +171,25 @@ async def _call_tool(fn, args: dict) -> str:
     return result if isinstance(result, str) else json.dumps(result)
 
 
-def _trim_history(history: list[dict]) -> list[dict]:
-    """Keep only the last MAX_HISTORY messages to stay within token limits."""
-    if len(history) > MAX_HISTORY:
-        return history[-MAX_HISTORY:]
-    return history
-
-
 # ── Main streaming entry point ──────────────────────────────────────────────
 
 async def stream_response(user_message: str, *, session_id: str = "default") -> AsyncGenerator[str, None]:
     """Stream a response, maintaining conversation history per session."""
-    history = _sessions[session_id]
+    # Ensure session exists in DB; auto-title from first user message
+    await create_session(session_id)
+    history = await get_messages(session_id)
+
+    # Auto-set title from first user message (if this is the first message)
+    if not history:
+        title = user_message[:50].strip()
+        await update_session_title(session_id, title)
+
+    # Save the incoming user message
+    await save_message(session_id, "user", user_message)
     history.append({"role": "user", "content": user_message})
 
-    # Build messages: system + trimmed history
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + _trim_history(history)
+    # Build messages: system + history
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
     # First call — the LLM may decide to call a tool
     response = await client.chat.completions.create(
@@ -217,7 +216,7 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
                 for tc in choice.message.tool_calls
             ],
         }
-        history.append(assistant_msg)
+        await save_message(session_id, "tool_call", json.dumps(assistant_msg))
         messages.append(assistant_msg)
 
         for tool_call in choice.message.tool_calls:
@@ -233,7 +232,7 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
                 "tool_call_id": tool_call.id,
                 "content": result,
             }
-            history.append(tool_msg)
+            await save_message(session_id, "tool", json.dumps(tool_msg))
             messages.append(tool_msg)
 
         # Second call — stream the final answer with tool results
@@ -254,10 +253,10 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
                 yield delta.content
 
         # Persist assistant reply
-        history.append({"role": "assistant", "content": "".join(full_reply)})
+        await save_message(session_id, "assistant", "".join(full_reply))
     else:
         # No tool call — just return the content directly
         content = choice.message.content or ""
         if content:
             yield content
-        history.append({"role": "assistant", "content": content})
+        await save_message(session_id, "assistant", content)

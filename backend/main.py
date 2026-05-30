@@ -1,4 +1,5 @@
 import json
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -12,11 +13,14 @@ from fastapi.staticfiles import StaticFiles
 
 from campaigns import fetch_all_campaigns
 from agent import stream_response
+from database import init_db, create_session, list_sessions, get_messages, delete_session
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: fetch and cache campaigns
+    # Startup: init DB and fetch campaigns
+    await init_db()
+    print("Database initialized.")
     print("Fetching campaigns from Aurora API...")
     try:
         await fetch_all_campaigns()
@@ -52,6 +56,34 @@ async def chat(request: Request):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ── Session endpoints ──────────────────────────────────────────────────────
+
+@app.post("/sessions")
+async def create_new_session():
+    session_id = str(uuid.uuid4())
+    await create_session(session_id)
+    return {"session_id": session_id}
+
+
+@app.get("/sessions")
+async def get_sessions():
+    sessions = await list_sessions()
+    return sessions
+
+
+@app.get("/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str):
+    messages = await get_messages(session_id)
+    # Filter to only user/assistant messages for the frontend
+    return [m for m in messages if m.get("role") in ("user", "assistant")]
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session_endpoint(session_id: str):
+    await delete_session(session_id)
+    return {"ok": True}
 
 
 # Serve frontend static files
