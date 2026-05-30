@@ -97,7 +97,7 @@ async def delete_session_endpoint(session_id: str):
 # ── Amazon OAuth endpoints ─────────────────────────────────────────────────
 
 AMAZON_AUTH_URL = "https://www.amazon.com/ap/oa"
-DEFAULT_REDIRECT_URI = "https://1778-2409-4085-d9b-87dc-d096-ac8c-8146-8952.ngrok-free.app/callback"
+DEFAULT_REDIRECT_URI = "https://powdered-tragedy-crafty.ngrok-free.dev/api/auth/amazon/ads-callback"
 
 
 @app.get("/amazon/login")
@@ -106,17 +106,43 @@ async def amazon_login(redirect_uri: str | None = None):
     ru = redirect_uri or DEFAULT_REDIRECT_URI
     params = urlencode({
         "client_id": os.getenv("AMAZON_LWA_CLIENT_ID", ""),
-        "scope": "profile:user_id",
+        # advertising::campaign_management is required to create/manage campaigns
+        # via the Amazon Ads API. profile:user_id alone returns 401/403 on Ads calls.
+        "scope": "advertising::campaign_management",
         "response_type": "code",
         "redirect_uri": ru,
     })
+    print(f"[amazon_login] Redirecting to Amazon OAuth consent page with params: {params}")
     return RedirectResponse(f"{AMAZON_AUTH_URL}?{params}")
 
 
 @app.get("/callback")
-async def oauth_callback(code: str, request: Request):
-    """Handle Amazon OAuth callback — exchange code for refresh token."""
-    redirect_uri = str(request.url).split("?")[0]  # reconstruct clean callback URL
+@app.get("/api/auth/amazon/ads-callback")
+async def oauth_callback(
+    request: Request,
+    code: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+):
+    """Handle Amazon OAuth callback — exchange code for refresh token.
+
+    Registered under both our own /callback and Aurora's
+    /api/auth/amazon/ads-callback path so either Allowed Return URL works.
+    """
+    # Amazon redirects here with ?error=... when consent fails or is declined.
+    if error or not code:
+        detail = error_description or error or "No authorization code was provided."
+        print(f"[oauth_callback] no code. error={error!r} description={error_description!r}")
+        return HTMLResponse(
+            f"<h2>OAuth Error</h2><p>{detail}</p>"
+            "<p>Start the flow again from <code>/amazon/login</code>.</p>",
+            status_code=400,
+        )
+
+    # Reconstruct the exact redirect URI used during authorization. Force https
+    # because behind ngrok the request scheme is often http, and Amazon requires
+    # the redirect_uri in the token exchange to match the one used at consent.
+    redirect_uri = f"https://{request.url.netloc}{request.url.path}"
     try:
         tokens = await exchange_auth_code(code, redirect_uri)
     except Exception as e:

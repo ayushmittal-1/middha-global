@@ -22,14 +22,15 @@ SYSTEM_PROMPT = (
     "- **get_keywords**: Fetch keyword suggestions from Amazon Autocomplete for a seed keyword.\n"
     "- **get_negative_keywords**: Get negative keyword suggestions to exclude wasteful/irrelevant terms from a campaign.\n"
     "- **analyze_campaign_performance**: Analyze campaign health — ACOS, ROI, and actionable recommendations.\n"
-    "- **create_campaign**: Create a campaign (only after user approves keywords & details).\n\n"
+    "- **create_campaign**: Create a campaign with a product ad (only after user approves keywords, ASIN/SKU & details).\n\n"
     "## Campaign creation flow (STRICT — follow every step)\n"
     "1. Ask about the product or seed keyword.\n"
     "2. Call get_keywords to fetch suggestions.\n"
     "3. **ALWAYS list the fetched keywords in your response** so the user can see them. Never skip this step.\n"
     "4. Ask the user which keywords to keep and whether to fetch negative keywords.\n"
     "5. Collect campaign details (name, type, budget, country) if not already provided.\n"
-    "6. **NEVER call create_campaign until the user explicitly approves the keywords and details.**\n\n"
+    "6. **ALWAYS ask the user for the product's seller SKU (merchant SKU).** This is a SELLER account, so the product ad MUST use the SKU — an ASIN will be rejected. A campaign cannot serve ads without a product ad, so you MUST collect the SKU before creating. Explain this if the user is unsure.\n"
+    "7. **NEVER call create_campaign until the user explicitly approves the keywords, the SKU, and the campaign details.** When you call create_campaign, pass the approved sku (not asin).\n\n"
     "## Performance analysis\n"
     "When users ask about campaign performance, health, or what to optimize, call analyze_campaign_performance.\n\n"
     "Be concise and actionable."
@@ -130,6 +131,14 @@ TOOLS = [
                         "items": {"type": "string"},
                         "description": "Optional list of negative keywords to exclude from the campaign.",
                     },
+                    "sku": {
+                        "type": "string",
+                        "description": "Seller/merchant SKU of the product to advertise. REQUIRED for seller accounts (Sponsored Products product ads on seller accounts must use the SKU). This is what makes the campaign actually serve.",
+                    },
+                    "asin": {
+                        "type": "string",
+                        "description": "ASIN of the product (e.g. 'B08XXXXXXX'). Only valid for VENDOR accounts. Seller accounts must use sku instead.",
+                    },
                 },
                 "required": ["campaign_name", "campaign_type", "budget", "country", "keywords"],
             },
@@ -161,6 +170,8 @@ async def _create_campaign(
     country: str,
     keywords: list[str],
     negative_keywords: list[str] | None = None,
+    sku: str | None = None,
+    asin: str | None = None,
 ) -> str:
     return await create_campaign({
         "campaign_name": campaign_name,
@@ -169,6 +180,8 @@ async def _create_campaign(
         "country": country,
         "keywords": keywords,
         "negative_keywords": negative_keywords or [],
+        "sku": sku,
+        "asin": asin,
     })
 
 
@@ -259,8 +272,11 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
                 if fn:
                     try:
                         args = json.loads(tool_call.function.arguments or "{}") or {}
+                        print(f"[agent] tool call: {fn_name} args={args}")
                         result = await _call_tool(fn, args)
+                        print(f"[agent] tool done: {fn_name} -> {str(result)[:200]}")
                     except Exception as e:
+                        print(f"[agent] tool error: {fn_name} -> {e}")
                         result = f"Tool error: {e}"
                 else:
                     result = "Unknown tool"

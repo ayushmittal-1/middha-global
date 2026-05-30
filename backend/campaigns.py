@@ -199,12 +199,38 @@ def analyze_performance() -> str:
     return _json.dumps(analysis)
 
 
+def _extract_id(resp: dict, section_key: str, id_field: str) -> str:
+    """Pull a created resource id out of an SP v3 batch-create response.
+
+    SP v3 returns either {"<section>": {"success": [...], "error": [...]}} or, in
+    some cases, a plain list. Handle both and surface API errors.
+    """
+    section = resp.get(section_key)
+
+    if isinstance(section, dict):
+        success = section.get("success", [])
+        if success:
+            return str(success[0].get(id_field, ""))
+        errors = section.get("error", [])
+        if errors:
+            raise RuntimeError(f"{section_key} creation failed: {errors}")
+    elif isinstance(section, list) and section:
+        return str(section[0].get(id_field, ""))
+
+    return ""
+
+
 async def create_campaign(payload: dict) -> str:
-    """Create a real Sponsored Products campaign via Amazon Ads API."""
+    """Create a real Sponsored Products campaign via Amazon Ads API.
+
+    Flow: campaign -> ad group -> product ad (SKU/ASIN) -> keywords -> negatives.
+    The product ad is required for the campaign to actually serve impressions.
+    """
     from datetime import datetime
     from amazon_ads import (
         create_sp_campaign,
         create_ad_group,
+        create_product_ad,
         add_keywords,
         add_negative_keywords,
     )
@@ -213,34 +239,76 @@ async def create_campaign(payload: dict) -> str:
     budget = float(payload.get("budget", 10))
     keywords = payload.get("keywords", [])
     negative_kws = payload.get("negative_keywords", [])
-    start_date = datetime.utcnow().strftime("%Y%m%d")
+    sku = payload.get("sku") or None
+    asin = payload.get("asin") or None
+    start_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+    print(
+        f"[create_campaign] START name={name!r} budget={budget} "
+        f"keywords={len(keywords)} negatives={len(negative_kws)} "
+        f"sku={sku!r} asin={asin!r}"
+    )
 
     try:
         # 1. Create campaign
+        print(f"[create_campaign] -> creating SP campaign {name!r}...")
         camp_resp = await create_sp_campaign(name, budget, start_date)
-        campaign_result = camp_resp.get("campaigns", [{}])[0]
-        campaign_id = str(campaign_result.get("campaignId", ""))
+        campaign_id = _extract_id(camp_resp, "campaigns", "campaignId")
         if not campaign_id:
+            print(f"[create_campaign] FAILED — no campaign id in response: {camp_resp}")
             return f"Failed to create campaign: {camp_resp}"
+        print(f"[create_campaign] <- campaign created. campaignId={campaign_id}")
 
         # 2. Create ad group
+        print(f"[create_campaign] -> creating ad group for campaign {campaign_id}...")
         ag_resp = await create_ad_group(campaign_id, f"{name} - Ad Group")
-        ad_group_result = ag_resp.get("adGroups", [{}])[0]
-        ad_group_id = str(ad_group_result.get("adGroupId", ""))
+        ad_group_id = _extract_id(ag_resp, "adGroups", "adGroupId")
+        if not ad_group_id:
+            print(f"[create_campaign] FAILED — no ad group id in response: {ag_resp}")
+            return (
+                f"Campaign '{name}' created (ID {campaign_id}), but ad group creation "
+                f"failed: {ag_resp}"
+            )
+        print(f"[create_campaign] <- ad group created. adGroupId={ad_group_id}")
 
         results = [f"Campaign '{name}' created. Campaign ID: {campaign_id}"]
 
-        # 3. Add keywords
-        if keywords and ad_group_id:
-            kw_resp = await add_keywords(campaign_id, ad_group_id, keywords)
+        # 3. Create product ad so the campaign can serve
+        if sku or asin:
+            target = f"SKU {sku}" if sku else f"ASIN {asin}"
+            print(f"[create_campaign] -> creating product ad ({target}) on ad group {ad_group_id}...")
+            try:
+                pa_resp = await create_product_ad(campaign_id, ad_group_id, sku=sku, asin=asin)
+                pa_id = _extract_id(pa_resp, "productAds", "adId")
+                print(f"[create_campaign] <- product ad created. adId={pa_id or '(unknown)'} resp={pa_resp}")
+                results.append(
+                    f"Linked product ad for {target}." if pa_id
+                    else f"Product ad request sent for {target} (response: {pa_resp})."
+                )
+            except Exception as e:
+                print(f"[create_campaign] !! product ad failed: {e}")
+                results.append(f"Warning: product ad could not be created ({e}). The campaign will not serve until a product ad is added.")
+        else:
+            print("[create_campaign] -- no SKU/ASIN provided, skipping product ad")
+            results.append("No SKU/ASIN provided — campaign will NOT serve until a product ad is added.")
+
+        # 4. Add keywords
+        if keywords:
+            print(f"[create_campaign] -> adding {len(keywords)} keyword(s)...")
+            await add_keywords(campaign_id, ad_group_id, keywords)
+            print(f"[create_campaign] <- keywords added")
             results.append(f"Added {len(keywords)} keyword(s).")
 
-        # 4. Add negative keywords
-        if negative_kws and ad_group_id:
-            nk_resp = await add_negative_keywords(campaign_id, ad_group_id, negative_kws)
+        # 5. Add negative keywords
+        if negative_kws:
+            print(f"[create_campaign] -> adding {len(negative_kws)} negative keyword(s)...")
+            await add_negative_keywords(campaign_id, ad_group_id, negative_kws)
+            print(f"[create_campaign] <- negative keywords added")
             results.append(f"Added {len(negative_kws)} negative keyword(s).")
 
+        print(f"[create_campaign] DONE campaignId={campaign_id}")
         return " ".join(results)
 
     except Exception as e:
+        print(f"[create_campaign] ERROR: {e}")
         return f"Error creating campaign on Amazon: {e}"
