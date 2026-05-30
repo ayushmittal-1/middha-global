@@ -199,13 +199,48 @@ def analyze_performance() -> str:
     return _json.dumps(analysis)
 
 
-def create_campaign(payload: dict) -> str:
-    """Mock campaign creation — logs the payload and returns a fake success."""
-    import uuid
-
-    campaign_id = f"CAMP-{uuid.uuid4().hex[:8].upper()}"
-    print(f"[mock] Creating campaign {campaign_id}: {payload}")
-    return (
-        f"Campaign '{payload.get('campaign_name', 'Untitled')}' created successfully. "
-        f"Campaign ID: {campaign_id}"
+async def create_campaign(payload: dict) -> str:
+    """Create a real Sponsored Products campaign via Amazon Ads API."""
+    from datetime import datetime
+    from amazon_ads import (
+        create_sp_campaign,
+        create_ad_group,
+        add_keywords,
+        add_negative_keywords,
     )
+
+    name = payload.get("campaign_name", "Untitled")
+    budget = float(payload.get("budget", 10))
+    keywords = payload.get("keywords", [])
+    negative_kws = payload.get("negative_keywords", [])
+    start_date = datetime.utcnow().strftime("%Y%m%d")
+
+    try:
+        # 1. Create campaign
+        camp_resp = await create_sp_campaign(name, budget, start_date)
+        campaign_result = camp_resp.get("campaigns", [{}])[0]
+        campaign_id = str(campaign_result.get("campaignId", ""))
+        if not campaign_id:
+            return f"Failed to create campaign: {camp_resp}"
+
+        # 2. Create ad group
+        ag_resp = await create_ad_group(campaign_id, f"{name} - Ad Group")
+        ad_group_result = ag_resp.get("adGroups", [{}])[0]
+        ad_group_id = str(ad_group_result.get("adGroupId", ""))
+
+        results = [f"Campaign '{name}' created. Campaign ID: {campaign_id}"]
+
+        # 3. Add keywords
+        if keywords and ad_group_id:
+            kw_resp = await add_keywords(campaign_id, ad_group_id, keywords)
+            results.append(f"Added {len(keywords)} keyword(s).")
+
+        # 4. Add negative keywords
+        if negative_kws and ad_group_id:
+            nk_resp = await add_negative_keywords(campaign_id, ad_group_id, negative_kws)
+            results.append(f"Added {len(negative_kws)} negative keyword(s).")
+
+        return " ".join(results)
+
+    except Exception as e:
+        return f"Error creating campaign on Amazon: {e}"

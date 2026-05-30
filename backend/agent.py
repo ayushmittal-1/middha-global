@@ -125,6 +125,11 @@ TOOLS = [
                         "items": {"type": "string"},
                         "description": "List of approved keywords for the campaign.",
                     },
+                    "negative_keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of negative keywords to exclude from the campaign.",
+                    },
                 },
                 "required": ["campaign_name", "campaign_type", "budget", "country", "keywords"],
             },
@@ -149,13 +154,21 @@ async def _get_negative_keywords(seed_keyword: str) -> str:
     return "Negative keyword suggestions:\n" + "\n".join(lines)
 
 
-def _create_campaign(campaign_name: str, campaign_type: str, budget: float, country: str, keywords: list[str]) -> str:
-    return create_campaign({
+async def _create_campaign(
+    campaign_name: str,
+    campaign_type: str,
+    budget: float,
+    country: str,
+    keywords: list[str],
+    negative_keywords: list[str] | None = None,
+) -> str:
+    return await create_campaign({
         "campaign_name": campaign_name,
         "campaign_type": campaign_type,
         "budget": budget,
         "country": country,
         "keywords": keywords,
+        "negative_keywords": negative_keywords or [],
     })
 
 
