@@ -40,12 +40,13 @@ app.add_middleware(
 async def chat(request: Request):
     body = await request.json()
     message = body.get("message", "")
+    session_id = body.get("session_id", "default")
 
     if not message.strip():
         return {"error": "Message is required"}
 
     async def event_stream():
-        async for chunk in stream_response(message):
+        async for chunk in stream_response(message, session_id=session_id):
             # SSE format
             yield f"data: {json.dumps({'content': chunk})}\n\n"
         yield "data: [DONE]\n\n"

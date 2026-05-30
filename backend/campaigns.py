@@ -87,3 +87,104 @@ def get_campaigns() -> list[dict]:
 
 def get_campaigns_summary() -> str:
     return _campaigns_summary
+
+
+def analyze_performance() -> str:
+    """Analyze campaign performance: ACOS, top/bottom performers, recommendations."""
+    if not _campaigns:
+        return "No campaign data available. Campaigns may not have loaded yet."
+
+    results = []
+    top_performers = []
+    underperformers = []
+    paused_with_spend = []
+
+    for c in _campaigns:
+        spend_amt = float((c.get("spend") or {}).get("amount", 0) or 0)
+        sales_amt = float((c.get("sales") or {}).get("amount", 0) or 0)
+        budget_amt = float((c.get("budget") or {}).get("amount", 0) or 0)
+        name = c.get("campaignName", "Unnamed")
+        status = c.get("status", "")
+        ctype = c.get("campaignType", "")
+
+        if spend_amt > 0:
+            acos = (spend_amt / sales_amt * 100) if sales_amt > 0 else float("inf")
+            roi = ((sales_amt - spend_amt) / spend_amt * 100) if spend_amt > 0 else 0
+
+            entry = {
+                "name": name,
+                "type": ctype,
+                "status": status,
+                "spend": round(spend_amt, 2),
+                "sales": round(sales_amt, 2),
+                "budget": round(budget_amt, 2),
+                "acos": round(acos, 1) if acos != float("inf") else "N/A (no sales)",
+                "roi_pct": round(roi, 1),
+            }
+
+            if sales_amt == 0:
+                underperformers.append(entry)
+            elif acos > 40:
+                underperformers.append(entry)
+            elif acos < 20 and sales_amt > 0:
+                top_performers.append(entry)
+
+            if status == "Paused" and spend_amt > 0:
+                paused_with_spend.append(entry)
+
+    # Build summary
+    total_spend = sum(float((c.get("spend") or {}).get("amount", 0) or 0) for c in _campaigns)
+    total_sales = sum(float((c.get("sales") or {}).get("amount", 0) or 0) for c in _campaigns)
+    overall_acos = (total_spend / total_sales * 100) if total_sales > 0 else 0
+    enabled = sum(1 for c in _campaigns if c.get("status") == "Enabled")
+    paused = sum(1 for c in _campaigns if c.get("status") == "Paused")
+
+    import json as _json
+    analysis = {
+        "overview": {
+            "total_campaigns": len(_campaigns),
+            "enabled": enabled,
+            "paused": paused,
+            "total_spend_usd": round(total_spend, 2),
+            "total_sales_usd": round(total_sales, 2),
+            "overall_acos_pct": round(overall_acos, 1),
+        },
+        "top_performers": sorted(top_performers, key=lambda x: x.get("roi_pct", 0), reverse=True)[:5],
+        "underperformers": sorted(underperformers, key=lambda x: x.get("spend", 0), reverse=True)[:5],
+        "recommendations": [],
+    }
+
+    # Generate recommendations
+    if underperformers:
+        high_spend_losers = [u for u in underperformers if u["acos"] == "N/A (no sales)"]
+        if high_spend_losers:
+            analysis["recommendations"].append(
+                f"{len(high_spend_losers)} campaign(s) have spend but ZERO sales — consider pausing or revising keywords."
+            )
+        high_acos = [u for u in underperformers if isinstance(u["acos"], (int, float)) and u["acos"] > 40]
+        if high_acos:
+            analysis["recommendations"].append(
+                f"{len(high_acos)} campaign(s) have ACOS > 40% — review bids and targeting."
+            )
+    if top_performers:
+        analysis["recommendations"].append(
+            f"{len(top_performers)} campaign(s) performing well (ACOS < 20%) — consider increasing budget."
+        )
+    if overall_acos > 30:
+        analysis["recommendations"].append(
+            f"Overall ACOS is {round(overall_acos, 1)}% — above healthy threshold. Review underperformers."
+        )
+
+    return _json.dumps(analysis)
+
+
+def create_campaign(payload: dict) -> str:
+    """Mock campaign creation — logs the payload and returns a fake success."""
+    import uuid
+
+    campaign_id = f"CAMP-{uuid.uuid4().hex[:8].upper()}"
+    print(f"[mock] Creating campaign {campaign_id}: {payload}")
+    return (
+        f"Campaign '{payload.get('campaign_name', 'Untitled')}' created successfully. "
+        f"Campaign ID: {campaign_id}"
+    )
