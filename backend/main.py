@@ -131,7 +131,7 @@ async def delete_session_endpoint(session_id: str):
 # ── Amazon OAuth endpoints ─────────────────────────────────────────────────
 
 AMAZON_AUTH_URL = "https://www.amazon.com/ap/oa"
-DEFAULT_REDIRECT_URI = "https://powdered-tragedy-crafty.ngrok-free.dev/api/auth/amazon/ads-callback"
+DEFAULT_REDIRECT_URI = "https://d24d-2409-4085-e8c-b458-f90e-780c-de78-1437.ngrok-free.app/amazon/sp-callback"
 
 
 @app.get("/amazon/login")
@@ -189,6 +189,65 @@ async def oauth_callback(
     return HTMLResponse(
         "<h2>Authorization successful!</h2>"
         "<p>Refresh token has been saved. You can close this window.</p>"
+        f"<pre>access_token (truncated): {tokens.get('access_token', '')[:20]}...</pre>"
+    )
+
+
+# ── SP-API OAuth ──────────────────────────────────────────────────────────
+
+SP_API_APP_ID = "amzn1.sp.solution.30028133-1d34-4996-b191-fb3ff4ce57f2"
+SP_API_AUTH_URL = "https://sellercentral.amazon.com/apps/authorize/consent"
+
+
+@app.get("/amazon/sp-login")
+async def sp_api_login(redirect_uri: str | None = None):
+    """Redirect user to Seller Central to authorize the SP-API app."""
+    ru = redirect_uri or DEFAULT_REDIRECT_URI
+    params = urlencode({
+        "application_id": SP_API_APP_ID,
+        "redirect_uri": ru,
+        "state": "sp_api_auth",
+    })
+    print(f"[sp_login] Redirecting to Seller Central consent: {SP_API_AUTH_URL}?{params}")
+    return RedirectResponse(f"{SP_API_AUTH_URL}?{params}")
+
+
+@app.get("/amazon/sp-callback")
+async def sp_api_callback(
+    request: Request,
+    spapi_oauth_code: str | None = None,
+    state: str | None = None,
+    selling_partner_id: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+):
+    """Handle SP-API OAuth callback — exchange code for refresh token."""
+    if error or not spapi_oauth_code:
+        detail = error_description or error or "No authorization code was provided."
+        print(f"[sp_callback] no code. error={error!r} description={error_description!r}")
+        return HTMLResponse(
+            f"<h2>SP-API OAuth Error</h2><p>{detail}</p>"
+            "<p>Start the flow again from <code>/amazon/sp-login</code>.</p>",
+            status_code=400,
+        )
+
+    print(f"[sp_callback] code={spapi_oauth_code[:8]}... seller_id={selling_partner_id}")
+
+    redirect_uri = f"https://{request.url.netloc}{request.url.path}"
+    try:
+        tokens = await exchange_auth_code(spapi_oauth_code, redirect_uri)
+    except Exception as e:
+        return HTMLResponse(f"<h2>SP-API OAuth Error</h2><pre>{e}</pre>", status_code=400)
+
+    refresh_token = tokens.get("refresh_token", "")
+    if refresh_token:
+        save_refresh_token(refresh_token)
+        print(f"[sp_callback] SP-API refresh token saved ({len(refresh_token)} chars)")
+
+    return HTMLResponse(
+        "<h2>SP-API Authorization successful!</h2>"
+        "<p>Refresh token has been saved. You can close this window.</p>"
+        f"<pre>selling_partner_id: {selling_partner_id}</pre>"
         f"<pre>access_token (truncated): {tokens.get('access_token', '')[:20]}...</pre>"
     )
 

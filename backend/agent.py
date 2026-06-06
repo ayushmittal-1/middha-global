@@ -9,6 +9,7 @@ from campaigns import get_campaigns_summary, create_campaign, analyze_performanc
 from keywords import fetch_amazon_keywords, suggest_negative_keywords
 from meta_ads import search_meta_ads
 from database import create_session, get_messages, save_message, update_session_title
+import amazon_sp
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -38,6 +39,14 @@ SYSTEM_PROMPT = (
     "- **search_meta_ads**: Search the public Meta (Facebook) Ad Library for competitor ads. "
     "Use this when the user asks about competitor ads, wants to see what others are advertising, "
     "or wants ad copy inspiration. Pass a product/brand query and optionally a country code.\n\n"
+    "## Selling Partner API (Orders, Inventory, Reports)\n"
+    "- **get_orders**: Fetch recent Amazon orders. Use when the user asks about order status, recent sales, shipments, or order history. "
+    "Pass days_back (default 7) and optionally a status filter (Unshipped, Shipped, PartiallyShipped, Canceled, Unfulfillable).\n"
+    "- **get_inventory**: Check FBA inventory levels. Use when the user asks about stock, inventory, or supply levels. "
+    "Optionally pass a list of SKUs to filter.\n"
+    "- **get_report**: Generate and download an Amazon report. Use when the user asks for sales reports, settlement reports, "
+    "or other data exports. Common report types: GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL, "
+    "GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA, GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE.\n\n"
     "Be concise and actionable."
 )
 
@@ -174,6 +183,72 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_orders",
+            "description": "Fetch recent Amazon orders from the Selling Partner API. Returns order IDs, dates, statuses, and totals.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days_back": {
+                        "type": "integer",
+                        "description": "Number of days to look back (default 7).",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by order status.",
+                        "enum": ["Unshipped", "PartiallyShipped", "Shipped", "Canceled", "Unfulfillable"],
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_inventory",
+            "description": "Check FBA inventory levels via the Selling Partner API. Returns fulfillable, inbound, reserved, and unfulfillable quantities per SKU.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skus": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of seller SKUs to filter. Omit for all inventory.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_report",
+            "description": "Generate and download an Amazon Seller report. Creates the report, waits for processing, and returns the data.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "report_type": {
+                        "type": "string",
+                        "description": "The SP-API report type identifier.",
+                        "enum": [
+                            "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL",
+                            "GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA",
+                            "GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE",
+                            "GET_SALES_AND_TRAFFIC_REPORT",
+                            "GET_FBA_FULFILLMENT_REMOVAL_ORDER_DETAIL_DATA",
+                        ],
+                    },
+                    "days_back": {
+                        "type": "integer",
+                        "description": "Number of days to cover (default 30).",
+                    },
+                },
+                "required": ["report_type"],
+            },
+        },
+    },
 ]
 
 # ── Tool function wrappers ──────────────────────────────────────────────────
@@ -229,6 +304,65 @@ def _get_campaigns_summary(query: str = "") -> str:
     return get_campaigns_summary()
 
 
+async def _get_orders(days_back: int = 7, status: str | None = None) -> str:
+    from datetime import datetime, timedelta, timezone
+    created_after = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    statuses = [status] if status else None
+    try:
+        data = await amazon_sp.get_orders(created_after=created_after, statuses=statuses)
+    except Exception as e:
+        return f"Error fetching orders: {e}"
+    orders = data.get("payload", {}).get("Orders", [])
+    if not orders:
+        return f"No orders found in the last {days_back} days."
+    lines = []
+    for o in orders[:30]:
+        total = o.get("OrderTotal", {})
+        total_str = f"{total.get('CurrencyCode', '')} {total.get('Amount', 'N/A')}" if total else "N/A"
+        lines.append(
+            f"- {o.get('AmazonOrderId')} | {o.get('PurchaseDate', '')[:10]} | "
+            f"{o.get('OrderStatus')} | {total_str} | {o.get('NumberOfItemsUnshipped', 0)} unshipped"
+        )
+    return f"Orders (last {days_back} days, {len(orders)} total):\n" + "\n".join(lines)
+
+
+async def _get_inventory(skus: list[str] | None = None) -> str:
+    try:
+        data = await amazon_sp.get_inventory_summaries(skus=skus)
+    except Exception as e:
+        return f"Error fetching inventory: {e}"
+    summaries = data.get("payload", {}).get("inventorySummaries", [])
+    if not summaries:
+        return "No FBA inventory found." + (" (filtered by SKUs: " + ", ".join(skus) + ")" if skus else "")
+    lines = []
+    for s in summaries[:50]:
+        inv = s.get("inventoryDetails", {})
+        lines.append(
+            f"- {s.get('sellerSku', '?')} (ASIN: {s.get('asin', '?')}) | "
+            f"Fulfillable: {inv.get('fulfillableQuantity', 0)} | "
+            f"Inbound: {inv.get('inboundWorkingQuantity', 0)}+{inv.get('inboundShippedQuantity', 0)} | "
+            f"Reserved: {inv.get('reservedQuantity', {}).get('totalReservedQuantity', 0)} | "
+            f"Unfulfillable: {inv.get('unfulfillableQuantity', {}).get('totalUnfulfillableQuantity', 0)}"
+        )
+    return f"FBA Inventory ({len(summaries)} SKUs):\n" + "\n".join(lines)
+
+
+async def _get_report(report_type: str, days_back: int = 30) -> str:
+    from datetime import datetime, timedelta, timezone
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days_back)
+    start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        result = await amazon_sp.create_report(report_type, start_date=start_str, end_date=end_str)
+        report_id = result.get("reportId")
+        if not report_id:
+            return f"Failed to create report. Response: {json.dumps(result)}"
+        return await amazon_sp.download_report(report_id)
+    except Exception as e:
+        return f"Error generating report: {e}"
+
+
 TOOL_FUNCTIONS = {
     "get_campaigns_summary": _get_campaigns_summary,
     "get_keywords": _get_keywords,
@@ -236,6 +370,9 @@ TOOL_FUNCTIONS = {
     "analyze_campaign_performance": _analyze_campaign_performance,
     "create_campaign": _create_campaign,
     "search_meta_ads": _search_meta_ads,
+    "get_orders": _get_orders,
+    "get_inventory": _get_inventory,
+    "get_report": _get_report,
 }
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
