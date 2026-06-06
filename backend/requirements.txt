@@ -4,3 +4,4 @@ httpx
 groq
 python-dotenv
 aiosqlite
+playwright
