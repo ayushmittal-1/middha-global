@@ -7,6 +7,7 @@ from groq import AsyncGroq
 
 from campaigns import get_campaigns_summary, create_campaign, analyze_performance, search_campaigns
 from keywords import fetch_amazon_keywords, suggest_negative_keywords
+from meta_ads import search_meta_ads
 from database import create_session, get_messages, save_message, update_session_title
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -33,6 +34,10 @@ SYSTEM_PROMPT = (
     "7. **NEVER call create_campaign until the user explicitly approves the keywords, the SKU, and the campaign details.** When you call create_campaign, pass the approved sku (not asin).\n\n"
     "## Performance analysis\n"
     "When users ask about campaign performance, health, or what to optimize, call analyze_campaign_performance.\n\n"
+    "## Competitor research\n"
+    "- **search_meta_ads**: Search the public Meta (Facebook) Ad Library for competitor ads. "
+    "Use this when the user asks about competitor ads, wants to see what others are advertising, "
+    "or wants ad copy inspiration. Pass a product/brand query and optionally a country code.\n\n"
     "Be concise and actionable."
 )
 
@@ -144,6 +149,31 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_meta_ads",
+            "description": "Search the public Meta (Facebook) Ad Library for competitor ads. Returns ad copy, advertiser names, platforms, and dates. Use for competitor research and ad copy inspiration.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query — product name, brand, or keyword (e.g. 'wireless earbuds', 'Nike').",
+                    },
+                    "country": {
+                        "type": "string",
+                        "description": "Two-letter country code (default 'US').",
+                    },
+                    "active_only": {
+                        "type": "boolean",
+                        "description": "If true (default), only return currently active ads.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 # ── Tool function wrappers ──────────────────────────────────────────────────
@@ -189,6 +219,10 @@ def _analyze_campaign_performance() -> str:
     return analyze_performance()
 
 
+async def _search_meta_ads(query: str, country: str = "US", active_only: bool = True) -> str:
+    return await search_meta_ads(query, country=country, active_only=active_only)
+
+
 def _get_campaigns_summary(query: str = "") -> str:
     if query:
         return search_campaigns(query)
@@ -201,6 +235,7 @@ TOOL_FUNCTIONS = {
     "get_negative_keywords": _get_negative_keywords,
     "analyze_campaign_performance": _analyze_campaign_performance,
     "create_campaign": _create_campaign,
+    "search_meta_ads": _search_meta_ads,
 }
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -213,65 +248,110 @@ async def _call_tool(fn, args: dict) -> str:
 
 # ── Main streaming entry point ──────────────────────────────────────────────
 
-async def stream_response(user_message: str, *, session_id: str = "default") -> AsyncGenerator[str, None]:
-    """Stream a response, maintaining conversation history per session."""
+async def stream_response(user_message: str, *, session_id: str = "default") -> AsyncGenerator[dict, None]:
+    """Stream a response as dict events, maintaining conversation history per session.
+
+    Yields dicts with a "type" key:
+      {"type": "token",       "content": "..."}
+      {"type": "tool_start",  "name": "...", "args": {...}}
+      {"type": "tool_result", "name": "...", "result": "..."}
+      {"type": "error",       "content": "..."}
+    The caller is responsible for sending a final {"type": "done"} after iteration.
+    """
     # Ensure session exists in DB; auto-title from first user message
     await create_session(session_id)
     history = await get_messages(session_id)
 
-    # Auto-set title from first user message (if this is the first message)
     if not history:
         title = user_message[:50].strip()
         await update_session_title(session_id, title)
 
-    # Save the incoming user message
     await save_message(session_id, "user", user_message)
     history.append({"role": "user", "content": user_message})
 
-    # Build messages: system + history
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
-    # Loop: the LLM may chain multiple tool calls before giving a text answer
     max_tool_rounds = 5
     for round_num in range(max_tool_rounds):
+        # ── Streaming call with tools ──────────────────────────────────────
         try:
-            response = await client.chat.completions.create(
+            stream = await client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
                 tools=TOOLS,
+                stream=True,
                 temperature=0.3,
                 max_tokens=1024,
             )
         except Exception as e:
             error_msg = f"Sorry, I encountered an error: {e}"
-            yield error_msg
+            yield {"type": "error", "content": error_msg}
             await save_message(session_id, "assistant", error_msg)
             return
 
-        choice = response.choices[0]
+        # Accumulate the full response from streamed deltas
+        text_chunks: list[str] = []
+        # tool_calls_acc: dict of index -> {id, name, arguments_parts}
+        tool_calls_acc: dict[int, dict] = {}
+        finish_reason = None
 
-        if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-            # Persist assistant tool-call message
-            assistant_msg = {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in choice.message.tool_calls
-                ],
-            }
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
+            finish_reason = chunk.choices[0].finish_reason or finish_reason
+
+            # Text token
+            if delta.content:
+                text_chunks.append(delta.content)
+                yield {"type": "token", "content": delta.content}
+
+            # Tool-call deltas arrive incrementally
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {
+                            "id": tc_delta.id or "",
+                            "name": tc_delta.function.name or "" if tc_delta.function else "",
+                            "arguments_parts": [],
+                        }
+                    acc = tool_calls_acc[idx]
+                    if tc_delta.id:
+                        acc["id"] = tc_delta.id
+                    if tc_delta.function and tc_delta.function.name:
+                        acc["name"] = tc_delta.function.name
+                    if tc_delta.function and tc_delta.function.arguments:
+                        acc["arguments_parts"].append(tc_delta.function.arguments)
+
+        # ── Handle tool calls ──────────────────────────────────────────────
+        if tool_calls_acc:
+            # Build the assistant message for the conversation
+            tool_calls_list = []
+            for idx in sorted(tool_calls_acc):
+                acc = tool_calls_acc[idx]
+                tool_calls_list.append({
+                    "id": acc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": acc["name"],
+                        "arguments": "".join(acc["arguments_parts"]),
+                    },
+                })
+
+            assistant_msg = {"role": "assistant", "tool_calls": tool_calls_list}
             await save_message(session_id, "tool_call", json.dumps(assistant_msg))
             messages.append(assistant_msg)
 
-            for tool_call in choice.message.tool_calls:
-                fn_name = tool_call.function.name
+            # Execute each tool
+            for tc in tool_calls_list:
+                fn_name = tc["function"]["name"]
                 fn = TOOL_FUNCTIONS.get(fn_name)
+                raw_args = tc["function"]["arguments"]
+                args = json.loads(raw_args or "{}") or {}
+
+                yield {"type": "tool_start", "name": fn_name, "args": args}
+
                 if fn:
                     try:
-                        args = json.loads(tool_call.function.arguments or "{}") or {}
                         print(f"[agent] tool call: {fn_name} args={args}")
                         result = await _call_tool(fn, args)
                         print(f"[agent] tool done: {fn_name} -> {str(result)[:200]}")
@@ -280,24 +360,26 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
                         result = f"Tool error: {e}"
                 else:
                     result = "Unknown tool"
+
+                yield {"type": "tool_result", "name": fn_name, "result": result}
+
                 tool_msg = {
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
+                    "tool_call_id": tc["id"],
                     "content": result,
                 }
                 await save_message(session_id, "tool", json.dumps(tool_msg))
                 messages.append(tool_msg)
-            # Continue loop — let the LLM decide if it needs more tools or can respond
+
+            # Continue loop — let the LLM decide if it needs more tools
             continue
 
-        # No tool call — stream the final text response
-        content = choice.message.content or ""
-        if content:
-            yield content
-        await save_message(session_id, "assistant", content)
+        # ── No tool calls — this was the final text response ───────────────
+        full_text = "".join(text_chunks)
+        await save_message(session_id, "assistant", full_text)
         return
 
-    # If we exhausted tool rounds, make a final call without tools to force a text answer
+    # ── Exhausted tool rounds — force a text-only response ─────────────────
     try:
         stream = await client.chat.completions.create(
             model=MODEL,
@@ -307,15 +389,15 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
             max_tokens=1024,
         )
 
-        full_reply = []
+        full_reply: list[str] = []
         async for chunk in stream:
             delta = chunk.choices[0].delta
             if delta.content:
                 full_reply.append(delta.content)
-                yield delta.content
+                yield {"type": "token", "content": delta.content}
 
         await save_message(session_id, "assistant", "".join(full_reply))
     except Exception as e:
         error_msg = f"Sorry, I encountered an error: {e}"
-        yield error_msg
+        yield {"type": "error", "content": error_msg}
         await save_message(session_id, "assistant", error_msg)

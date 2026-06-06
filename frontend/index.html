@@ -145,6 +145,13 @@
       border-left: 3px solid #4a6cf7;
     }
 
+    .tool-indicator {
+      font-size: 12px;
+      color: #4a6cf7;
+      font-style: italic;
+      margin-top: 4px;
+    }
+
     #input-area {
       padding: 16px 24px;
       background: #fff;
@@ -233,6 +240,91 @@
     const newChatBtn = document.getElementById('new-chat-btn');
     let isStreaming = false;
     let currentSessionId = null;
+    let ws = null;
+    let currentAssistantDiv = null;
+
+    // ── WebSocket ──────────────────────────────────────
+
+    function connectWebSocket() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws/chat`);
+
+      ws.onopen = () => console.log('[ws] connected');
+
+      ws.onmessage = (evt) => {
+        try {
+          const event = JSON.parse(evt.data);
+          handleWsMessage(event);
+        } catch (e) {
+          console.error('[ws] bad message', e);
+        }
+      };
+
+      ws.onclose = () => {
+        console.log('[ws] disconnected — reconnecting in 2s');
+        setTimeout(connectWebSocket, 2000);
+      };
+
+      ws.onerror = (err) => console.error('[ws] error', err);
+    }
+
+    function handleWsMessage(event) {
+      switch (event.type) {
+        case 'token':
+          if (currentAssistantDiv) {
+            currentAssistantDiv.textContent += event.content;
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+          }
+          break;
+
+        case 'tool_start':
+          if (currentAssistantDiv) {
+            const indicator = document.createElement('div');
+            indicator.className = 'tool-indicator';
+            indicator.textContent = `[Using ${event.name}...]`;
+            currentAssistantDiv.appendChild(indicator);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+          }
+          break;
+
+        case 'tool_result':
+          if (currentAssistantDiv) {
+            // Remove the matching indicator
+            const indicators = currentAssistantDiv.querySelectorAll('.tool-indicator');
+            for (const ind of indicators) {
+              if (ind.textContent.includes(event.name)) {
+                ind.textContent = `[${event.name} done]`;
+                break;
+              }
+            }
+          }
+          break;
+
+        case 'done':
+          if (currentAssistantDiv) {
+            // Strip tool indicators from the final bubble
+            currentAssistantDiv.querySelectorAll('.tool-indicator').forEach(el => el.remove());
+            currentAssistantDiv.classList.remove('streaming');
+          }
+          currentAssistantDiv = null;
+          isStreaming = false;
+          sendBtn.disabled = false;
+          messageInput.focus();
+          loadSessions();
+          break;
+
+        case 'error':
+          if (currentAssistantDiv) {
+            currentAssistantDiv.textContent = event.content || 'An error occurred.';
+            currentAssistantDiv.classList.remove('streaming');
+          }
+          currentAssistantDiv = null;
+          isStreaming = false;
+          sendBtn.disabled = false;
+          messageInput.focus();
+          break;
+      }
+    }
 
     // ── Session helpers ────────────────────────────────
 
@@ -278,7 +370,7 @@
       currentSessionId = sessionId;
       localStorage.setItem('session_id', sessionId);
       await loadHistory(sessionId);
-      await loadSessions(); // refresh active highlight
+      await loadSessions();
     }
 
     async function loadHistory(sessionId) {
@@ -331,7 +423,6 @@
     // ── Chat functions ─────────────────────────────────
 
     function addMessage(text, role) {
-      // Remove welcome message on first interaction
       const welcome = chatContainer.querySelector('.welcome');
       if (welcome) welcome.remove();
 
@@ -343,65 +434,28 @@
       return div;
     }
 
-    async function sendMessage() {
+    function sendMessage() {
       const text = messageInput.value.trim();
       if (!text || isStreaming) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        alert('Not connected to server. Reconnecting...');
+        connectWebSocket();
+        return;
+      }
 
       addMessage(text, 'user');
       messageInput.value = '';
       isStreaming = true;
       sendBtn.disabled = true;
 
-      const assistantDiv = addMessage('', 'assistant');
-      assistantDiv.classList.add('streaming');
+      currentAssistantDiv = addMessage('', 'assistant');
+      currentAssistantDiv.classList.add('streaming');
 
-      try {
-        const response = await fetch('/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text, session_id: currentSessionId }),
-        });
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-
-          const lines = buffer.split('\n');
-          buffer = lines.pop(); // keep incomplete line in buffer
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6);
-              if (data === '[DONE]') break;
-              try {
-                const parsed = JSON.parse(data);
-                if (parsed.content) {
-                  assistantDiv.textContent += parsed.content;
-                  chatContainer.scrollTop = chatContainer.scrollHeight;
-                }
-              } catch (e) {
-                // skip malformed JSON
-              }
-            }
-          }
-        }
-      } catch (error) {
-        assistantDiv.textContent = 'Error: Failed to get response. Please try again.';
-      }
-
-      assistantDiv.classList.remove('streaming');
-      isStreaming = false;
-      sendBtn.disabled = false;
-      messageInput.focus();
-
-      // Refresh sidebar to show updated title
-      await loadSessions();
+      ws.send(JSON.stringify({
+        type: 'chat',
+        session_id: currentSessionId,
+        message: text,
+      }));
     }
 
     // ── Event listeners ────────────────────────────────
@@ -415,7 +469,6 @@
     // ── Init ───────────────────────────────────────────
 
     (async () => {
-      // Restore session from localStorage or create a new one
       const saved = localStorage.getItem('session_id');
       if (saved) {
         currentSessionId = saved;
@@ -425,6 +478,7 @@
         localStorage.setItem('session_id', currentSessionId);
       }
       await loadSessions();
+      connectWebSocket();
       messageInput.focus();
     })();
   </script>

@@ -8,13 +8,14 @@ from urllib.parse import urlencode
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from campaigns import fetch_all_campaigns
 from agent import stream_response
+from meta_ads import shutdown_browser
 from database import init_db, create_session, list_sessions, get_messages, delete_session
 from amazon_ads import (
     exchange_auth_code,
@@ -36,6 +37,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"Warning: Failed to fetch campaigns: {e}")
     yield
+    # Shutdown: close shared Playwright browser
+    await shutdown_browser()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -48,8 +51,36 @@ app.add_middleware(
 )
 
 
+@app.websocket("/ws/chat")
+async def ws_chat(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "content": "Invalid JSON"})
+                continue
+
+            message = data.get("message", "").strip()
+            session_id = data.get("session_id", "default")
+
+            if not message:
+                await websocket.send_json({"type": "error", "content": "Message is required"})
+                continue
+
+            async for event in stream_response(message, session_id=session_id):
+                await websocket.send_json(event)
+
+            await websocket.send_json({"type": "done"})
+    except WebSocketDisconnect:
+        pass
+
+
 @app.post("/chat")
 async def chat(request: Request):
+    """Legacy SSE endpoint (kept for curl / debug use)."""
     body = await request.json()
     message = body.get("message", "")
     session_id = body.get("session_id", "default")
@@ -58,9 +89,12 @@ async def chat(request: Request):
         return {"error": "Message is required"}
 
     async def event_stream():
-        async for chunk in stream_response(message, session_id=session_id):
-            # SSE format
-            yield f"data: {json.dumps({'content': chunk})}\n\n"
+        async for event in stream_response(message, session_id=session_id):
+            if event["type"] == "token":
+                yield f"data: {json.dumps({'content': event['content']})}\n\n"
+            elif event["type"] == "error":
+                yield f"data: {json.dumps({'error': event['content']})}\n\n"
+            # tool_start / tool_result are silently skipped in SSE mode
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
