@@ -152,6 +152,41 @@
       margin-top: 4px;
     }
 
+    .tool-result-card {
+      align-self: flex-start;
+      max-width: 85%;
+      background: #f8f9fb;
+      border-left: 4px solid #4a6cf7;
+      border-radius: 8px;
+      padding: 12px 16px;
+      font-size: 13px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+
+    .tool-result-header {
+      font-size: 11px;
+      font-weight: 700;
+      color: #4a6cf7;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+
+    .tool-result-body {
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      font-family: 'SF Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+      font-size: 12px;
+      color: #333;
+      max-height: 300px;
+      overflow-y: auto;
+      line-height: 1.5;
+    }
+
+    .tool-result-card.loading .tool-result-header::after {
+      content: ' ⏳';
+    }
+
     #input-area {
       padding: 16px 24px;
       background: #fff;
@@ -277,19 +312,36 @@
           }
           break;
 
-        case 'tool_start':
+        case 'tool_start': {
+          // Indicator inside the assistant bubble (will be stripped on done)
           if (currentAssistantDiv) {
             const indicator = document.createElement('div');
             indicator.className = 'tool-indicator';
             indicator.textContent = `[Using ${event.name}...]`;
             currentAssistantDiv.appendChild(indicator);
-            chatContainer.scrollTop = chatContainer.scrollHeight;
           }
-          break;
 
-        case 'tool_result':
+          // Persistent card in the chat stream (outside assistant div)
+          const card = document.createElement('div');
+          card.className = 'tool-result-card loading';
+          card.setAttribute('data-tool', event.name);
+          card.innerHTML = `<div class="tool-result-header">${escapeHtml(event.name)}</div><div class="tool-result-body">Loading…</div>`;
+          chatContainer.appendChild(card);
+          chatContainer.scrollTop = chatContainer.scrollHeight;
+          break;
+        }
+
+        case 'tool_result': {
+          // Populate the matching card
+          const card = chatContainer.querySelector(`.tool-result-card[data-tool="${event.name}"]`);
+          if (card) {
+            card.classList.remove('loading');
+            const body = card.querySelector('.tool-result-body');
+            body.textContent = event.result || '(no output)';
+          }
+
+          // Update indicator inside assistant bubble
           if (currentAssistantDiv) {
-            // Remove the matching indicator
             const indicators = currentAssistantDiv.querySelectorAll('.tool-indicator');
             for (const ind of indicators) {
               if (ind.textContent.includes(event.name)) {
@@ -298,7 +350,9 @@
               }
             }
           }
+          chatContainer.scrollTop = chatContainer.scrollHeight;
           break;
+        }
 
         case 'done':
           if (currentAssistantDiv) {
