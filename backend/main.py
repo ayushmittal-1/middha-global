@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 import os
 import uuid
@@ -16,7 +18,15 @@ from fastapi.staticfiles import StaticFiles
 from campaigns import fetch_all_campaigns
 from agent import stream_response
 from meta_ads import shutdown_browser
-from database import init_db, create_session, list_sessions, get_messages, delete_session
+from database import (
+    init_db,
+    create_session,
+    list_sessions,
+    get_messages,
+    delete_session,
+    upsert_cogs,
+    get_cogs,
+)
 from amazon_ads import (
     exchange_auth_code,
     get_profiles,
@@ -126,6 +136,43 @@ async def get_session_messages(session_id: str):
 async def delete_session_endpoint(session_id: str):
     await delete_session(session_id)
     return {"ok": True}
+
+
+# ── COGS endpoints ─────────────────────────────────────────────────────────
+
+@app.post("/cogs/upload")
+async def upload_cogs(request: Request):
+    """Accept a CSV body (text/csv or text/plain) with columns sku, unit_cost,
+    and optionally inbound_shipping_per_unit. Upserts rows into the cogs table.
+    """
+    raw = (await request.body()).decode("utf-8", errors="replace")
+    if not raw.strip():
+        return {"error": "empty body"}
+
+    reader = csv.DictReader(io.StringIO(raw))
+    rows: list[dict] = []
+    skipped: list[str] = []
+    for row in reader:
+        if not row.get("sku"):
+            continue
+        try:
+            cost = float((row.get("unit_cost") or "").strip() or 0)
+        except ValueError:
+            skipped.append(f"{row.get('sku')}: bad unit_cost {row.get('unit_cost')!r}")
+            continue
+        if cost <= 0:
+            skipped.append(f"{row.get('sku')}: missing unit_cost")
+            continue
+        rows.append(row)
+
+    written = await upsert_cogs(rows)
+    return {"saved": written, "skipped": len(skipped), "skipped_details": skipped[:20]}
+
+
+@app.get("/cogs")
+async def list_cogs():
+    rows = await get_cogs()
+    return {"count": len(rows), "rows": rows}
 
 
 # ── Amazon OAuth endpoints ─────────────────────────────────────────────────

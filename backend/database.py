@@ -26,6 +26,14 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cogs (
+                sku TEXT PRIMARY KEY,
+                unit_cost REAL NOT NULL,
+                inbound_shipping_per_unit REAL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
 
@@ -92,6 +100,60 @@ async def update_session_title(session_id: str, title: str):
             (title, session_id),
         )
         await db.commit()
+
+
+async def upsert_cogs(rows: list[dict]) -> int:
+    """Insert or update COGS rows. Each row needs sku and unit_cost.
+    inbound_shipping_per_unit is optional. Returns the count actually written.
+    """
+    written = 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        for r in rows:
+            sku = (r.get("sku") or "").strip()
+            if not sku:
+                continue
+            try:
+                unit_cost = float(r.get("unit_cost") or 0)
+            except (TypeError, ValueError):
+                continue
+            if unit_cost <= 0:
+                continue
+            try:
+                shipping = float(r.get("inbound_shipping_per_unit") or 0)
+            except (TypeError, ValueError):
+                shipping = 0.0
+            await db.execute(
+                """
+                INSERT INTO cogs (sku, unit_cost, inbound_shipping_per_unit, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(sku) DO UPDATE SET
+                    unit_cost = excluded.unit_cost,
+                    inbound_shipping_per_unit = excluded.inbound_shipping_per_unit,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (sku, unit_cost, shipping),
+            )
+            written += 1
+        await db.commit()
+    return written
+
+
+async def get_cogs(skus: list[str] | None = None) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if skus:
+            placeholders = ",".join("?" * len(skus))
+            cursor = await db.execute(
+                f"SELECT sku, unit_cost, inbound_shipping_per_unit, updated_at "
+                f"FROM cogs WHERE sku IN ({placeholders})",
+                skus,
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT sku, unit_cost, inbound_shipping_per_unit, updated_at FROM cogs ORDER BY sku"
+            )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
 
 
 async def delete_session(session_id: str):
