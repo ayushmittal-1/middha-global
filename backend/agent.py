@@ -1,14 +1,17 @@
+import asyncio
 import inspect
 import json
 import os
+from collections import defaultdict
 from collections.abc import AsyncGenerator
+from datetime import datetime, timedelta, timezone
 
 from groq import AsyncGroq
 
 from campaigns import get_campaigns_summary, create_campaign, analyze_performance, search_campaigns
 from keywords import fetch_amazon_keywords, suggest_negative_keywords
 from meta_ads import search_meta_ads
-from database import create_session, get_messages, save_message, update_session_title
+from database import create_session, get_messages, save_message, update_session_title, get_cogs
 import amazon_sp
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -42,11 +45,22 @@ SYSTEM_PROMPT = (
     "## Selling Partner API (Orders, Inventory, Reports)\n"
     "- **get_orders**: Fetch recent Amazon orders. Use when the user asks about order status, recent sales, shipments, or order history. "
     "Pass days_back (default 7) and optionally a status filter (Unshipped, Shipped, PartiallyShipped, Canceled, Unfulfillable).\n"
+    "- **get_order_items**: Fetch SKU-level line items (SKU, ASIN, price, qty, promo) for a single order id. Use whenever you need per-SKU revenue.\n"
     "- **get_inventory**: Check FBA inventory levels. Use when the user asks about stock, inventory, or supply levels. "
     "Optionally pass a list of SKUs to filter.\n"
+    "- **get_cogs**: Look up unit_cost and inbound_shipping_per_unit per SKU from the user-supplied COGS table. "
+    "Amazon's APIs do NOT expose what the seller paid to make or ship product, so this is the only source of cost data.\n"
     "- **get_report**: Generate and download an Amazon report. Use when the user asks for sales reports, settlement reports, "
-    "or other data exports. Common report types: GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL, "
-    "GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA, GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE.\n\n"
+    "or other data exports. Profitability-relevant types: GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE (actual fees deducted), "
+    "GET_FBA_ESTIMATED_FBA_FEES_TXT_DATA (per-SKU referral + FBA fee estimates), "
+    "GET_FBA_STORAGE_FEE_CHARGES_DATA (monthly storage), GET_FBA_INVENTORY_AGED_DATA (aged surcharge), "
+    "GET_FBA_FULFILLMENT_REMOVAL_ORDER_DETAIL_DATA (removal fees).\n\n"
+    "## Profitability analysis\n"
+    "When the user asks about profit, margin, or P&L: call **analyze_profitability(days_back=N)** ONCE (N defaults to 7). "
+    "The tool returns a fully-formatted markdown table + summary + caveats — present that text VERBATIM to the user, optionally with one short intro line. "
+    "Do NOT recompute the math. Do NOT call get_orders / get_order_items / get_cogs manually — analyze_profitability already does all of that server-side. "
+    "Do NOT add commentary that contradicts the table.\n"
+    "If the user asks for fees / ad spend / fully-loaded mode, tell them that mode isn't built yet and offer the simple table.\n\n"
     "Be concise and actionable."
 )
 
@@ -192,8 +206,8 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "days_back": {
-                        "type": "integer",
-                        "description": "Number of days to look back (default 7).",
+                        "type": ["integer", "string"],
+                        "description": "Number of days to look back (default 7). Must be a number — '7' or 7 both fine.",
                     },
                     "status": {
                         "type": "string",
@@ -224,6 +238,56 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_order_items",
+            "description": "Fetch line items (SKU, ASIN, item price, quantity, promo discount) for a single Amazon order. Use this to break an order down to SKU-level revenue — required for any per-SKU profitability calculation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "description": "The AmazonOrderId returned by get_orders (e.g. '114-4871996-9329822').",
+                    },
+                },
+                "required": ["order_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_cogs",
+            "description": "Look up unit cost and inbound shipping cost per SKU from the user-supplied COGS table. Returns rows with sku, unit_cost, and inbound_shipping_per_unit. Required input for profitability — Amazon's APIs do not expose what the seller paid to acquire/ship product. If a SKU is missing, the user has not uploaded its cost yet.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skus": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of seller SKUs. Omit to get all stored COGS rows.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_profitability",
+            "description": "Compute per-SKU profitability for recent orders. Pulls orders, order items, and COGS server-side, then returns a fully-formatted markdown table with units, revenue, COGS+inbound, net, and margin per SKU plus totals. Use this for ANY profit / margin / P&L question — do not chain get_orders + get_order_items + get_cogs manually.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days_back": {
+                        "type": ["integer", "string"],
+                        "description": "Days of order history to include (default 7).",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_report",
             "description": "Generate and download an Amazon Seller report. Creates the report, waits for processing, and returns the data.",
             "parameters": {
@@ -238,11 +302,14 @@ TOOLS = [
                             "GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE",
                             "GET_SALES_AND_TRAFFIC_REPORT",
                             "GET_FBA_FULFILLMENT_REMOVAL_ORDER_DETAIL_DATA",
+                            "GET_FBA_ESTIMATED_FBA_FEES_TXT_DATA",
+                            "GET_FBA_STORAGE_FEE_CHARGES_DATA",
+                            "GET_FBA_INVENTORY_AGED_DATA",
                         ],
                     },
                     "days_back": {
-                        "type": "integer",
-                        "description": "Number of days to cover (default 30).",
+                        "type": ["integer", "string"],
+                        "description": "Number of days to cover (default 30). Must be a number — '30' or 30 both fine.",
                     },
                 },
                 "required": ["report_type"],
@@ -304,8 +371,11 @@ def _get_campaigns_summary(query: str = "") -> str:
     return get_campaigns_summary()
 
 
-async def _get_orders(days_back: int = 7, status: str | None = None) -> str:
-    from datetime import datetime, timedelta, timezone
+async def _get_orders(days_back: int | str = 7, status: str | None = None) -> str:
+    try:
+        days_back = int(days_back)
+    except (TypeError, ValueError):
+        days_back = 7
     created_after = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
     statuses = [status] if status else None
     try:
@@ -347,8 +417,176 @@ async def _get_inventory(skus: list[str] | None = None) -> str:
     return f"FBA Inventory ({len(summaries)} SKUs):\n" + "\n".join(lines)
 
 
-async def _get_report(report_type: str, days_back: int = 30) -> str:
-    from datetime import datetime, timedelta, timezone
+async def _get_order_items(order_id: str) -> str:
+    try:
+        data = await amazon_sp.get_order_items(order_id)
+    except Exception as e:
+        return f"Error fetching order items: {e}"
+    items = data.get("payload", {}).get("OrderItems", [])
+    if not items:
+        return f"No items found for order {order_id}."
+    lines = []
+    for it in items:
+        price = it.get("ItemPrice") or {}
+        promo = it.get("PromotionDiscount") or {}
+        lines.append(
+            f"- {it.get('SellerSKU', '?')} (ASIN: {it.get('ASIN', '?')}) | "
+            f"qty: {it.get('QuantityOrdered', 0)} | "
+            f"price: {price.get('CurrencyCode', '')} {price.get('Amount', 'N/A')} | "
+            f"promo: {promo.get('CurrencyCode', '')} {promo.get('Amount', '0.00')}"
+        )
+    return f"Order {order_id} items ({len(items)}):\n" + "\n".join(lines)
+
+
+async def _get_cogs(skus: list[str] | None = None) -> str:
+    try:
+        rows = await get_cogs(skus)
+    except Exception as e:
+        return f"Error reading COGS: {e}"
+    if not rows:
+        if skus:
+            return f"No COGS found for: {', '.join(skus)}. User must upload them via the COGS panel."
+        return "No COGS uploaded yet. User must upload a CSV via the COGS panel before profit can be computed."
+    lines = [
+        f"- {r['sku']} | unit_cost: {r['unit_cost']} | inbound_shipping_per_unit: {r['inbound_shipping_per_unit']}"
+        for r in rows
+    ]
+    out = f"COGS ({len(rows)} SKU{'s' if len(rows) != 1 else ''}):\n" + "\n".join(lines)
+    if skus:
+        missing = sorted(set(skus) - {r["sku"] for r in rows})
+        if missing:
+            out += f"\nMissing COGS for: {', '.join(missing)} (user must upload)."
+    return out
+
+
+async def _analyze_profitability(days_back: int | str = 7) -> str:
+    try:
+        days_back = int(days_back)
+    except (TypeError, ValueError):
+        days_back = 7
+
+    created_after = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        orders_resp = await amazon_sp.get_orders(created_after=created_after)
+    except Exception as e:
+        return f"Error fetching orders: {e}"
+    orders = orders_resp.get("payload", {}).get("Orders", [])
+    if not orders:
+        return f"No orders in the last {days_back} days."
+
+    order_ids = [o.get("AmazonOrderId") for o in orders if o.get("AmazonOrderId")]
+
+    async def fetch_items(oid: str):
+        try:
+            return oid, await amazon_sp.get_order_items(oid)
+        except Exception as e:
+            return oid, {"_error": str(e)}
+
+    items_results = await asyncio.gather(*[fetch_items(oid) for oid in order_ids])
+
+    sku_data: dict[str, dict] = defaultdict(lambda: {"units": 0, "revenue": 0.0})
+    na_price_rows: list[tuple[str, str, int]] = []
+    fetch_errors: list[str] = []
+
+    for oid, items_resp in items_results:
+        if "_error" in items_resp:
+            fetch_errors.append(f"{oid}: {items_resp['_error']}")
+            continue
+        for it in items_resp.get("payload", {}).get("OrderItems", []):
+            sku = it.get("SellerSKU")
+            if not sku:
+                continue
+            qty = int(it.get("QuantityOrdered", 0) or 0)
+            price = it.get("ItemPrice") or {}
+            amount_raw = price.get("Amount")
+            try:
+                amount = float(amount_raw) if amount_raw is not None else None
+            except (TypeError, ValueError):
+                amount = None
+            if amount is None:
+                na_price_rows.append((oid, sku, qty))
+                continue
+            sku_data[sku]["units"] += qty
+            sku_data[sku]["revenue"] += amount
+
+    if not sku_data:
+        return f"Found {len(orders)} orders but no items with a valid price."
+
+    skus = sorted(sku_data.keys())
+    try:
+        cogs_rows = await get_cogs(skus)
+    except Exception as e:
+        return f"Error reading COGS: {e}"
+    cogs_map = {r["sku"]: r for r in cogs_rows}
+
+    table_rows = []
+    totals = {"units": 0, "revenue": 0.0, "cogs": 0.0, "net": 0.0}
+    missing_cogs: list[tuple[str, int, float]] = []
+
+    for sku in skus:
+        units = sku_data[sku]["units"]
+        revenue = sku_data[sku]["revenue"]
+        cogs_row = cogs_map.get(sku)
+        if not cogs_row:
+            missing_cogs.append((sku, units, revenue))
+            continue
+        unit_total = cogs_row["unit_cost"] + cogs_row["inbound_shipping_per_unit"]
+        cogs_inbound = unit_total * units
+        net = revenue - cogs_inbound
+        margin = (net / revenue * 100) if revenue > 0 else 0.0
+        table_rows.append({
+            "sku": sku, "units": units, "revenue": revenue,
+            "cogs": cogs_inbound, "net": net, "margin": margin,
+        })
+        totals["units"] += units
+        totals["revenue"] += revenue
+        totals["cogs"] += cogs_inbound
+        totals["net"] += net
+
+    total_margin = (totals["net"] / totals["revenue"] * 100) if totals["revenue"] > 0 else 0.0
+
+    lines = [f"Profitability — last {days_back} days, {len(orders)} orders, {len(skus)} distinct SKUs.", ""]
+    if table_rows:
+        lines.append("| SKU | Units | Revenue | COGS+Inbound | Net | Margin % |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for r in table_rows:
+            lines.append(
+                f"| {r['sku']} | {r['units']} | ${r['revenue']:.2f} | "
+                f"${r['cogs']:.2f} | ${r['net']:.2f} | {r['margin']:.1f}% |"
+            )
+        lines.append(
+            f"| **Totals** | **{totals['units']}** | **${totals['revenue']:.2f}** | "
+            f"**${totals['cogs']:.2f}** | **${totals['net']:.2f}** | **{total_margin:.1f}%** |"
+        )
+        lines.append("")
+        lines.append(
+            f"Net profit ${totals['net']:.2f} on ${totals['revenue']:.2f} revenue across "
+            f"{totals['units']} units ({total_margin:.1f}% margin)."
+        )
+    else:
+        lines.append("No rows in the table — every active SKU was missing COGS.")
+
+    caveats = []
+    for sku, units, rev in missing_cogs:
+        caveats.append(f"- COGS missing for '{sku}' ({units} units, ${rev:.2f} revenue) — excluded from totals. Upload via the COGS panel.")
+    for oid, sku, qty in na_price_rows[:5]:
+        caveats.append(f"- Order {oid} ('{sku}' qty {qty}) had price N/A — row excluded.")
+    if len(na_price_rows) > 5:
+        caveats.append(f"- …and {len(na_price_rows) - 5} more N/A-price rows excluded.")
+    for err in fetch_errors[:3]:
+        caveats.append(f"- Failed to fetch items for {err}")
+    caveats.append("- Amazon fees and ad spend not included (simple mode).")
+    lines.append("")
+    lines.append("Caveats:")
+    lines.extend(caveats)
+    return "\n".join(lines)
+
+
+async def _get_report(report_type: str, days_back: int | str = 30) -> str:
+    try:
+        days_back = int(days_back)
+    except (TypeError, ValueError):
+        days_back = 30
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days_back)
     start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -371,7 +609,10 @@ TOOL_FUNCTIONS = {
     "create_campaign": _create_campaign,
     "search_meta_ads": _search_meta_ads,
     "get_orders": _get_orders,
+    "get_order_items": _get_order_items,
     "get_inventory": _get_inventory,
+    "get_cogs": _get_cogs,
+    "analyze_profitability": _analyze_profitability,
     "get_report": _get_report,
 }
 
@@ -408,7 +649,7 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
-    max_tool_rounds = 5
+    max_tool_rounds = 25
     for round_num in range(max_tool_rounds):
         # ── Streaming call with tools ──────────────────────────────────────
         try:
@@ -432,32 +673,39 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
         tool_calls_acc: dict[int, dict] = {}
         finish_reason = None
 
-        async for chunk in stream:
-            delta = chunk.choices[0].delta
-            finish_reason = chunk.choices[0].finish_reason or finish_reason
+        try:
+            async for chunk in stream:
+                delta = chunk.choices[0].delta
+                finish_reason = chunk.choices[0].finish_reason or finish_reason
 
-            # Text token
-            if delta.content:
-                text_chunks.append(delta.content)
-                yield {"type": "token", "content": delta.content}
+                # Text token
+                if delta.content:
+                    text_chunks.append(delta.content)
+                    yield {"type": "token", "content": delta.content}
 
-            # Tool-call deltas arrive incrementally
-            if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {
-                            "id": tc_delta.id or "",
-                            "name": tc_delta.function.name or "" if tc_delta.function else "",
-                            "arguments_parts": [],
-                        }
-                    acc = tool_calls_acc[idx]
-                    if tc_delta.id:
-                        acc["id"] = tc_delta.id
-                    if tc_delta.function and tc_delta.function.name:
-                        acc["name"] = tc_delta.function.name
-                    if tc_delta.function and tc_delta.function.arguments:
-                        acc["arguments_parts"].append(tc_delta.function.arguments)
+                # Tool-call deltas arrive incrementally
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {
+                                "id": tc_delta.id or "",
+                                "name": tc_delta.function.name or "" if tc_delta.function else "",
+                                "arguments_parts": [],
+                            }
+                        acc = tool_calls_acc[idx]
+                        if tc_delta.id:
+                            acc["id"] = tc_delta.id
+                        if tc_delta.function and tc_delta.function.name:
+                            acc["name"] = tc_delta.function.name
+                        if tc_delta.function and tc_delta.function.arguments:
+                            acc["arguments_parts"].append(tc_delta.function.arguments)
+        except Exception as e:
+            error_msg = f"Sorry, the LLM stream failed: {e}"
+            print(f"[agent] stream error: {e}")
+            yield {"type": "error", "content": error_msg}
+            await save_message(session_id, "assistant", error_msg)
+            return
 
         # ── Handle tool calls ──────────────────────────────────────────────
         if tool_calls_acc:
