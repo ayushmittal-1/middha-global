@@ -394,8 +394,9 @@
         }
 
         case 'tool_result': {
-          // Populate the matching card
-          const card = chatContainer.querySelector(`.tool-result-card[data-tool="${event.name}"]`);
+          // Populate the oldest still-loading card for this tool name
+          // (handles same-name parallel/repeated calls — first match wins, but only among loading ones)
+          const card = chatContainer.querySelector(`.tool-result-card.loading[data-tool="${event.name}"]`);
           if (card) {
             card.classList.remove('loading');
             const body = card.querySelector('.tool-result-body');
