@@ -18,18 +18,165 @@ from urllib.parse import quote, urlencode, urlparse
 
 import httpx
 
-from amazon_ads import get_access_token
+from amazon_ads import get_sp_access_token
+from auth import require_user
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── App-level config (stays in env) ──────────────────────────────────────────
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-SELLER_ID = os.getenv("AMAZON_SELLER_ID", "")
-MARKETPLACE_ID = os.getenv("AMAZON_MARKETPLACE_ID", "ATVPDKIKX0DER")
 
-SP_API_BASE = "https://sellingpartnerapi-na.amazon.com"
-SP_API_REGION = "us-east-1"
+# Region-aware SP-API hosts.
+_SP_API_BASES = {
+    "NA": ("https://sellingpartnerapi-na.amazon.com", "us-east-1"),
+    "EU": ("https://sellingpartnerapi-eu.amazon.com", "eu-west-1"),
+    "FE": ("https://sellingpartnerapi-fe.amazon.com", "us-west-2"),
+}
 SP_API_SERVICE = "execute-api"
+
+
+def _sp_base_and_region(user: dict) -> tuple[str, str]:
+    region = (user.get("marketplace") or "NA").upper()
+    return _SP_API_BASES.get(region, _SP_API_BASES["NA"])
+
+
+_US_MARKETPLACE_ID = "ATVPDKIKX0DER"
+
+# Human-readable names for the marketplace IDs Amazon publishes. Used by the
+# new `get_marketplaces` tool so the LLM can present a friendly picker.
+MARKETPLACE_NAMES = {
+    "ATVPDKIKX0DER": "United States",
+    "A2EUQ1WTGCTBG2": "Canada",
+    "A1AM78C64UM0Y8": "Mexico",
+    "A2Q3Y263D00KWC": "Brazil",
+    "A1F83G8C2ARO7P": "United Kingdom",
+    "A1PA6795UKMFR9": "Germany",
+    "A13V1IB3VIYZZH": "France",
+    "APJ6JRA9NG5V4": "Italy",
+    "A1RKKUPIHCS9HS": "Spain",
+    "A1805IZSGTT6HS": "Netherlands",
+    "A2NODRKZP88ZB9": "Sweden",
+    "A1C3SOZRARQ6R3": "Poland",
+    "ARBP9OOSHTCHU": "Egypt",
+    "A33AVAJ2PDY3EV": "Turkey",
+    "A17E79C6D8DWNP": "Saudi Arabia",
+    "A2VIGQ35RCS4UG": "United Arab Emirates",
+    "A21TJRUUN4KGV": "India",
+    "A19VAU5U5O7RUS": "Singapore",
+    "A39IBJ37TRP1C6": "Australia",
+    "A1VC38T7YXB528": "Japan",
+    # Common mis-mapped ones that appear in NA accounts (verify in your seller central):
+    "A1MQXOICRS2Z7M": "Canada (FBA)",
+    "A2ZV50J4W1RKNI": "Saudi Arabia",
+    "A3H6HPSLHAK3XG": "Egypt",
+    "AHRY1CZE9ZY4H": "Singapore",
+}
+
+
+def _user_marketplace_ids(user: dict) -> list[str]:
+    """All marketplaces the user is registered in. Fall back to US."""
+    ids = user.get("amazonMarketplaceIds") or []
+    return [str(x) for x in ids] if ids else [_US_MARKETPLACE_ID]
+
+
+def _user_primary_marketplace_id(user: dict) -> str:
+    """For endpoints that accept only a single marketplace id (inventory
+    granularity, single-marketplace reports). Prefer US when available so
+    the chatbot shows the active warehouse rather than an empty regional
+    sub-marketplace."""
+    ids = _user_marketplace_ids(user)
+    return _US_MARKETPLACE_ID if _US_MARKETPLACE_ID in ids else ids[0]
+
+
+def list_marketplaces() -> list[dict]:
+    """Return the current user's marketplaces with human-readable names."""
+    user = require_user()
+    primary = _user_primary_marketplace_id(user)
+    return [
+        {
+            "id": mid,
+            "name": MARKETPLACE_NAMES.get(mid, "Unknown"),
+            "is_primary": mid == primary,
+        }
+        for mid in _user_marketplace_ids(user)
+    ]
+
+
+# ISO-style short codes → list of canonical marketplace ids. Some countries
+# have multiple historical ids (e.g. Saudi Arabia is A17E79C6D8DWNP on some
+# seller central regions and A2ZV50J4W1RKNI on others); resolve_marketplace
+# picks whichever one the *user* actually has.
+_SHORT_CODES = {
+    "us": ["ATVPDKIKX0DER"], "usa": ["ATVPDKIKX0DER"],
+    "ca": ["A2EUQ1WTGCTBG2", "A1MQXOICRS2Z7M"],
+    "mx": ["A1AM78C64UM0Y8"],
+    "br": ["A2Q3Y263D00KWC"],
+    "uk": ["A1F83G8C2ARO7P"], "gb": ["A1F83G8C2ARO7P"],
+    "de": ["A1PA6795UKMFR9"],
+    "fr": ["A13V1IB3VIYZZH"],
+    "it": ["APJ6JRA9NG5V4"],
+    "es": ["A1RKKUPIHCS9HS"],
+    "nl": ["A1805IZSGTT6HS"],
+    "se": ["A2NODRKZP88ZB9"],
+    "pl": ["A1C3SOZRARQ6R3"],
+    "tr": ["A33AVAJ2PDY3EV"],
+    "eg": ["ARBP9OOSHTCHU", "A3H6HPSLHAK3XG"],
+    "sa": ["A17E79C6D8DWNP", "A2ZV50J4W1RKNI"],
+    "ae": ["A2VIGQ35RCS4UG"], "uae": ["A2VIGQ35RCS4UG"],
+    "in": ["A21TJRUUN4KGV"],
+    "sg": ["A19VAU5U5O7RUS", "AHRY1CZE9ZY4H"],
+    "au": ["A39IBJ37TRP1C6"],
+    "jp": ["A1VC38T7YXB528"],
+}
+
+
+def resolve_marketplace(
+    user: dict,
+    requested: str | list[str] | None,
+    *,
+    multiple: bool,
+) -> list[str] | str:
+    """Turn the LLM's `marketplace` arg into a clean marketplace id list (or
+    single id). Accepts an id, full country name ("United States"), short
+    code ("US", "SA", "UK"), a comma-separated string, a list, or None.
+    If None: use all (multiple=True) or the primary (multiple=False)."""
+    available = _user_marketplace_ids(user)
+    full_name_lookup = {v.lower(): k for k, v in MARKETPLACE_NAMES.items()}
+
+    def normalize(item: str) -> str | None:
+        item = (item or "").strip()
+        if not item:
+            return None
+        if item in available:
+            return item
+        # Full country name ("United States", "Saudi Arabia") — picks whichever
+        # canonical id matches first; verify it's actually one this user has.
+        full = full_name_lookup.get(item.lower())
+        if full and full in available:
+            return full
+        # ISO-ish short code — multiple candidates possible, pick the first
+        # one the user actually has registered.
+        for candidate in _SHORT_CODES.get(item.lower(), []):
+            if candidate in available:
+                return candidate
+        return None
+
+    if requested is None or requested == "":
+        return available if multiple else _user_primary_marketplace_id(user)
+
+    if isinstance(requested, str):
+        parts = [normalize(p) for p in requested.split(",")]
+    else:
+        parts = [normalize(p) for p in requested]
+
+    cleaned = [p for p in parts if p]
+    if not cleaned:
+        # Nothing matched — fall back so the call doesn't hard-fail, but
+        # this usually means the LLM passed a bad code. Behavior is the
+        # same as omitting the arg.
+        return available if multiple else _user_primary_marketplace_id(user)
+
+    return cleaned if multiple else cleaned[0]
 
 # ── SigV4 signing ────────────────────────────────────────────────────────────
 
@@ -50,6 +197,7 @@ def _sigv4_headers(
     method: str,
     url: str,
     headers: dict,
+    region: str,
     body: str = "",
 ) -> dict:
     """Add SigV4 Authorization header to the request headers dict (in-place + returned)."""
@@ -86,7 +234,7 @@ def _sigv4_headers(
         payload_hash,
     ])
 
-    credential_scope = f"{date_stamp}/{SP_API_REGION}/{SP_API_SERVICE}/aws4_request"
+    credential_scope = f"{date_stamp}/{region}/{SP_API_SERVICE}/aws4_request"
     string_to_sign = "\n".join([
         "AWS4-HMAC-SHA256",
         amz_date,
@@ -94,7 +242,7 @@ def _sigv4_headers(
         hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
     ])
 
-    signing_key = _get_signature_key(secret_key, date_stamp, SP_API_REGION, SP_API_SERVICE)
+    signing_key = _get_signature_key(secret_key, date_stamp, region, SP_API_SERVICE)
     signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
     headers["Authorization"] = (
@@ -113,11 +261,13 @@ async def _sp_request(
     params: dict | None = None,
     body: dict | None = None,
 ) -> dict | list | str:
-    """Make a signed SP-API request."""
-    access_token = await get_access_token()
+    """Make a signed SP-API request on behalf of the current authenticated user."""
+    user = require_user()
+    access_token = await get_sp_access_token(user)
+    sp_base, sp_region = _sp_base_and_region(user)
 
     query_string = urlencode(params, doseq=True) if params else ""
-    url = f"{SP_API_BASE}{path}"
+    url = f"{sp_base}{path}"
     if query_string:
         url = f"{url}?{query_string}"
 
@@ -127,7 +277,7 @@ async def _sp_request(
     headers = {
         "content-type": "application/json",
     }
-    _sigv4_headers(method, url, headers, body=body_str)
+    _sigv4_headers(method, url, headers, sp_region, body=body_str)
 
     # Add non-signed headers after signing
     headers["x-amz-access-token"] = access_token
@@ -159,10 +309,14 @@ async def get_orders(
     created_after: str | None = None,
     statuses: list[str] | None = None,
     max_results: int = 20,
+    marketplace: str | list[str] | None = None,
 ) -> dict:
-    """List orders. created_after is ISO-8601 (e.g. '2024-01-01T00:00:00Z')."""
+    """List orders across the requested marketplaces (default: all the user
+    is registered in). created_after is ISO-8601 (e.g. '2024-01-01T00:00:00Z')."""
+    user = require_user()
+    marketplace_ids = resolve_marketplace(user, marketplace, multiple=True)
     params = {
-        "MarketplaceIds": MARKETPLACE_ID,
+        "MarketplaceIds": ",".join(marketplace_ids),
         "MaxResultsPerPage": str(min(max_results, 100)),
     }
     if created_after:
@@ -188,13 +342,18 @@ async def get_order_items(order_id: str) -> dict:
 async def get_inventory_summaries(
     skus: list[str] | None = None,
     details: bool = True,
+    marketplace: str | None = None,
 ) -> dict:
-    """Get FBA inventory levels."""
+    """Get FBA inventory levels. SP-API requires a single granularityId per
+    call, so this scopes to one marketplace at a time (default: user's
+    primary, US-preferred)."""
+    user = require_user()
+    marketplace_id = resolve_marketplace(user, marketplace, multiple=False)
     params = {
         "details": str(details).lower(),
         "granularityType": "Marketplace",
-        "granularityId": MARKETPLACE_ID,
-        "marketplaceIds": MARKETPLACE_ID,
+        "granularityId": marketplace_id,
+        "marketplaceIds": marketplace_id,
     }
     if skus:
         params["sellerSkus"] = ",".join(skus)
@@ -208,11 +367,15 @@ async def create_report(
     report_type: str,
     start_date: str | None = None,
     end_date: str | None = None,
+    marketplace: str | list[str] | None = None,
 ) -> dict:
-    """Request a new report. Returns reportId for polling."""
+    """Request a new report. Returns reportId for polling. By default, covers
+    all the user's marketplaces."""
+    user = require_user()
+    marketplace_ids = resolve_marketplace(user, marketplace, multiple=True)
     body: dict = {
         "reportType": report_type,
-        "marketplaceIds": [MARKETPLACE_ID],
+        "marketplaceIds": marketplace_ids,
     }
     if start_date or end_date:
         body["dataStartTime"] = start_date

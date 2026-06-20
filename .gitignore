@@ -2,3 +2,15 @@
 .venv/
 __pycache__/
 *.pyc
+
+# Separate sub-repo, not part of this project
+auroraBackend/
+
+# Legacy SQLite chat store — replaced by Mongo `conversations` collection
+backend/chat.db
+backend/chat.db*
+
+# Local data dumps
+inventory_full.json
+*.bak
+ROADMAP.md

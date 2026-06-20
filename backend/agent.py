@@ -201,7 +201,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_orders",
-            "description": "Fetch recent Amazon orders from the Selling Partner API. Returns order IDs, dates, statuses, and totals.",
+            "description": "Fetch recent Amazon orders from the Selling Partner API. By default searches across ALL marketplaces the user is registered in; pass `marketplace` to scope to one (or several) — e.g. 'US' or 'A1F83G8C2ARO7P' or 'US,UK'. Returns order IDs, dates, statuses, and totals.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -211,8 +211,11 @@ TOOLS = [
                     },
                     "status": {
                         "type": "string",
-                        "description": "Filter by order status.",
-                        "enum": ["Unshipped", "PartiallyShipped", "Shipped", "Canceled", "Unfulfillable"],
+                        "description": "Filter by order status. One of: Unshipped, PartiallyShipped, Shipped, Canceled, Unfulfillable. Omit to get all.",
+                    },
+                    "marketplace": {
+                        "type": ["string", "null"],
+                        "description": "Optional. Marketplace id (e.g. ATVPDKIKX0DER), short name ('US', 'UK', 'UAE'), or comma-separated list. Omit / null to search all the user's marketplaces. Call get_marketplaces first if you're unsure what's available.",
                     },
                 },
             },
@@ -222,14 +225,18 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_inventory",
-            "description": "Check FBA inventory levels via the Selling Partner API. Returns fulfillable, inbound, reserved, and unfulfillable quantities per SKU.",
+            "description": "Check FBA inventory levels via the Selling Partner API. Returns fulfillable, inbound, reserved, and unfulfillable quantities per SKU. SP-API requires a single marketplace per call — defaults to the user's primary (US-preferred); pass `marketplace` to override.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "skus": {
-                        "type": "array",
+                        "type": ["array", "null"],
                         "items": {"type": "string"},
-                        "description": "Optional list of seller SKUs to filter. Omit for all inventory.",
+                        "description": "Optional list of seller SKUs to filter. Omit, pass null, or pass [] to get ALL inventory.",
+                    },
+                    "marketplace": {
+                        "type": ["string", "null"],
+                        "description": "Optional. One marketplace id or short name ('US', 'UK', 'MX', etc). Omit / null for the user's primary marketplace.",
                     },
                 },
             },
@@ -239,13 +246,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_order_items",
-            "description": "Fetch line items (SKU, ASIN, item price, quantity, promo discount) for a single Amazon order. Use this to break an order down to SKU-level revenue — required for any per-SKU profitability calculation.",
+            "description": "Fetch line items (SKU, ASIN, item price, quantity, promo discount) for a single Amazon order. Use this to break an order down to SKU-level revenue. NOT for SKUs/ASINs — those go to get_inventory or get_orders.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "order_id": {
-                        "type": "string",
-                        "description": "The AmazonOrderId returned by get_orders (e.g. '114-4871996-9329822').",
+                        "type": ["string", "object"],
+                        "description": "The AmazonOrderId returned by get_orders. Format is exactly '3-7-7' digits (e.g. '114-4871996-9329822'). Do NOT pass a SKU or ASIN here.",
                     },
                 },
                 "required": ["order_id"],
@@ -261,9 +268,9 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "skus": {
-                        "type": "array",
+                        "type": ["array", "null"],
                         "items": {"type": "string"},
-                        "description": "Optional list of seller SKUs. Omit to get all stored COGS rows.",
+                        "description": "Optional list of seller SKUs. Omit, pass null, or pass [] to get all stored COGS rows.",
                     },
                 },
             },
@@ -316,6 +323,14 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_marketplaces",
+            "description": "List the Amazon marketplaces the user is registered in (id + human-readable country name + which is primary). Call this when the user asks 'which marketplaces do I have?', or before scoping another tool (get_orders / get_inventory) to a specific country.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 # ── Tool function wrappers ──────────────────────────────────────────────────
@@ -357,31 +372,35 @@ async def _create_campaign(
     })
 
 
-def _analyze_campaign_performance() -> str:
-    return analyze_performance()
+async def _analyze_campaign_performance() -> str:
+    return await analyze_performance()
 
 
 async def _search_meta_ads(query: str, country: str = "US", active_only: bool = True) -> str:
     return await search_meta_ads(query, country=country, active_only=active_only)
 
 
-def _get_campaigns_summary(query: str = "") -> str:
+async def _get_campaigns_summary(query: str = "") -> str:
     if query:
-        return search_campaigns(query)
-    return get_campaigns_summary()
+        return await search_campaigns(query)
+    return await get_campaigns_summary()
 
 
-async def _get_orders(days_back: int | str = 7, status: str | None = None) -> str:
+async def _get_orders(days_back: int | str = 7, status: str | None = None, marketplace=None) -> str:
     try:
         days_back = int(days_back)
     except (TypeError, ValueError):
         days_back = 7
+    valid_statuses = {"Unshipped", "PartiallyShipped", "Shipped", "Canceled", "Unfulfillable"}
+    statuses = [status] if status in valid_statuses else None
     created_after = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    statuses = [status] if status else None
     try:
-        data = await amazon_sp.get_orders(created_after=created_after, statuses=statuses)
+        data = await amazon_sp.get_orders(
+            created_after=created_after, statuses=statuses, marketplace=marketplace,
+        )
     except Exception as e:
         return f"Error fetching orders: {e}"
+
     orders = data.get("payload", {}).get("Orders", [])
     if not orders:
         return f"No orders found in the last {days_back} days."
@@ -396,9 +415,17 @@ async def _get_orders(days_back: int | str = 7, status: str | None = None) -> st
     return f"Orders (last {days_back} days, {len(orders)} total):\n" + "\n".join(lines)
 
 
-async def _get_inventory(skus: list[str] | None = None) -> str:
+async def _get_inventory(skus=None, marketplace=None) -> str:
+    # Models occasionally emit `skus={}` or `skus="ABC,DEF"` instead of a list.
+    # Coerce to a clean list-or-None so the SP-API call doesn't blow up.
+    if isinstance(skus, str):
+        skus = [s.strip() for s in skus.split(",") if s.strip()]
+    elif not isinstance(skus, list):
+        skus = None
+    if skus is not None and not skus:
+        skus = None
     try:
-        data = await amazon_sp.get_inventory_summaries(skus=skus)
+        data = await amazon_sp.get_inventory_summaries(skus=skus, marketplace=marketplace)
     except Exception as e:
         return f"Error fetching inventory: {e}"
     summaries = data.get("payload", {}).get("inventorySummaries", [])
@@ -417,7 +444,23 @@ async def _get_inventory(skus: list[str] | None = None) -> str:
     return f"FBA Inventory ({len(summaries)} SKUs):\n" + "\n".join(lines)
 
 
-async def _get_order_items(order_id: str) -> str:
+_AMAZON_ORDER_ID_RE = __import__("re").compile(r"^\d{3}-\d{7}-\d{7}$")
+
+
+async def _get_order_items(order_id=None) -> str:
+    # Models sometimes wrap the id in an object like {"order_id": "..."}
+    # or {"sku": "..."}. Coerce to a string and validate the shape.
+    if isinstance(order_id, dict):
+        order_id = order_id.get("order_id") or order_id.get("AmazonOrderId") or next(iter(order_id.values()), "")
+    order_id = str(order_id or "").strip()
+    if not order_id:
+        return "Error: get_order_items needs an order_id. Get one from get_orders first."
+    if not _AMAZON_ORDER_ID_RE.match(order_id):
+        return (
+            f"Error: '{order_id}' is not an AmazonOrderId (expected '3-7-7' digit format, "
+            f"e.g. '114-4871996-9329822'). If this is a SKU or ASIN, call get_orders to "
+            "find which orders contain it, then call get_order_items on those order ids."
+        )
     try:
         data = await amazon_sp.get_order_items(order_id)
     except Exception as e:
@@ -438,7 +481,13 @@ async def _get_order_items(order_id: str) -> str:
     return f"Order {order_id} items ({len(items)}):\n" + "\n".join(lines)
 
 
-async def _get_cogs(skus: list[str] | None = None) -> str:
+async def _get_cogs(skus=None) -> str:
+    if isinstance(skus, str):
+        skus = [s.strip() for s in skus.split(",") if s.strip()]
+    elif not isinstance(skus, list):
+        skus = None
+    if skus is not None and not skus:
+        skus = None
     try:
         rows = await get_cogs(skus)
     except Exception as e:
@@ -614,7 +663,20 @@ TOOL_FUNCTIONS = {
     "get_cogs": _get_cogs,
     "analyze_profitability": _analyze_profitability,
     "get_report": _get_report,
+    "get_marketplaces": lambda: _format_marketplaces(),
 }
+
+
+def _format_marketplaces() -> str:
+    rows = amazon_sp.list_marketplaces()
+    if not rows:
+        return "No marketplaces registered on this account."
+    lines = ["The user is registered in the following marketplaces:"]
+    for r in rows:
+        flag = " (primary)" if r["is_primary"] else ""
+        lines.append(f"- {r['id']} — {r['name']}{flag}")
+    lines.append("\nWhen scoping a tool, pass marketplace=<id> or marketplace=<short name like 'US'>.")
+    return "\n".join(lines)
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -660,6 +722,11 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
                 stream=True,
                 temperature=0.3,
                 max_tokens=1024,
+                # Discourage the model from emitting the same n-gram over and
+                # over — llama-4-scout is prone to token-repetition loops on
+                # vague prompts ("last 7 ?") and needs a nudge.
+                frequency_penalty=0.5,
+                presence_penalty=0.3,
             )
         except Exception as e:
             error_msg = f"Sorry, I encountered an error: {e}"
@@ -672,6 +739,12 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
         # tool_calls_acc: dict of index -> {id, name, arguments_parts}
         tool_calls_acc: dict[int, dict] = {}
         finish_reason = None
+        # Repetition guard: count how many times the most recent non-trivial
+        # line has appeared. If it crosses a threshold, abort the stream —
+        # the model is stuck in a loop and the rest is garbage.
+        last_line = ""
+        repeat_count = 0
+        REPEAT_LIMIT = 6
 
         try:
             async for chunk in stream:
@@ -682,6 +755,23 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
                 if delta.content:
                     text_chunks.append(delta.content)
                     yield {"type": "token", "content": delta.content}
+
+                    # Detect repetition on completed lines only — token-level
+                    # comparison would false-positive on legitimate prose.
+                    if "\n" in delta.content:
+                        recent_text = "".join(text_chunks)
+                        lines = [l.strip() for l in recent_text.splitlines() if l.strip()]
+                        if lines:
+                            current = lines[-1]
+                            if current == last_line and len(current) >= 3:
+                                repeat_count += 1
+                                if repeat_count >= REPEAT_LIMIT:
+                                    print(f"[agent] repetition loop detected on: {current!r} — aborting stream")
+                                    await stream.close()
+                                    break
+                            else:
+                                last_line = current
+                                repeat_count = 0
 
                 # Tool-call deltas arrive incrementally
                 if delta.tool_calls:
@@ -772,6 +862,8 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
             stream=True,
             temperature=0.3,
             max_tokens=1024,
+            frequency_penalty=0.5,
+            presence_penalty=0.3,
         )
 
         full_reply: list[str] = []

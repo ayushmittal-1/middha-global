@@ -1,20 +1,25 @@
 """
 Amazon Advertising API integration — OAuth + Sponsored Products campaign creation.
+
+App-level secrets (LWA client id/secret) live in .env. Per-user secrets
+(refresh tokens, profile id, region/marketplace) come from the authenticated
+user document in MongoDB — loaded by `auth.protect` / `auth.authenticate_ws`
+and pulled from the ContextVar by `auth.require_user()`.
 """
 
 import os
-from pathlib import Path
 
 import httpx
 
-# ── Config ───────────────────────────────────────────────────────────────────
+from auth import require_user
+from bson import ObjectId
+from datetime import datetime, timezone
+
+# ── App-level config (stays in env) ──────────────────────────────────────────
 LWA_CLIENT_ID = os.getenv("AMAZON_LWA_CLIENT_ID", "")
 LWA_CLIENT_SECRET = os.getenv("AMAZON_LWA_CLIENT_SECRET", "")
-REFRESH_TOKEN = os.getenv("AMAZON_REFRESH_TOKEN", "")
-PROFILE_ID = os.getenv("AMAZON_PROFILE_ID", "")
 
-# Region-aware endpoints (mirrors Aurora's amazonAPI.js). Set AMAZON_REGION to
-# NA (North America), EU (Europe), or FE (Far East). Defaults to NA.
+# Region-aware endpoints (mirrors Aurora's amazonAPI.js).
 _TOKEN_URLS = {
     "NA": "https://api.amazon.com/auth/o2/token",
     "EU": "https://api.amazon.co.uk/auth/o2/token",
@@ -33,31 +38,39 @@ SP_KEYWORD_CT = "application/vnd.spKeyword.v3+json"
 SP_NEGATIVE_KEYWORD_CT = "application/vnd.spNegativeKeyword.v3+json"
 SP_PRODUCT_AD_CT = "application/vnd.spProductAd.v3+json"
 
-_cached_access_token: str | None = None
+
+def _user_region(user: dict) -> str:
+    return (user.get("marketplace") or "NA").upper()
 
 
-def _region() -> str:
-    return os.getenv("AMAZON_REGION", "NA").upper()
+def _token_url(user: dict) -> str:
+    return _TOKEN_URLS.get(_user_region(user), _TOKEN_URLS["NA"])
 
 
-def _token_url() -> str:
-    return _TOKEN_URLS.get(_region(), _TOKEN_URLS["NA"])
+def _ads_base(user: dict) -> str:
+    return _ADS_BASE_URLS.get(_user_region(user), _ADS_BASE_URLS["NA"])
 
 
-def _ads_base() -> str:
-    return _ADS_BASE_URLS.get(_region(), _ADS_BASE_URLS["NA"])
+def _ads_profile_id(user: dict) -> str:
+    profiles = user.get("amazonAdsProfileIds") or []
+    return str(profiles[0]) if profiles else ""
 
 
 # ── OAuth helpers ────────────────────────────────────────────────────────────
 
 async def exchange_auth_code(code: str, redirect_uri: str) -> dict:
-    """Exchange an authorization code for access + refresh tokens."""
+    """Exchange an authorization code for access + refresh tokens.
+
+    Token exchange uses app-level LWA creds and does not need user context.
+    Default to the NA token URL — Amazon LWA accepts cross-region exchanges.
+    """
+    url = os.getenv("AMAZON_TOKEN_URL", _TOKEN_URLS["NA"])
     print(
-        f"[exchange_auth_code] POST {_token_url()} redirect_uri={redirect_uri!r} "
+        f"[exchange_auth_code] POST {url} redirect_uri={redirect_uri!r} "
         f"client_id={LWA_CLIENT_ID[:25]}... code={code[:8]}..."
     )
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(_token_url(), data={
+        resp = await client.post(url, data={
             "grant_type": "authorization_code",
             "code": code,
             "redirect_uri": redirect_uri,
@@ -70,53 +83,50 @@ async def exchange_auth_code(code: str, redirect_uri: str) -> dict:
         return resp.json()
 
 
-async def get_access_token() -> str:
-    """Get a fresh access token using the stored refresh token."""
-    global _cached_access_token
-
-    refresh = REFRESH_TOKEN or os.getenv("AMAZON_REFRESH_TOKEN", "")
+async def _get_access_token(user: dict, refresh_field: str) -> str:
+    refresh = user.get(refresh_field)
     if not refresh:
         raise RuntimeError(
-            "No Amazon refresh token configured. "
-            "Visit /amazon/login to complete the OAuth flow first."
+            f"User {user.get('email')} has no {refresh_field}. "
+            "Complete the Amazon OAuth flow in Aurora first."
         )
-
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(_token_url(), data={
+        resp = await client.post(_token_url(user), data={
             "grant_type": "refresh_token",
             "refresh_token": refresh,
             "client_id": LWA_CLIENT_ID,
             "client_secret": LWA_CLIENT_SECRET,
         })
         resp.raise_for_status()
-        data = resp.json()
-        _cached_access_token = data["access_token"]
-        return _cached_access_token
+        return resp.json()["access_token"]
 
 
-def _versioned_headers(access_token: str, content_type: str) -> dict:
+async def get_ads_access_token(user: dict | None = None) -> str:
+    """Fresh access token for the Advertising API."""
+    user = user or require_user()
+    return await _get_access_token(user, "amazonAdsRefreshToken")
+
+
+async def get_sp_access_token(user: dict | None = None) -> str:
+    """Fresh access token for the Selling Partner API."""
+    user = user or require_user()
+    return await _get_access_token(user, "amazonRefreshToken")
+
+
+# Backwards-compat alias — historical callers expected the SP-API token here.
+async def get_access_token() -> str:
+    return await get_sp_access_token()
+
+
+def _versioned_headers(user: dict, access_token: str, content_type: str) -> dict:
     """Headers for SP v3 endpoints, which require a per-resource versioned media type."""
-    profile_id = PROFILE_ID or os.getenv("AMAZON_PROFILE_ID", "")
     h = {
         "Authorization": f"Bearer {access_token}",
         "Amazon-Advertising-API-ClientId": LWA_CLIENT_ID,
         "Content-Type": content_type,
         "Accept": content_type,
     }
-    if profile_id:
-        h["Amazon-Advertising-API-Scope"] = profile_id
-    return h
-
-
-def _simple_headers(access_token: str) -> dict:
-    """Headers for plain-JSON endpoints (e.g. v2 profiles)."""
-    profile_id = PROFILE_ID or os.getenv("AMAZON_PROFILE_ID", "")
-    h = {
-        "Authorization": f"Bearer {access_token}",
-        "Amazon-Advertising-API-ClientId": LWA_CLIENT_ID,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+    profile_id = _ads_profile_id(user)
     if profile_id:
         h["Amazon-Advertising-API-Scope"] = profile_id
     return h
@@ -126,13 +136,14 @@ def _simple_headers(access_token: str) -> dict:
 
 async def _post_json(label: str, path: str, content_type: str, payload: dict) -> dict:
     """POST to an Ads API endpoint with logging of the request and response."""
-    token = await get_access_token()
-    url = f"{_ads_base()}{path}"
+    user = require_user()
+    token = await get_ads_access_token(user)
+    url = f"{_ads_base(user)}{path}"
     print(f"[amazon_ads] -> POST {label} {url}")
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(
             url,
-            headers=_versioned_headers(token, content_type),
+            headers=_versioned_headers(user, token, content_type),
             json=payload,
         )
         if resp.is_error:
@@ -148,7 +159,8 @@ async def get_profiles() -> list[dict]:
     The /v2/profiles listing must NOT include an Amazon-Advertising-API-Scope
     header (that header selects a single profile and an invalid value 400s).
     """
-    token = await get_access_token()
+    user = require_user()
+    token = await get_ads_access_token(user)
     headers = {
         "Authorization": f"Bearer {token}",
         "Amazon-Advertising-API-ClientId": LWA_CLIENT_ID,
@@ -156,7 +168,7 @@ async def get_profiles() -> list[dict]:
         "Accept": "application/json",
     }
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(f"{_ads_base()}/v2/profiles", headers=headers)
+        resp = await client.get(f"{_ads_base(user)}/v2/profiles", headers=headers)
         if resp.is_error:
             print(f"[get_profiles] FAILED status={resp.status_code} body={resp.text}")
             resp.raise_for_status()
@@ -169,27 +181,15 @@ async def create_sp_campaign(
     start_date: str,
     state: str = "ENABLED",
 ) -> dict:
-    """Create a Sponsored Products campaign.
-
-    Args:
-        name: Campaign name.
-        budget: Daily budget in the marketplace currency.
-        start_date: YYYY-MM-DD format.
-        state: 'ENABLED', 'PAUSED', or 'PROPOSED'.
-    """
+    """Create a Sponsored Products campaign."""
     payload = {
         "campaigns": [
             {
                 "name": name,
                 "targetingType": "MANUAL",
                 "state": state,
-                "dynamicBidding": {
-                    "strategy": "LEGACY_FOR_SALES",
-                },
-                "budget": {
-                    "budgetType": "DAILY",
-                    "budget": budget,
-                },
+                "dynamicBidding": {"strategy": "LEGACY_FOR_SALES"},
+                "budget": {"budgetType": "DAILY", "budget": budget},
                 "startDate": start_date,
             }
         ]
@@ -270,11 +270,7 @@ async def create_product_ad(
     asin: str | None = None,
     state: str = "ENABLED",
 ) -> dict:
-    """Create a Sponsored Products product ad linking a SKU or ASIN to an ad group.
-
-    A campaign needs at least one product ad to actually serve. Provide either a
-    seller SKU (FBA/seller-fulfilled) or an ASIN (vendor / catalog item).
-    """
+    """Create a Sponsored Products product ad linking a SKU or ASIN to an ad group."""
     if not sku and not asin:
         raise ValueError("create_product_ad requires either a sku or an asin.")
 
@@ -292,47 +288,35 @@ async def create_product_ad(
     return await _post_json("productAd", "/sp/productAds", SP_PRODUCT_AD_CT, payload)
 
 
-# ── Persist refresh token to .env ────────────────────────────────────────────
+# ── Persist OAuth results back to the user document ──────────────────────────
 
-def save_refresh_token(token: str) -> None:
-    """Write AMAZON_REFRESH_TOKEN back to .env file."""
-    global REFRESH_TOKEN
-    REFRESH_TOKEN = token
-    os.environ["AMAZON_REFRESH_TOKEN"] = token
+async def save_refresh_token(token: str, scope: str = "sp") -> None:
+    """Write the refresh token into the authenticated user's Mongo doc.
 
-    env_path = Path(__file__).parent.parent / ".env"
-    content = env_path.read_text()
-    if "AMAZON_REFRESH_TOKEN=" in content:
-        lines = content.splitlines()
-        new_lines = []
-        for line in lines:
-            if line.startswith("AMAZON_REFRESH_TOKEN="):
-                new_lines.append(f"AMAZON_REFRESH_TOKEN={token}")
-            else:
-                new_lines.append(line)
-        env_path.write_text("\n".join(new_lines) + "\n")
-    else:
-        with open(env_path, "a") as f:
-            f.write(f"\nAMAZON_REFRESH_TOKEN={token}\n")
+    scope='sp' writes amazonRefreshToken, scope='ads' writes amazonAdsRefreshToken.
+    """
+    user = require_user()
+    field = "amazonAdsRefreshToken" if scope == "ads" else "amazonRefreshToken"
+    expires_field = "amazonAdsTokenExpiresAt" if scope == "ads" else "amazonTokenExpiresAt"
+
+    from auth import _db  # local import to avoid circular at module load
+    await _db().users.update_one(
+        {"_id": ObjectId(str(user["_id"]))},
+        {"$set": {field: token, expires_field: None, "updatedAt": datetime.now(timezone.utc)}},
+    )
+    user[field] = token
 
 
-def save_profile_id(profile_id: str) -> None:
-    """Write AMAZON_PROFILE_ID back to .env file."""
-    global PROFILE_ID
-    PROFILE_ID = profile_id
-    os.environ["AMAZON_PROFILE_ID"] = profile_id
+async def save_profile_id(profile_id: str) -> None:
+    """Append profile_id onto the user's amazonAdsProfileIds (and dedupe)."""
+    user = require_user()
+    existing = list(user.get("amazonAdsProfileIds") or [])
+    if profile_id not in existing:
+        existing.insert(0, profile_id)
 
-    env_path = Path(__file__).parent.parent / ".env"
-    content = env_path.read_text()
-    if "AMAZON_PROFILE_ID=" in content:
-        lines = content.splitlines()
-        new_lines = []
-        for line in lines:
-            if line.startswith("AMAZON_PROFILE_ID="):
-                new_lines.append(f"AMAZON_PROFILE_ID={profile_id}")
-            else:
-                new_lines.append(line)
-        env_path.write_text("\n".join(new_lines) + "\n")
-    else:
-        with open(env_path, "a") as f:
-            f.write(f"\nAMAZON_PROFILE_ID={profile_id}\n")
+    from auth import _db
+    await _db().users.update_one(
+        {"_id": ObjectId(str(user["_id"]))},
+        {"$set": {"amazonAdsProfileIds": existing, "updatedAt": datetime.now(timezone.utc)}},
+    )
+    user["amazonAdsProfileIds"] = existing
