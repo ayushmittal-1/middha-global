@@ -1,28 +1,35 @@
 import os
 import httpx
 
-AURORA_API_URL = "https://aurorabackend-is4p.onrender.com/api/ads"
-AURORA_API_TOKEN = os.getenv(
-    "AURORA_API_TOKEN",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjY5ZTBjNzUxMzYxODE0ZDg5ZGUzZmEwYiIsImlhdCI6MTc3OTUzMTEzMywiZXhwIjoxNzgyMTIzMTMzfQ.Imk0CJm2-ocMtuJz1kPRPQ15l6PlT4AkzcCCAuAcsc0",
-)
+from auth import require_user
 
-_campaigns: list[dict] = []
-_campaigns_summary: str = ""
+AURORA_API_URL = os.getenv("AURORA_API_URL", "https://aurorabackend-is4p.onrender.com/api/ads")
+
+# Cache campaigns per-user so different sellers don't see each other's data.
+_user_campaigns: dict[str, list[dict]] = {}
+_user_summary: dict[str, str] = {}
 
 
-async def fetch_all_campaigns():
-    """Fetch all campaigns from Aurora API with pagination."""
-    global _campaigns, _campaigns_summary
+def _user_key() -> str:
+    return str(require_user()["_id"])
+
+
+async def fetch_all_campaigns(user: dict | None = None) -> None:
+    """Fetch all campaigns from Aurora API with pagination using the current
+    user's JWT — same token that authenticated this request."""
+    user = user or require_user()
+    token = user.get("_token")
+    if not token:
+        raise RuntimeError("Authenticated user has no Bearer token attached")
 
     headers = {
         "accept": "*/*",
-        "authorization": f"Bearer {AURORA_API_TOKEN}",
+        "authorization": f"Bearer {token}",
         "origin": "https://www.auroratest.in",
         "referer": "https://www.auroratest.in/",
     }
 
-    all_campaigns = []
+    all_campaigns: list[dict] = []
     page = 1
     limit = 100
 
@@ -46,14 +53,20 @@ async def fetch_all_campaigns():
                 break
             page += 1
 
-    _campaigns = all_campaigns
-    _campaigns_summary = _build_summary(all_campaigns)
-    print(f"Loaded {len(_campaigns)} campaigns")
+    key = str(user["_id"])
+    _user_campaigns[key] = all_campaigns
+    _user_summary[key] = _build_summary(all_campaigns)
+    print(f"Loaded {len(all_campaigns)} campaigns for user {user.get('email')}")
+
+
+async def _ensure_loaded() -> None:
+    key = _user_key()
+    if key not in _user_campaigns:
+        await fetch_all_campaigns()
 
 
 def _build_summary(campaigns: list[dict]) -> str:
     """Build an ultra-compact pipe-delimited summary of campaigns for LLM context."""
-    # Use short column names and pipe delimiter to minimize token count
     lines = ["nm|tp|st|co|bgt|spd|sal|dt"]
     for c in campaigns:
         budget = c.get("budget") or {}
@@ -63,7 +76,6 @@ def _build_summary(campaigns: list[dict]) -> str:
         sales = c.get("sales") or {}
         sa = sales.get("amount", "")
         sd = (c.get("startDate") or "")[:10]
-        # Abbreviate type
         ctype = c.get("campaignType", "")
         if ctype == "Sponsored Products":
             ctype = "SP"
@@ -71,7 +83,6 @@ def _build_summary(campaigns: list[dict]) -> str:
             ctype = "SB"
         elif ctype == "Sponsored Display":
             ctype = "SD"
-        # Abbreviate status
         status = c.get("status", "")
         smap = {"Enabled": "E", "Paused": "P", "Archived": "A"}
         status = smap.get(status, status)
@@ -81,34 +92,39 @@ def _build_summary(campaigns: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def get_campaigns() -> list[dict]:
-    return _campaigns
+async def get_campaigns() -> list[dict]:
+    await _ensure_loaded()
+    return _user_campaigns[_user_key()]
 
 
-def get_campaigns_summary() -> str:
-    return _campaigns_summary
+async def get_campaigns_summary() -> str:
+    await _ensure_loaded()
+    return _user_summary[_user_key()]
 
 
-def search_campaigns(query: str) -> str:
+async def search_campaigns(query: str) -> str:
     """Search campaigns by name (case-insensitive). Returns matching campaigns."""
+    await _ensure_loaded()
+    campaigns = _user_campaigns[_user_key()]
     query_lower = query.lower()
-    matches = [c for c in _campaigns if query_lower in (c.get("campaignName", "")).lower()]
+    matches = [c for c in campaigns if query_lower in (c.get("campaignName", "")).lower()]
     if not matches:
         return f"No campaigns found matching '{query}'."
     return f"Found {len(matches)} campaign(s) matching '{query}':\n" + _build_summary(matches)
 
 
-def analyze_performance() -> str:
+async def analyze_performance() -> str:
     """Analyze campaign performance: ACOS, top/bottom performers, recommendations."""
-    if not _campaigns:
-        return "No campaign data available. Campaigns may not have loaded yet."
+    await _ensure_loaded()
+    campaigns = _user_campaigns[_user_key()]
+    if not campaigns:
+        return "No campaign data available."
 
-    results = []
-    top_performers = []
-    underperformers = []
-    paused_with_spend = []
+    top_performers: list[dict] = []
+    underperformers: list[dict] = []
+    paused_with_spend: list[dict] = []
 
-    for c in _campaigns:
+    for c in campaigns:
         spend_amt = float((c.get("spend") or {}).get("amount", 0) or 0)
         sales_amt = float((c.get("sales") or {}).get("amount", 0) or 0)
         budget_amt = float((c.get("budget") or {}).get("amount", 0) or 0)
@@ -141,17 +157,16 @@ def analyze_performance() -> str:
             if status == "Paused" and spend_amt > 0:
                 paused_with_spend.append(entry)
 
-    # Build summary
-    total_spend = sum(float((c.get("spend") or {}).get("amount", 0) or 0) for c in _campaigns)
-    total_sales = sum(float((c.get("sales") or {}).get("amount", 0) or 0) for c in _campaigns)
+    total_spend = sum(float((c.get("spend") or {}).get("amount", 0) or 0) for c in campaigns)
+    total_sales = sum(float((c.get("sales") or {}).get("amount", 0) or 0) for c in campaigns)
     overall_acos = (total_spend / total_sales * 100) if total_sales > 0 else 0
-    enabled = sum(1 for c in _campaigns if c.get("status") == "Enabled")
-    paused = sum(1 for c in _campaigns if c.get("status") == "Paused")
+    enabled = sum(1 for c in campaigns if c.get("status") == "Enabled")
+    paused = sum(1 for c in campaigns if c.get("status") == "Paused")
 
     import json as _json
     analysis = {
         "overview": {
-            "total_campaigns": len(_campaigns),
+            "total_campaigns": len(campaigns),
             "enabled": enabled,
             "paused": paused,
             "total_spend_usd": round(total_spend, 2),
@@ -163,10 +178,9 @@ def analyze_performance() -> str:
         "recommendations": [],
     }
 
-    # Generate recommendations
-    if enabled == 0 and len(_campaigns) > 0:
+    if enabled == 0 and len(campaigns) > 0:
         analysis["recommendations"].append(
-            f"All {len(_campaigns)} campaigns are paused or archived — no active campaigns running. Consider enabling high-potential campaigns."
+            f"All {len(campaigns)} campaigns are paused or archived — no active campaigns running."
         )
     if paused > 0:
         analysis["recommendations"].append(
@@ -191,7 +205,7 @@ def analyze_performance() -> str:
         analysis["recommendations"].append(
             f"Overall ACOS is {round(overall_acos, 1)}% — above healthy threshold. Review underperformers."
         )
-    if total_spend == 0 and len(_campaigns) > 0:
+    if total_spend == 0 and len(campaigns) > 0:
         analysis["recommendations"].append(
             "No spend recorded across any campaign — campaigns may need to be enabled and given budget to start generating data."
         )
@@ -200,13 +214,8 @@ def analyze_performance() -> str:
 
 
 def _extract_id(resp: dict, section_key: str, id_field: str) -> str:
-    """Pull a created resource id out of an SP v3 batch-create response.
-
-    SP v3 returns either {"<section>": {"success": [...], "error": [...]}} or, in
-    some cases, a plain list. Handle both and surface API errors.
-    """
+    """Pull a created resource id out of an SP v3 batch-create response."""
     section = resp.get(section_key)
-
     if isinstance(section, dict):
         success = section.get("success", [])
         if success:
@@ -216,7 +225,6 @@ def _extract_id(resp: dict, section_key: str, id_field: str) -> str:
             raise RuntimeError(f"{section_key} creation failed: {errors}")
     elif isinstance(section, list) and section:
         return str(section[0].get(id_field, ""))
-
     return ""
 
 
@@ -224,7 +232,6 @@ async def create_campaign(payload: dict) -> str:
     """Create a real Sponsored Products campaign via Amazon Ads API.
 
     Flow: campaign -> ad group -> product ad (SKU/ASIN) -> keywords -> negatives.
-    The product ad is required for the campaign to actually serve impressions.
     """
     from datetime import datetime
     from amazon_ads import (
@@ -250,7 +257,6 @@ async def create_campaign(payload: dict) -> str:
     )
 
     try:
-        # 1. Create campaign
         print(f"[create_campaign] -> creating SP campaign {name!r}...")
         camp_resp = await create_sp_campaign(name, budget, start_date)
         campaign_id = _extract_id(camp_resp, "campaigns", "campaignId")
@@ -259,7 +265,6 @@ async def create_campaign(payload: dict) -> str:
             return f"Failed to create campaign: {camp_resp}"
         print(f"[create_campaign] <- campaign created. campaignId={campaign_id}")
 
-        # 2. Create ad group
         print(f"[create_campaign] -> creating ad group for campaign {campaign_id}...")
         ag_resp = await create_ad_group(campaign_id, f"{name} - Ad Group")
         ad_group_id = _extract_id(ag_resp, "adGroups", "adGroupId")
@@ -273,7 +278,6 @@ async def create_campaign(payload: dict) -> str:
 
         results = [f"Campaign '{name}' created. Campaign ID: {campaign_id}"]
 
-        # 3. Create product ad so the campaign can serve
         if sku or asin:
             target = f"SKU {sku}" if sku else f"ASIN {asin}"
             print(f"[create_campaign] -> creating product ad ({target}) on ad group {ad_group_id}...")
@@ -292,14 +296,12 @@ async def create_campaign(payload: dict) -> str:
             print("[create_campaign] -- no SKU/ASIN provided, skipping product ad")
             results.append("No SKU/ASIN provided — campaign will NOT serve until a product ad is added.")
 
-        # 4. Add keywords
         if keywords:
             print(f"[create_campaign] -> adding {len(keywords)} keyword(s)...")
             await add_keywords(campaign_id, ad_group_id, keywords)
             print(f"[create_campaign] <- keywords added")
             results.append(f"Added {len(keywords)} keyword(s).")
 
-        # 5. Add negative keywords
         if negative_kws:
             print(f"[create_campaign] -> adding {len(negative_kws)} negative keyword(s)...")
             await add_negative_keywords(campaign_id, ad_group_id, negative_kws)

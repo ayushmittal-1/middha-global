@@ -287,9 +287,116 @@
       min-height: 14px;
     }
     #cogs-file { display: none; }
+
+    /* ── Login overlay ──────────────────────────────────── */
+    #login-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(20, 22, 40, 0.72);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+    #login-overlay.visible { display: flex; }
+
+    #login-card {
+      width: 360px;
+      background: #fff;
+      padding: 28px 28px 24px;
+      border-radius: 14px;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.35);
+    }
+    #login-card h2 {
+      font-size: 20px;
+      color: #1a1a2e;
+      margin-bottom: 6px;
+    }
+    #login-card p {
+      font-size: 13px;
+      color: #666;
+      margin-bottom: 18px;
+    }
+    #login-card label {
+      display: block;
+      font-size: 12px;
+      color: #444;
+      margin-bottom: 4px;
+      margin-top: 12px;
+      font-weight: 600;
+    }
+    #login-card input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #d0d0d0;
+      border-radius: 8px;
+      font-size: 14px;
+      outline: none;
+    }
+    #login-card input:focus { border-color: #4a6cf7; }
+    #login-card button {
+      width: 100%;
+      margin-top: 18px;
+      padding: 11px;
+      background: #1a1a2e;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    #login-card button:hover { background: #16213e; }
+    #login-card button:disabled { background: #999; cursor: not-allowed; }
+    #login-error {
+      margin-top: 12px;
+      color: #c62828;
+      font-size: 13px;
+      min-height: 16px;
+    }
+
+    /* ── Sidebar user / logout ──────────────────────────── */
+    #sidebar-footer {
+      padding: 12px 16px;
+      border-top: 1px solid rgba(255,255,255,0.1);
+      font-size: 12px;
+      color: rgba(255,255,255,0.7);
+    }
+    #user-email {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      margin-bottom: 6px;
+    }
+    #logout-btn {
+      width: 100%;
+      padding: 6px 10px;
+      background: transparent;
+      color: rgba(255,255,255,0.7);
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    #logout-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
   </style>
 </head>
 <body>
+
+  <!-- Login overlay -->
+  <div id="login-overlay">
+    <form id="login-card">
+      <h2>Sign in</h2>
+      <p>Use your Aurora email and password.</p>
+      <label for="login-email">Email</label>
+      <input id="login-email" type="email" autocomplete="username" required>
+      <label for="login-password">Password</label>
+      <input id="login-password" type="password" autocomplete="current-password" required>
+      <button id="login-submit" type="submit">Sign in</button>
+      <div id="login-error"></div>
+    </form>
+  </div>
 
   <!-- Sidebar -->
   <div id="sidebar">
@@ -306,6 +413,11 @@
       <textarea id="cogs-paste" placeholder="…or paste CSV here:&#10;sku,unit_cost,inbound_shipping_per_unit&#10;ABC-1,3.20,0.45"></textarea>
       <button id="cogs-paste-btn">Save pasted CSV</button>
       <div id="cogs-status"></div>
+    </div>
+
+    <div id="sidebar-footer">
+      <span id="user-email"></span>
+      <button id="logout-btn">Log out</button>
     </div>
   </div>
 
@@ -340,11 +452,53 @@
     let ws = null;
     let currentAssistantDiv = null;
 
+    // ── Auth ───────────────────────────────────────────
+    // Login is handled by THIS backend's POST /api/auth/login — same origin,
+    // so no CORS. It verifies the password against the shared Mongo users
+    // collection and issues a JWT signed with Aurora's JWT_SECRET, so the
+    // resulting token works against Aurora as well.
+    function getAuthToken() {
+      return (localStorage.getItem('auth_token') || '').trim();
+    }
+    function authHeaders(extra = {}) {
+      const t = getAuthToken();
+      return t ? { ...extra, Authorization: `Bearer ${t}` } : extra;
+    }
+    function logout() {
+      localStorage.removeItem('auth_token');
+      localStorage.removeItem('user_email');
+      localStorage.removeItem('session_id');
+      if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+      location.reload();
+    }
+    async function loginWithCredentials(email, password) {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || `Login failed (${res.status})`);
+      }
+      if (!data.token) {
+        throw new Error('Login response had no token');
+      }
+      localStorage.setItem('auth_token', data.token);
+      if (data.email) localStorage.setItem('user_email', data.email);
+      return data;
+    }
+
     // ── WebSocket ──────────────────────────────────────
 
     function connectWebSocket() {
+      const token = getAuthToken();
+      if (!token) {
+        console.error('[ws] no auth token — refusing to connect');
+        return;
+      }
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${proto}://${location.host}/ws/chat`);
+      ws = new WebSocket(`${proto}://${location.host}/ws/chat?token=${encodeURIComponent(token)}`);
 
       ws.onopen = () => console.log('[ws] connected');
 
@@ -357,7 +511,13 @@
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (evt) => {
+        if (evt.code === 4401) {
+          console.warn('[ws] auth rejected — clearing token and showing login');
+          localStorage.removeItem('auth_token');
+          showLogin();
+          return;
+        }
         console.log('[ws] disconnected — reconnecting in 2s');
         setTimeout(connectWebSocket, 2000);
       };
@@ -451,7 +611,7 @@
 
     async function loadSessions() {
       try {
-        const res = await fetch('/sessions');
+        const res = await fetch('/sessions', { headers: authHeaders() });
         const sessions = await res.json();
         renderSessionList(sessions);
       } catch (e) {
@@ -493,7 +653,7 @@
     async function loadHistory(sessionId) {
       chatContainer.innerHTML = '';
       try {
-        const res = await fetch(`/sessions/${sessionId}/messages`);
+        const res = await fetch(`/sessions/${sessionId}/messages`, { headers: authHeaders() });
         const messages = await res.json();
         if (messages.length === 0) {
           showWelcome();
@@ -527,7 +687,7 @@
 
     async function deleteSession(sessionId) {
       try {
-        await fetch(`/sessions/${sessionId}`, { method: 'DELETE' });
+        await fetch(`/sessions/${sessionId}`, { method: 'DELETE', headers: authHeaders() });
         if (sessionId === currentSessionId) {
           await startNewChat();
         }
@@ -595,7 +755,7 @@
       try {
         const r = await fetch('/cogs/upload', {
           method: 'POST',
-          headers: { 'Content-Type': 'text/csv' },
+          headers: authHeaders({ 'Content-Type': 'text/csv' }),
           body: text,
         });
         const j = await r.json();
@@ -626,9 +786,49 @@
       await postCogsCsv(text);
     });
 
+    const loginOverlay = document.getElementById('login-overlay');
+    const loginForm = document.getElementById('login-card');
+    const loginEmail = document.getElementById('login-email');
+    const loginPassword = document.getElementById('login-password');
+    const loginSubmit = document.getElementById('login-submit');
+    const loginError = document.getElementById('login-error');
+    const userEmailEl = document.getElementById('user-email');
+
+    function showLogin() {
+      loginOverlay.classList.add('visible');
+      loginError.textContent = '';
+      const savedEmail = localStorage.getItem('user_email');
+      if (savedEmail) loginEmail.value = savedEmail;
+      setTimeout(() => (savedEmail ? loginPassword : loginEmail).focus(), 50);
+    }
+    function hideLogin() {
+      loginOverlay.classList.remove('visible');
+    }
+
+    loginForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = loginEmail.value.trim();
+      const password = loginPassword.value;
+      if (!email || !password) return;
+      loginSubmit.disabled = true;
+      loginError.textContent = '';
+      try {
+        await loginWithCredentials(email, password);
+        hideLogin();
+        await startApp();
+      } catch (err) {
+        loginError.textContent = err.message || 'Login failed';
+      } finally {
+        loginSubmit.disabled = false;
+      }
+    });
+
+    document.getElementById('logout-btn').addEventListener('click', logout);
+
     // ── Init ───────────────────────────────────────────
 
-    (async () => {
+    async function startApp() {
+      userEmailEl.textContent = localStorage.getItem('user_email') || '';
       const saved = localStorage.getItem('session_id');
       if (saved) {
         currentSessionId = saved;
@@ -640,6 +840,14 @@
       await loadSessions();
       connectWebSocket();
       messageInput.focus();
+    }
+
+    (async () => {
+      if (!getAuthToken()) {
+        showLogin();
+      } else {
+        await startApp();
+      }
     })();
   </script>
 </body>
