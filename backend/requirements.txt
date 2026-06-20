@@ -8,3 +8,4 @@ playwright
 motor
 pyjwt
 bcrypt
+cryptography

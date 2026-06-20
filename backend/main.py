@@ -175,7 +175,7 @@ async def delete_session_endpoint(session_id: str, user: dict = Depends(protect)
 # ── COGS endpoints ─────────────────────────────────────────────────────────
 
 @app.post("/cogs/upload")
-async def upload_cogs(request: Request):
+async def upload_cogs(request: Request, user: dict = Depends(protect)):
     """Accept a CSV body (text/csv or text/plain) with columns sku, unit_cost,
     and optionally inbound_shipping_per_unit. Upserts rows into the cogs table.
     """
@@ -204,7 +204,7 @@ async def upload_cogs(request: Request):
 
 
 @app.get("/cogs")
-async def list_cogs():
+async def list_cogs(user: dict = Depends(protect)):
     rows = await get_cogs()
     return {"count": len(rows), "rows": rows}
 

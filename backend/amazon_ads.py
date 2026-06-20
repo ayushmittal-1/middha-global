@@ -16,8 +16,15 @@ from bson import ObjectId
 from datetime import datetime, timezone
 
 # ── App-level config (stays in env) ──────────────────────────────────────────
+#
+# Aurora registers TWO separate LWA apps with Amazon — one for SP-API and one
+# for the Advertising API. Refresh tokens minted by the Ads app can ONLY be
+# exchanged using the Ads client_id/secret; trying to use the SP-API pair
+# returns a generic 400 from /auth/o2/token. We mirror Aurora's split.
 LWA_CLIENT_ID = os.getenv("AMAZON_LWA_CLIENT_ID", "")
 LWA_CLIENT_SECRET = os.getenv("AMAZON_LWA_CLIENT_SECRET", "")
+ADS_LWA_CLIENT_ID = os.getenv("AMAZON_ADVERTISING_CLIENT_ID", "") or LWA_CLIENT_ID
+ADS_LWA_CLIENT_SECRET = os.getenv("AMAZON_ADVERTISING_CLIENT_SECRET", "") or LWA_CLIENT_SECRET
 
 # Region-aware endpoints (mirrors Aurora's amazonAPI.js).
 _TOKEN_URLS = {
@@ -90,13 +97,32 @@ async def _get_access_token(user: dict, refresh_field: str) -> str:
             f"User {user.get('email')} has no {refresh_field}. "
             "Complete the Amazon OAuth flow in Aurora first."
         )
+    # Refresh tokens are app-scoped — Ads tokens MUST be exchanged with the
+    # Ads LWA client_id/secret; SP-API tokens with the SP-API ones. Mixing
+    # them up gives a generic 400 from /auth/o2/token.
+    if refresh_field == "amazonAdsRefreshToken":
+        # Ads uses a single shared LWA app (env-only — Aurora's
+        # SellerApplication has no ads-LWA fields).
+        client_id, client_secret = ADS_LWA_CLIENT_ID, ADS_LWA_CLIENT_SECRET
+    else:
+        # SP-API LWA is per-organization — prefer the user's SellerApplication
+        # creds, env fallback. Matches Aurora's getSellerAppCredentials.
+        from seller_app import get_seller_app_credentials  # local import avoids circular
+        creds = await get_seller_app_credentials(user)
+        client_id = creds.get("amazonLwaClientId") or LWA_CLIENT_ID
+        client_secret = creds.get("amazonLwaClientSecret") or LWA_CLIENT_SECRET
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(_token_url(user), data={
             "grant_type": "refresh_token",
             "refresh_token": refresh,
-            "client_id": LWA_CLIENT_ID,
-            "client_secret": LWA_CLIENT_SECRET,
+            "client_id": client_id,
+            "client_secret": client_secret,
         })
+        if resp.is_error:
+            print(
+                f"[lwa] refresh FAILED for {refresh_field} "
+                f"status={resp.status_code} body={resp.text[:300]}"
+            )
         resp.raise_for_status()
         return resp.json()["access_token"]
 
@@ -122,7 +148,7 @@ def _versioned_headers(user: dict, access_token: str, content_type: str) -> dict
     """Headers for SP v3 endpoints, which require a per-resource versioned media type."""
     h = {
         "Authorization": f"Bearer {access_token}",
-        "Amazon-Advertising-API-ClientId": LWA_CLIENT_ID,
+        "Amazon-Advertising-API-ClientId": ADS_LWA_CLIENT_ID,
         "Content-Type": content_type,
         "Accept": content_type,
     }
@@ -163,7 +189,7 @@ async def get_profiles() -> list[dict]:
     token = await get_ads_access_token(user)
     headers = {
         "Authorization": f"Bearer {token}",
-        "Amazon-Advertising-API-ClientId": LWA_CLIENT_ID,
+        "Amazon-Advertising-API-ClientId": ADS_LWA_CLIENT_ID,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
