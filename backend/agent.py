@@ -11,7 +11,7 @@ from groq import AsyncGroq
 from campaigns import get_campaigns_summary, create_campaign, analyze_performance, search_campaigns
 from keywords import fetch_amazon_keywords, suggest_negative_keywords
 from meta_ads import search_meta_ads
-from database import create_session, get_messages, save_message, update_session_title, get_cogs
+from database import create_session, get_messages, save_message, update_session_title, get_cogs, get_forecast_cache
 import amazon_sp
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -67,6 +67,15 @@ SYSTEM_PROMPT = (
     "Do NOT recompute the math. Do NOT call get_orders / get_order_items / get_cogs manually — analyze_profitability already does all of that server-side. "
     "Do NOT add commentary that contradicts the table.\n"
     "If the user asks for fees / ad spend / fully-loaded mode, tell them that mode isn't built yet and offer the simple table.\n\n"
+    "## Inventory forecasting / restock\n"
+    "When the user asks about future demand, restock planning, when to reorder, days of cover, PO quantities, "
+    "or whether they'll stock out:\n"
+    "- **forecast_sku(sku, horizon_days)** — single-SKU forecast + reorder math\n"
+    "- **restock_recommendations(top_n)** — ranked list of SKUs to reorder next\n"
+    "- **days_until_stockout(sku)** — quick triage; omit sku for a riskiest-SKUs list\n"
+    "These read a nightly-refreshed cache; they do NOT refit on the fly. If the response says 'no cached forecast', "
+    "tell the user to hit POST /forecasting/refresh (or wait for the 03:00 UTC nightly job). "
+    "Present the markdown the tool returns verbatim — do NOT recompute the math or invent SKUs not in the response.\n\n"
     "Be concise and actionable."
 )
 
@@ -335,6 +344,53 @@ TOOLS = [
             "name": "get_marketplaces",
             "description": "List the Amazon marketplaces the user is registered in (id + human-readable country name + which is primary). Call this when the user asks 'which marketplaces do I have?', or before scoping another tool (get_orders / get_inventory) to a specific country.",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forecast_sku",
+            "description": "Forecast future demand for one SKU. Returns the next N-day p50/p90 demand, the model used (prophet / prophet+ads / naive), drivers (recent_avg, growth_rate), and the reorder math (days of cover, reorder-by date, suggested PO qty). Reads from the cached forecast — does NOT refit. If no cache exists for the SKU, tell the user to run /forecasting/refresh.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sku": {"type": "string", "description": "Seller SKU."},
+                    "horizon_days": {
+                        "type": "integer",
+                        "description": "Days of forecast to summarize (default 30, max 90).",
+                    },
+                },
+                "required": ["sku"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "restock_recommendations",
+            "description": "Top SKUs that need a PO soon, ranked by stockout urgency (lowest days-of-cover first). Returns a markdown table with on-hand, inbound, days of cover, reorder-by date, and suggested PO quantity. Use when the user asks 'what should I reorder?', 'what's running low?', or wants a restock plan.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "top_n": {
+                        "type": "integer",
+                        "description": "How many SKUs to show (default 10).",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "days_until_stockout",
+            "description": "Quick triage — days of cover remaining per SKU. Pass a SKU for one answer, omit for a sorted list of the riskiest SKUs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sku": {"type": "string", "description": "Optional. Single SKU to check."},
+                },
+            },
         },
     },
 ]
@@ -656,6 +712,115 @@ async def _get_report(report_type: str, days_back: int | str = 30) -> str:
         return f"Error generating report: {e}"
 
 
+# ── Forecasting tools (read from forecastCache, never refit on demand) ──
+
+async def _forecast_sku(sku: str, horizon_days: int | str = 30) -> str:
+    try:
+        horizon_days = max(1, min(int(horizon_days), 90))
+    except (TypeError, ValueError):
+        horizon_days = 30
+    cached = await get_forecast_cache(skus=[sku])
+    if not cached:
+        return (
+            f"No cached forecast for **{sku}**. The forecast cache is refreshed by the "
+            "nightly job at 03:00 UTC, or the user can trigger it manually via "
+            "POST /forecasting/refresh."
+        )
+    c = cached[0]
+    fc = c.get("forecast") or []
+    window = fc[:horizon_days]
+    total_p50 = sum(float(r.get("p50", 0)) for r in window)
+    total_p90 = sum(float(r.get("p90", 0)) for r in window)
+    daily_avg = total_p50 / max(1, len(window))
+    drivers = c.get("drivers") or {}
+    reorder = c.get("reorder") or {}
+    growth_pct = float(drivers.get("growth_rate") or 0) * 100
+    lines = [
+        f"### Forecast for {sku} — next {horizon_days} days",
+        f"- Method: **{c.get('method')}**",
+        f"- Total demand p50: **{total_p50:.0f}** units (p90 upper bound: {total_p90:.0f})",
+        f"- Avg daily demand: **{daily_avg:.1f}** units/day",
+        f"- Recent 28-day average: {drivers.get('recent_avg', 0)}/day, growth {growth_pct:+.1f}%",
+        "",
+        "### Restock math",
+        f"- On hand: **{reorder.get('on_hand', 0)}** | inbound: {reorder.get('inbound', 0)}",
+        f"- Days of cover: **{reorder.get('days_of_cover', 'n/a')}**",
+        f"- Reorder by: **{reorder.get('reorder_by_date') or 'n/a'}**",
+        f"- Suggested PO qty: **{reorder.get('recommended_po_qty', 0)}** (MOQ {reorder.get('moq', 1)})",
+        f"- Safety stock: {reorder.get('safety_stock', 0)}, reorder point: {reorder.get('reorder_point', 0)}",
+    ]
+    return "\n".join(lines)
+
+
+async def _restock_recommendations(top_n: int | str = 10) -> str:
+    try:
+        top_n = max(1, min(int(top_n), 50))
+    except (TypeError, ValueError):
+        top_n = 10
+    cached = await get_forecast_cache()
+    if not cached:
+        return "No forecasts cached yet. Run POST /forecasting/refresh to generate them."
+    rows: list[dict] = []
+    for c in cached:
+        r = c.get("reorder") or {}
+        rows.append({
+            "sku": c["sku"],
+            "on_hand": r.get("on_hand", 0),
+            "inbound": r.get("inbound", 0),
+            "days_of_cover": r.get("days_of_cover"),
+            "reorder_by_date": r.get("reorder_by_date"),
+            "recommended_po_qty": r.get("recommended_po_qty", 0),
+        })
+    # Stockouts (None / 0 cover) bubble to the top.
+    rows.sort(key=lambda r: (1e9 if r["days_of_cover"] is None else r["days_of_cover"]))
+    rows = rows[:top_n]
+
+    header = "| SKU | On hand | Inbound | Days of cover | Reorder by | Suggested PO |"
+    sep    = "| --- | --- | --- | --- | --- | --- |"
+    out_lines = [header, sep]
+    for r in rows:
+        doc = r["days_of_cover"]
+        if doc is None:
+            cover_cell = "no demand"
+        elif doc <= 7:
+            cover_cell = f"⚠ {doc:.1f}"
+        else:
+            cover_cell = f"{doc:.1f}"
+        out_lines.append(
+            f"| {r['sku']} | {r['on_hand']} | {r['inbound']} | "
+            f"{cover_cell} | {r['reorder_by_date'] or '—'} | {r['recommended_po_qty']} |"
+        )
+    return "### Top restock priorities\n" + "\n".join(out_lines)
+
+
+async def _days_until_stockout(sku: str | None = None) -> str:
+    skus = [sku] if sku else None
+    cached = await get_forecast_cache(skus=skus)
+    if not cached:
+        scope = f"SKU {sku}" if sku else "any SKU"
+        return f"No forecast data for {scope}. Run POST /forecasting/refresh first."
+    if sku:
+        r = (cached[0].get("reorder") or {})
+        doc = r.get("days_of_cover")
+        if doc is None:
+            return f"**{sku}** has no recent demand signal — days of cover is undefined."
+        return (
+            f"**{sku}** has approximately **{doc:.1f} days** of cover remaining "
+            f"({r.get('on_hand', 0)} on hand + {r.get('inbound', 0)} inbound)."
+        )
+    rows = []
+    for c in cached:
+        r = c.get("reorder") or {}
+        rows.append((c["sku"], r.get("days_of_cover")))
+    rows.sort(key=lambda r: (1e9 if r[1] is None else r[1]))
+    top = rows[:15]
+    body = "\n".join(
+        f"- {s}: {'no demand signal' if d is None else f'{d:.1f} days'}"
+        for s, d in top
+    )
+    return "### Days of cover (15 riskiest SKUs)\n" + body
+
+
 TOOL_FUNCTIONS = {
     "get_campaigns_summary": _get_campaigns_summary,
     "get_keywords": _get_keywords,
@@ -670,6 +835,9 @@ TOOL_FUNCTIONS = {
     "analyze_profitability": _analyze_profitability,
     "get_report": _get_report,
     "get_marketplaces": lambda: _format_marketplaces(),
+    "forecast_sku": _forecast_sku,
+    "restock_recommendations": _restock_recommendations,
+    "days_until_stockout": _days_until_stockout,
 }
 
 

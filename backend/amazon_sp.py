@@ -368,18 +368,26 @@ async def create_report(
     start_date: str | None = None,
     end_date: str | None = None,
     marketplace: str | list[str] | None = None,
+    report_options: dict | None = None,
+    single_marketplace: bool = False,
 ) -> dict:
     """Request a new report. Returns reportId for polling. By default, covers
-    all the user's marketplaces."""
+    all the user's marketplaces. Some report types (Sales & Traffic, FBA
+    inventory planning) reject multi-marketplace requests — pass
+    single_marketplace=True for those."""
     user = require_user()
-    marketplace_ids = resolve_marketplace(user, marketplace, multiple=True)
+    marketplace_ids = resolve_marketplace(
+        user, marketplace, multiple=not single_marketplace
+    )
     body: dict = {
         "reportType": report_type,
-        "marketplaceIds": marketplace_ids,
+        "marketplaceIds": marketplace_ids if isinstance(marketplace_ids, list) else [marketplace_ids],
     }
     if start_date or end_date:
         body["dataStartTime"] = start_date
         body["dataEndTime"] = end_date
+    if report_options:
+        body["reportOptions"] = report_options
     return await _sp_request("POST", "/reports/2021-06-30/reports", body=body)
 
 
@@ -391,6 +399,36 @@ async def get_report(report_id: str) -> dict:
 async def get_report_document(document_id: str) -> dict:
     """Get the download URL for a completed report document."""
     return await _sp_request("GET", f"/reports/2021-06-30/documents/{document_id}")
+
+
+async def download_report_raw(report_id: str, max_polls: int = 30, poll_interval: int = 10) -> str:
+    """Poll until a report is done, then return the FULL decoded text.
+
+    Used by the ingest pipeline, which needs every row (not the
+    LLM-friendly truncated summary that `download_report` returns).
+    """
+    for _ in range(max_polls):
+        status = await get_report(report_id)
+        processing_status = status.get("processingStatus", "")
+        if processing_status == "DONE":
+            doc_id = status.get("reportDocumentId")
+            if not doc_id:
+                raise RuntimeError(f"Report {report_id} done but no document id")
+            doc_info = await get_report_document(doc_id)
+            url = doc_info.get("url")
+            if not url:
+                raise RuntimeError(f"Report doc {doc_id} has no download url")
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+            content = resp.content
+            if doc_info.get("compressionAlgorithm") == "GZIP":
+                content = gzip.decompress(content)
+            return content.decode("utf-8", errors="replace")
+        if processing_status in ("CANCELLED", "FATAL"):
+            raise RuntimeError(f"Report {report_id} failed: {processing_status}")
+        await asyncio.sleep(poll_interval)
+    raise TimeoutError(f"Report {report_id} did not finish within {max_polls * poll_interval}s")
 
 
 async def download_report(report_id: str, max_polls: int = 12, poll_interval: int = 10) -> str:

@@ -27,6 +27,7 @@ import json
 from datetime import datetime, timezone
 
 from bson import ObjectId
+from pymongo import UpdateOne
 from pymongo.errors import DocumentTooLarge
 
 from auth import _db, require_user
@@ -43,6 +44,22 @@ def _cogs():
     return _db().userCogs
 
 
+def _sales_daily():
+    return _db().salesDaily
+
+
+def _inventory_snapshot():
+    return _db().inventorySnapshot
+
+
+def _forecast_cache():
+    return _db().forecastCache
+
+
+def _forecast_settings():
+    return _db().forecastSettings
+
+
 def _user_oid() -> ObjectId:
     user = require_user()
     return ObjectId(str(user["_id"]))
@@ -55,6 +72,17 @@ async def init_db():
         [("convId", 1), ("userId", 1)], unique=True
     )
     await _cogs().create_index([("userId", 1), ("sku", 1)], unique=True)
+    await _sales_daily().create_index(
+        [("userId", 1), ("sku", 1), ("date", 1)], unique=True
+    )
+    await _sales_daily().create_index([("userId", 1), ("date", -1)])
+    await _inventory_snapshot().create_index(
+        [("userId", 1), ("sku", 1), ("date", 1)], unique=True
+    )
+    await _forecast_cache().create_index(
+        [("userId", 1), ("sku", 1)], unique=True
+    )
+    await _forecast_settings().create_index([("userId", 1)], unique=True)
 
 
 # ── Conversations ────────────────────────────────────────────────────────
@@ -230,3 +258,155 @@ async def get_cogs(skus: list[str] | None = None) -> list[dict]:
         }
         for r in rows
     ]
+
+
+# ── Forecasting: salesDaily / inventorySnapshot / forecastCache ───────────
+#
+# These helpers take an explicit `user_id` because they are also called from
+# the APScheduler nightly job, which has no request context (no ContextVar).
+# The agent / UI surface uses the request-scoped wrappers further below.
+
+async def upsert_sales_daily(user_id: ObjectId, rows: list[dict]) -> int:
+    """Bulk-upsert daily sales rows for one user. Each row must include
+    `sku` and `date` (datetime, UTC midnight). All other fields are
+    persisted as-is. Returns the count of operations attempted."""
+    if not rows:
+        return 0
+    ops: list[UpdateOne] = []
+    for r in rows:
+        sku = (r.get("sku") or "").strip()
+        date = r.get("date")
+        if not sku or not isinstance(date, datetime):
+            continue
+        payload = {k: v for k, v in r.items() if k not in ("sku", "date")}
+        ops.append(UpdateOne(
+            {"userId": user_id, "sku": sku, "date": date},
+            {"$set": payload,
+             "$setOnInsert": {"userId": user_id, "sku": sku, "date": date}},
+            upsert=True,
+        ))
+    if not ops:
+        return 0
+    await _sales_daily().bulk_write(ops, ordered=False)
+    return len(ops)
+
+
+async def get_sales_daily_for_user(
+    user_id: ObjectId,
+    sku: str | None = None,
+    since: datetime | None = None,
+) -> list[dict]:
+    query: dict = {"userId": user_id}
+    if sku:
+        query["sku"] = sku
+    if since:
+        query["date"] = {"$gte": since}
+    cursor = _sales_daily().find(query, {"_id": 0, "userId": 0}).sort("date", 1)
+    return await cursor.to_list(length=None)
+
+
+async def upsert_inventory_snapshot(user_id: ObjectId, rows: list[dict]) -> int:
+    """Bulk-upsert daily inventory snapshots."""
+    if not rows:
+        return 0
+    ops: list[UpdateOne] = []
+    for r in rows:
+        sku = (r.get("sku") or "").strip()
+        date = r.get("date")
+        if not sku or not isinstance(date, datetime):
+            continue
+        payload = {k: v for k, v in r.items() if k not in ("sku", "date")}
+        ops.append(UpdateOne(
+            {"userId": user_id, "sku": sku, "date": date},
+            {"$set": payload,
+             "$setOnInsert": {"userId": user_id, "sku": sku, "date": date}},
+            upsert=True,
+        ))
+    if not ops:
+        return 0
+    await _inventory_snapshot().bulk_write(ops, ordered=False)
+    return len(ops)
+
+
+async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
+    """Most recent snapshot per SKU. Returns { sku: snapshot_doc }."""
+    pipeline = [
+        {"$match": {"userId": user_id}},
+        {"$sort": {"date": -1}},
+        {"$group": {"_id": "$sku", "doc": {"$first": "$$ROOT"}}},
+    ]
+    out: dict[str, dict] = {}
+    async for row in _inventory_snapshot().aggregate(pipeline):
+        doc = row["doc"]
+        doc.pop("_id", None)
+        doc.pop("userId", None)
+        out[doc["sku"]] = doc
+    return out
+
+
+async def upsert_forecast_cache(user_id: ObjectId, sku: str, payload: dict) -> None:
+    # Keep userId/sku out of $set — Mongo rejects an update that touches
+    # the same path in both $set and $setOnInsert.
+    set_payload = {k: v for k, v in payload.items() if k not in ("userId", "sku")}
+    set_payload["generated_at"] = datetime.now(timezone.utc)
+    await _forecast_cache().update_one(
+        {"userId": user_id, "sku": sku},
+        {"$set": set_payload, "$setOnInsert": {"userId": user_id, "sku": sku}},
+        upsert=True,
+    )
+
+
+# Request-scoped wrappers — used by FastAPI endpoints and agent tools that
+# run inside an authenticated request context.
+
+async def get_sales_daily(
+    sku: str | None = None, since: datetime | None = None
+) -> list[dict]:
+    return await get_sales_daily_for_user(_user_oid(), sku=sku, since=since)
+
+
+async def get_forecast_cache(skus: list[str] | None = None) -> list[dict]:
+    query: dict = {"userId": _user_oid()}
+    if skus:
+        query["sku"] = {"$in": skus}
+    cursor = _forecast_cache().find(query, {"_id": 0, "userId": 0}).sort("sku", 1)
+    return await cursor.to_list(length=None)
+
+
+async def latest_inventory() -> dict[str, dict]:
+    return await latest_inventory_for_user(_user_oid())
+
+
+# ── Forecast settings ─────────────────────────────────────────────────────
+
+DEFAULT_FORECAST_SETTINGS = {
+    "lead_time_days": 30,
+    "moq": 1,
+    "target_cover_days": 90,
+    "service_level": 0.95,
+}
+
+
+async def get_forecast_settings_for_user(user_id: ObjectId) -> dict:
+    doc = await _forecast_settings().find_one({"userId": user_id}) or {}
+    return {**DEFAULT_FORECAST_SETTINGS, **{
+        k: doc[k] for k in DEFAULT_FORECAST_SETTINGS if k in doc
+    }}
+
+
+async def get_forecast_settings() -> dict:
+    return await get_forecast_settings_for_user(_user_oid())
+
+
+async def update_forecast_settings(patch: dict) -> dict:
+    user_id = _user_oid()
+    allowed = {k: v for k, v in patch.items() if k in DEFAULT_FORECAST_SETTINGS}
+    if not allowed:
+        return await get_forecast_settings_for_user(user_id)
+    allowed["updatedAt"] = datetime.now(timezone.utc)
+    await _forecast_settings().update_one(
+        {"userId": user_id},
+        {"$set": allowed, "$setOnInsert": {"userId": user_id}},
+        upsert=True,
+    )
+    return await get_forecast_settings_for_user(user_id)

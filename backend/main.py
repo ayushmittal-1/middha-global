@@ -25,7 +25,17 @@ from database import (
     delete_session,
     upsert_cogs,
     get_cogs,
+    get_forecast_settings,
+    update_forecast_settings,
+    get_forecast_cache,
 )
+from forecasting.ingest import (
+    backfill_user,
+    ingest_user_incremental,
+    run_nightly_ingest,
+)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from amazon_ads import (
     exchange_auth_code,
     get_profiles,
@@ -52,9 +62,30 @@ async def lifespan(app: FastAPI):
     # Startup: init DB. Campaigns are fetched lazily per-user on first tool call.
     await init_db()
     print("Database initialized.")
-    yield
-    # Shutdown: close shared Playwright browser
-    await shutdown_browser()
+
+    # Nightly forecasting ingest — 03:00 UTC daily. Skipped if the
+    # FORECASTING_SCHEDULER env var is set to "0" (useful in dev so the
+    # job doesn't fire while iterating on the code).
+    scheduler: AsyncIOScheduler | None = None
+    if os.getenv("FORECASTING_SCHEDULER", "1") != "0":
+        scheduler = AsyncIOScheduler(timezone="UTC")
+        scheduler.add_job(
+            run_nightly_ingest,
+            trigger=CronTrigger(hour=3, minute=0),
+            id="forecasting_nightly_ingest",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.start()
+        print("Forecasting scheduler started (nightly 03:00 UTC).")
+
+    try:
+        yield
+    finally:
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
+        # Shutdown: close shared Playwright browser
+        await shutdown_browser()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -207,6 +238,100 @@ async def upload_cogs(request: Request, user: dict = Depends(protect)):
 async def list_cogs(user: dict = Depends(protect)):
     rows = await get_cogs()
     return {"count": len(rows), "rows": rows}
+
+
+# ── Forecasting endpoints ──────────────────────────────────────────────────
+
+
+@app.post("/forecasting/ingest")
+async def forecasting_ingest(
+    user: dict = Depends(protect),
+    backfill: bool = False,
+    days_back: int = 540,
+):
+    """Manually trigger an ingest for the authenticated user. By default
+    runs the incremental flow (yesterday's orders + today's inventory).
+    Pass `?backfill=true` to do the full 18-month pull instead.
+    """
+    if not user.get("amazonRefreshToken"):
+        return {"error": "SP-API not connected. Authorize at /amazon/sp-login first."}
+    current_user.set(user)
+    if backfill:
+        result = await backfill_user(user, days_back=days_back)
+        return {"mode": "backfill", "days_back": days_back, **result}
+    result = await ingest_user_incremental(user)
+    return {"mode": "incremental", **result}
+
+
+@app.post("/forecasting/refresh")
+async def forecasting_refresh(user: dict = Depends(protect)):
+    """Refit forecasts + reorder math for every SKU with history. Reads
+    from salesDaily/inventorySnapshot (no SP-API calls)."""
+    from bson import ObjectId as _OID
+    from forecasting.model import refresh_forecasts_for_user
+    current_user.set(user)
+    return await refresh_forecasts_for_user(_OID(str(user["_id"])))
+
+
+@app.get("/forecasting/settings")
+async def get_forecasting_settings_endpoint(user: dict = Depends(protect)):
+    return await get_forecast_settings()
+
+
+@app.put("/forecasting/settings")
+async def update_forecasting_settings_endpoint(
+    request: Request, user: dict = Depends(protect)
+):
+    body = await request.json()
+    return await update_forecast_settings(body or {})
+
+
+@app.get("/forecasting/restock")
+async def forecasting_restock(user: dict = Depends(protect)):
+    """The Restock dashboard's data source. One row per SKU with the
+    forecast headline, reorder math, and method used."""
+    cached = await get_forecast_cache()
+    rows = []
+    for c in cached:
+        reorder = c.get("reorder") or {}
+        forecast = c.get("forecast") or []
+        next30 = sum(float(r.get("p50", 0)) for r in forecast[:30])
+        rows.append({
+            "sku": c["sku"],
+            "method": c.get("method"),
+            "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
+            "on_hand": reorder.get("on_hand", 0),
+            "inbound": reorder.get("inbound", 0),
+            "next_30_day_forecast": round(next30, 1),
+            "days_of_cover": reorder.get("days_of_cover"),
+            "reorder_by_date": reorder.get("reorder_by_date"),
+            "recommended_po_qty": reorder.get("recommended_po_qty", 0),
+            "drivers": c.get("drivers"),
+        })
+    # Sort: stockouts first (None or low days_of_cover), then ascending.
+    def _sort_key(r):
+        d = r.get("days_of_cover")
+        return (1, 0) if d is None else (0, d)
+    rows.sort(key=_sort_key)
+    return {"count": len(rows), "rows": rows}
+
+
+@app.get("/forecasting/sku/{sku}")
+async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
+    """Full forecast (90-day p50/p90) for one SKU — drives the detail chart."""
+    cached = await get_forecast_cache(skus=[sku])
+    if not cached:
+        return {"error": f"No forecast for {sku}. Run /forecasting/refresh first."}
+    c = cached[0]
+    return {
+        "sku": sku,
+        "method": c.get("method"),
+        "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
+        "horizon_days": c.get("horizon_days"),
+        "drivers": c.get("drivers"),
+        "reorder": c.get("reorder"),
+        "forecast": c.get("forecast"),
+    }
 
 
 # ── Amazon OAuth endpoints ─────────────────────────────────────────────────

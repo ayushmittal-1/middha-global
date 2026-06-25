@@ -9,3 +9,7 @@ motor
 pyjwt
 bcrypt
 cryptography
+apscheduler
+pandas
+numpy
+prophet

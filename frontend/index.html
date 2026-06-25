@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Aurora Chatbot</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -380,6 +381,228 @@
       cursor: pointer;
     }
     #logout-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+
+    /* ── Tab nav + Restock view ─────────────────────────── */
+    #tab-nav {
+      display: flex;
+      background: #fff;
+      border-bottom: 1px solid #e0e0e0;
+      padding: 0 24px;
+      gap: 4px;
+    }
+    .tab-btn {
+      padding: 12px 18px;
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      font-size: 13px;
+      font-weight: 600;
+      color: #777;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .tab-btn:hover { color: #1a1a2e; }
+    .tab-btn.active { color: #1a1a2e; border-bottom-color: #4a6cf7; }
+
+    #restock-view {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: none;
+      flex-direction: column;
+      gap: 16px;
+    }
+    #restock-view.visible { display: flex; }
+
+    #restock-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    #restock-toolbar h2 {
+      font-size: 18px;
+      color: #1a1a2e;
+      margin-right: auto;
+    }
+    #restock-toolbar button {
+      padding: 8px 14px;
+      background: #1a1a2e;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    #restock-toolbar button.secondary {
+      background: #fff;
+      color: #1a1a2e;
+      border: 1px solid #d0d0d0;
+    }
+    #restock-toolbar button:disabled { opacity: 0.6; cursor: not-allowed; }
+    #restock-stamp { font-size: 12px; color: #888; }
+
+    #restock-settings {
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 14px 16px;
+      display: none;
+      flex-wrap: wrap;
+      gap: 14px;
+      font-size: 13px;
+    }
+    #restock-settings.visible { display: flex; }
+    #restock-settings label {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 11px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    #restock-settings input {
+      padding: 7px 10px;
+      border: 1px solid #d0d0d0;
+      border-radius: 6px;
+      font-size: 13px;
+      width: 110px;
+    }
+    #restock-settings button {
+      padding: 7px 14px;
+      background: #4a6cf7;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      align-self: flex-end;
+    }
+
+    #restock-table-wrap {
+      background: #fff;
+      border-radius: 10px;
+      border: 1px solid #e0e0e0;
+      overflow: hidden;
+    }
+    table.restock {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    table.restock thead th {
+      background: #f8f9fb;
+      color: #444;
+      text-align: left;
+      padding: 10px 12px;
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid #e0e0e0;
+    }
+    table.restock tbody tr {
+      border-bottom: 1px solid #f0f0f0;
+      cursor: pointer;
+      transition: background 0.1s;
+    }
+    table.restock tbody tr:hover { background: #f8f9fb; }
+    table.restock tbody tr:last-child { border-bottom: none; }
+    table.restock td {
+      padding: 11px 12px;
+      color: #222;
+      vertical-align: middle;
+    }
+    table.restock .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .urgency-pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+    .urgency-red    { background: #ffe2e2; color: #b71c1c; }
+    .urgency-orange { background: #ffe9d0; color: #b35200; }
+    .urgency-amber  { background: #fff5cf; color: #8a6d00; }
+    .urgency-green  { background: #d8f3df; color: #1b5e20; }
+    .urgency-grey   { background: #ececf0; color: #555; }
+
+    #restock-empty {
+      padding: 32px;
+      text-align: center;
+      color: #888;
+      background: #fff;
+      border: 1px dashed #d0d0d0;
+      border-radius: 10px;
+    }
+
+    /* SKU drill-down side panel */
+    #sku-drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: 520px;
+      max-width: 90vw;
+      background: #fff;
+      box-shadow: -8px 0 24px rgba(0,0,0,0.12);
+      transform: translateX(100%);
+      transition: transform 0.22s ease;
+      display: flex;
+      flex-direction: column;
+      z-index: 900;
+    }
+    #sku-drawer.visible { transform: translateX(0); }
+    #sku-drawer header {
+      background: #1a1a2e;
+      color: #fff;
+      padding: 14px 18px;
+      font-size: 15px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    #sku-drawer .close-btn {
+      background: transparent;
+      border: none;
+      color: #fff;
+      font-size: 22px;
+      cursor: pointer;
+    }
+    #sku-drawer-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 18px;
+      font-size: 13px;
+      color: #333;
+    }
+    #sku-drawer-body .kv {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px 16px;
+      margin-bottom: 16px;
+    }
+    #sku-drawer-body .kv div span:first-child {
+      display: block;
+      font-size: 11px;
+      color: #777;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    #sku-drawer-body .kv div span:last-child {
+      font-size: 14px;
+      color: #1a1a2e;
+      font-weight: 600;
+    }
+    #sku-chart-wrap { position: relative; height: 260px; }
+    #sku-drawer-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.25);
+      display: none; z-index: 800;
+    }
+    #sku-drawer-overlay.visible { display: block; }
   </style>
 </head>
 <body>
@@ -427,6 +650,11 @@
       <span>&#128202;</span> Campaign QA Chatbot
     </header>
 
+    <nav id="tab-nav">
+      <button class="tab-btn active" data-tab="chat">Chat</button>
+      <button class="tab-btn" data-tab="restock">Restock</button>
+    </nav>
+
     <div id="chat-container">
       <div class="welcome">
         <h2>Campaign Analyst Assistant</h2>
@@ -438,6 +666,63 @@
     <div id="input-area">
       <input type="text" id="message-input" placeholder="Ask about your campaigns..." autocomplete="off">
       <button id="send-btn">Send</button>
+    </div>
+
+    <div id="restock-view">
+      <div id="restock-toolbar">
+        <h2>Restock dashboard</h2>
+        <span id="restock-stamp"></span>
+        <button id="restock-settings-toggle" class="secondary">Settings</button>
+        <button id="restock-refresh">Refresh forecasts</button>
+      </div>
+
+      <div id="restock-settings">
+        <label>Lead time (days)
+          <input id="setting-lead-time" type="number" min="1" max="365">
+        </label>
+        <label>MOQ
+          <input id="setting-moq" type="number" min="1">
+        </label>
+        <label>Target cover (days)
+          <input id="setting-target-cover" type="number" min="7" max="365">
+        </label>
+        <label>Service level
+          <input id="setting-service-level" type="number" step="0.01" min="0.5" max="0.99">
+        </label>
+        <button id="setting-save">Save</button>
+      </div>
+
+      <div id="restock-table-wrap">
+        <table class="restock">
+          <thead>
+            <tr>
+              <th>SKU</th>
+              <th class="num">On hand</th>
+              <th class="num">Inbound</th>
+              <th class="num">30-day forecast</th>
+              <th>Days of cover</th>
+              <th>Reorder by</th>
+              <th class="num">Suggested PO</th>
+            </tr>
+          </thead>
+          <tbody id="restock-body"></tbody>
+        </table>
+      </div>
+      <div id="restock-empty" style="display:none;">
+        No forecasts yet. Click <strong>Refresh forecasts</strong> once your SP-API data has been ingested.
+      </div>
+    </div>
+  </div>
+
+  <div id="sku-drawer-overlay"></div>
+  <div id="sku-drawer">
+    <header>
+      <span id="sku-drawer-title">SKU detail</span>
+      <button class="close-btn" id="sku-drawer-close">&times;</button>
+    </header>
+    <div id="sku-drawer-body">
+      <div class="kv" id="sku-kv"></div>
+      <div id="sku-chart-wrap"><canvas id="sku-chart"></canvas></div>
     </div>
   </div>
 
@@ -824,6 +1109,219 @@
     });
 
     document.getElementById('logout-btn').addEventListener('click', logout);
+
+    // ── Restock tab ─────────────────────────────────────
+    const chatContainerEl = document.getElementById('chat-container');
+    const inputAreaEl = document.getElementById('input-area');
+    const restockViewEl = document.getElementById('restock-view');
+    const restockBodyEl = document.getElementById('restock-body');
+    const restockEmptyEl = document.getElementById('restock-empty');
+    const restockStampEl = document.getElementById('restock-stamp');
+    const restockRefreshBtn = document.getElementById('restock-refresh');
+    const restockSettingsToggle = document.getElementById('restock-settings-toggle');
+    const restockSettingsPanel = document.getElementById('restock-settings');
+    const settingLead = document.getElementById('setting-lead-time');
+    const settingMoq = document.getElementById('setting-moq');
+    const settingCover = document.getElementById('setting-target-cover');
+    const settingSvc = document.getElementById('setting-service-level');
+    const settingSave = document.getElementById('setting-save');
+    let restockLoaded = false;
+    let skuChart = null;
+
+    function setActiveTab(tab) {
+      document.querySelectorAll('.tab-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.tab === tab);
+      });
+      const isChat = tab === 'chat';
+      chatContainerEl.style.display = isChat ? 'flex' : 'none';
+      inputAreaEl.style.display = isChat ? 'flex' : 'none';
+      restockViewEl.classList.toggle('visible', !isChat);
+      if (!isChat && !restockLoaded) {
+        loadRestock();
+        loadForecastSettings();
+        restockLoaded = true;
+      }
+    }
+    document.querySelectorAll('.tab-btn').forEach(b => {
+      b.addEventListener('click', () => setActiveTab(b.dataset.tab));
+    });
+
+    function urgencyClass(daysOfCover) {
+      if (daysOfCover === null || daysOfCover === undefined) return 'urgency-grey';
+      if (daysOfCover <= 7) return 'urgency-red';
+      if (daysOfCover <= 21) return 'urgency-orange';
+      if (daysOfCover <= 45) return 'urgency-amber';
+      return 'urgency-green';
+    }
+
+    function fmtDaysOfCover(d) {
+      if (d === null || d === undefined) return 'no demand';
+      return `${d.toFixed(1)} d`;
+    }
+
+    async function loadRestock() {
+      restockBodyEl.innerHTML = '';
+      restockEmptyEl.style.display = 'none';
+      try {
+        const r = await fetch('/forecasting/restock', { headers: authHeaders() });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        if (!data.rows || data.rows.length === 0) {
+          restockEmptyEl.style.display = 'block';
+          restockStampEl.textContent = '';
+          return;
+        }
+        let latest = '';
+        for (const row of data.rows) {
+          if (row.generated_at && row.generated_at > latest) latest = row.generated_at;
+          const tr = document.createElement('tr');
+          tr.dataset.sku = row.sku;
+          const docCls = urgencyClass(row.days_of_cover);
+          tr.innerHTML = `
+            <td><strong>${escapeHtml(row.sku)}</strong></td>
+            <td class="num">${row.on_hand ?? 0}</td>
+            <td class="num">${row.inbound ?? 0}</td>
+            <td class="num">${row.next_30_day_forecast ?? 0}</td>
+            <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>
+            <td>${row.reorder_by_date ?? '—'}</td>
+            <td class="num"><strong>${row.recommended_po_qty ?? 0}</strong></td>
+          `;
+          tr.addEventListener('click', () => openSkuDrawer(row.sku));
+          restockBodyEl.appendChild(tr);
+        }
+        if (latest) {
+          const d = new Date(latest);
+          restockStampEl.textContent = `Last refreshed ${d.toLocaleString()}`;
+        }
+      } catch (err) {
+        restockBodyEl.innerHTML = `<tr><td colspan="7" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
+      }
+    }
+
+    restockRefreshBtn.addEventListener('click', async () => {
+      restockRefreshBtn.disabled = true;
+      const orig = restockRefreshBtn.textContent;
+      restockRefreshBtn.textContent = 'Refreshing…';
+      try {
+        const r = await fetch('/forecasting/refresh', {
+          method: 'POST', headers: authHeaders(),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        await loadRestock();
+      } catch (err) {
+        alert(`Refresh failed: ${err}`);
+      } finally {
+        restockRefreshBtn.disabled = false;
+        restockRefreshBtn.textContent = orig;
+      }
+    });
+
+    restockSettingsToggle.addEventListener('click', () => {
+      restockSettingsPanel.classList.toggle('visible');
+    });
+
+    async function loadForecastSettings() {
+      try {
+        const r = await fetch('/forecasting/settings', { headers: authHeaders() });
+        if (!r.ok) return;
+        const s = await r.json();
+        settingLead.value = s.lead_time_days;
+        settingMoq.value = s.moq;
+        settingCover.value = s.target_cover_days;
+        settingSvc.value = s.service_level;
+      } catch (_) {}
+    }
+
+    settingSave.addEventListener('click', async () => {
+      settingSave.disabled = true;
+      settingSave.textContent = 'Saving…';
+      try {
+        await fetch('/forecasting/settings', {
+          method: 'PUT',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({
+            lead_time_days: Number(settingLead.value),
+            moq: Number(settingMoq.value),
+            target_cover_days: Number(settingCover.value),
+            service_level: Number(settingSvc.value),
+          }),
+        });
+        settingSave.textContent = 'Saved';
+        setTimeout(() => { settingSave.textContent = 'Save'; settingSave.disabled = false; }, 900);
+      } catch (err) {
+        alert(`Save failed: ${err}`);
+        settingSave.textContent = 'Save';
+        settingSave.disabled = false;
+      }
+    });
+
+    // ── SKU drawer ──────────────────────────────────────
+    const drawerEl = document.getElementById('sku-drawer');
+    const drawerOverlay = document.getElementById('sku-drawer-overlay');
+    const drawerTitle = document.getElementById('sku-drawer-title');
+    const drawerKV = document.getElementById('sku-kv');
+    const chartCanvas = document.getElementById('sku-chart');
+
+    function closeDrawer() {
+      drawerEl.classList.remove('visible');
+      drawerOverlay.classList.remove('visible');
+    }
+    document.getElementById('sku-drawer-close').addEventListener('click', closeDrawer);
+    drawerOverlay.addEventListener('click', closeDrawer);
+
+    async function openSkuDrawer(sku) {
+      drawerTitle.textContent = sku;
+      drawerKV.innerHTML = '<div>Loading…</div>';
+      drawerEl.classList.add('visible');
+      drawerOverlay.classList.add('visible');
+      try {
+        const r = await fetch(`/forecasting/sku/${encodeURIComponent(sku)}`, { headers: authHeaders() });
+        const data = await r.json();
+        if (data.error) {
+          drawerKV.innerHTML = `<div>${escapeHtml(data.error)}</div>`;
+          return;
+        }
+        const reorder = data.reorder || {};
+        const drivers = data.drivers || {};
+        drawerKV.innerHTML = `
+          <div><span>Method</span><span>${escapeHtml(data.method || '—')}</span></div>
+          <div><span>Recent avg</span><span>${drivers.recent_avg ?? 0}/day</span></div>
+          <div><span>On hand</span><span>${reorder.on_hand ?? 0}</span></div>
+          <div><span>Inbound</span><span>${reorder.inbound ?? 0}</span></div>
+          <div><span>Days of cover</span><span>${reorder.days_of_cover ?? '—'}</span></div>
+          <div><span>Reorder by</span><span>${reorder.reorder_by_date ?? '—'}</span></div>
+          <div><span>Safety stock</span><span>${reorder.safety_stock ?? 0}</span></div>
+          <div><span>Reorder point</span><span>${reorder.reorder_point ?? 0}</span></div>
+          <div><span>Recommended PO</span><span>${reorder.recommended_po_qty ?? 0}</span></div>
+          <div><span>MOQ / lead time</span><span>${reorder.moq ?? 1} / ${reorder.lead_time_days ?? '?'}d</span></div>
+        `;
+        const fc = data.forecast || [];
+        const labels = fc.map(r => r.date.slice(0, 10));
+        const p50 = fc.map(r => r.p50);
+        const p90 = fc.map(r => r.p90);
+        if (skuChart) skuChart.destroy();
+        skuChart = new Chart(chartCanvas, {
+          type: 'line',
+          data: {
+            labels,
+            datasets: [
+              { label: 'p90 (upper)', data: p90, borderColor: '#c5d2ff', backgroundColor: 'rgba(74,108,247,0.10)', fill: '-1', pointRadius: 0, borderWidth: 1 },
+              { label: 'p50 forecast', data: p50, borderColor: '#4a6cf7', backgroundColor: 'rgba(74,108,247,0.05)', pointRadius: 0, borderWidth: 2, tension: 0.2 },
+            ],
+          },
+          options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { display: true, labels: { font: { size: 11 } } } },
+            scales: {
+              x: { ticks: { maxTicksLimit: 8, font: { size: 10 } } },
+              y: { beginAtZero: true, ticks: { font: { size: 10 } } },
+            },
+          },
+        });
+      } catch (err) {
+        drawerKV.innerHTML = `<div>Failed to load: ${escapeHtml(String(err))}</div>`;
+      }
+    }
 
     // ── Init ───────────────────────────────────────────
 
