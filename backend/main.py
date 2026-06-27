@@ -36,6 +36,11 @@ from forecasting.ingest import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from datetime import datetime, timedelta, timezone
+
+import amazon_sp
+from agent import compute_profitability_data
+from campaigns import analyze_performance_data
 from amazon_ads import (
     exchange_auth_code,
     get_profiles,
@@ -332,6 +337,83 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
         "reorder": c.get("reorder"),
         "forecast": c.get("forecast"),
     }
+
+
+# ── Amazon SP-API data endpoints (for FE tables) ───────────────────────────
+
+
+@app.get("/amazon/marketplaces")
+async def amazon_marketplaces(user: dict = Depends(protect)):
+    """Marketplaces the user is registered in. Feeds the Orders tab selector."""
+    return {"marketplaces": amazon_sp.list_marketplaces()}
+
+
+@app.get("/amazon/orders")
+async def amazon_orders(
+    days_back: int = 30,
+    start: str | None = None,
+    end: str | None = None,
+    status: str | None = None,
+    marketplace: str | None = None,
+    buyer_email: str | None = None,
+    user: dict = Depends(protect),
+):
+    """List orders in the requested window across all pages (no FE pagination).
+
+    Filters: date range (days_back OR explicit start/end ISO-8601), comma-
+    separated OrderStatuses, single marketplace (id / short code / country
+    name; default = all the user has), and optional buyer email substring
+    match applied after fetch."""
+    if start:
+        created_after = start
+    else:
+        created_after = (
+            datetime.now(timezone.utc) - timedelta(days=max(1, days_back))
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    created_before = end
+    statuses = [s.strip() for s in status.split(",") if s.strip()] if status else None
+
+    data = await amazon_sp.get_orders(
+        created_after=created_after,
+        created_before=created_before,
+        statuses=statuses,
+        max_results=100,
+        marketplace=marketplace,
+        paginate=True,
+    )
+    orders = (data.get("payload") or {}).get("Orders") or []
+    if buyer_email:
+        needle = buyer_email.lower()
+        orders = [
+            o for o in orders
+            if needle in (o.get("BuyerInfo", {}).get("BuyerEmail") or "").lower()
+        ]
+    return {
+        "count": len(orders),
+        "created_after": created_after,
+        "created_before": created_before,
+        "orders": orders,
+    }
+
+
+@app.get("/amazon/orders/{order_id}/items")
+async def amazon_order_items(order_id: str, user: dict = Depends(protect)):
+    """Line items for a single order — used to expand a row in the FE table."""
+    data = await amazon_sp.get_order_items(order_id)
+    return {"items": (data.get("payload") or {}).get("OrderItems") or []}
+
+
+@app.get("/campaigns/performance")
+async def campaigns_performance(user: dict = Depends(protect)):
+    """Structured campaign performance — feeds the Campaigns tab."""
+    return await analyze_performance_data(full=True)
+
+
+@app.get("/profitability")
+async def profitability(days_back: int = 30, user: dict = Depends(protect)):
+    """Per-SKU profitability for the requested window. Walks SP-API
+    NextToken so the FE sees the whole window."""
+    return await compute_profitability_data(days_back=days_back, paginate=True)
 
 
 # ── Amazon OAuth endpoints ─────────────────────────────────────────────────

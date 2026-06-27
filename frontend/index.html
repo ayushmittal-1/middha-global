@@ -529,6 +529,212 @@
     .urgency-green  { background: #d8f3df; color: #1b5e20; }
     .urgency-grey   { background: #ececf0; color: #555; }
 
+    /* Orders tab — reuses .restock table styles */
+    #orders-view {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 24px;
+      display: none;
+      flex-direction: column;
+      gap: 16px;
+    }
+    #orders-view.visible { display: flex; }
+    #orders-toolbar {
+      display: flex;
+      align-items: flex-end;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    #orders-toolbar h2 {
+      font-size: 18px;
+      color: #1a1a2e;
+      margin-right: auto;
+      align-self: center;
+    }
+    #orders-toolbar label {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 11px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    #orders-toolbar input,
+    #orders-toolbar select {
+      padding: 7px 10px;
+      border: 1px solid #d0d0d0;
+      border-radius: 6px;
+      font-size: 13px;
+      background: #fff;
+    }
+    #orders-toolbar input[type=number] { width: 90px; }
+    #orders-toolbar input[type=search] { width: 180px; }
+    #orders-toolbar #orders-refresh {
+      padding: 8px 16px;
+      background: #1a1a2e;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    #orders-toolbar #orders-refresh:disabled { opacity: 0.6; cursor: not-allowed; }
+    #orders-stamp { font-size: 12px; color: #888; align-self: center; }
+    #orders-table-wrap {
+      background: #fff;
+      border-radius: 10px;
+      border: 1px solid #e0e0e0;
+      overflow: auto;
+      max-height: calc(100vh - 260px);
+    }
+    #orders-table-wrap thead th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    #orders-empty {
+      padding: 32px;
+      text-align: center;
+      color: #888;
+      background: #fff;
+      border: 1px dashed #d0d0d0;
+      border-radius: 10px;
+    }
+    .status-pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      background: #ececf0;
+      color: #444;
+    }
+    .status-shipped { background: #d8f3df; color: #1b5e20; }
+    .status-pending, .status-unshipped { background: #fff5cf; color: #8a6d00; }
+    .status-canceled, .status-unfulfillable { background: #ffe2e2; color: #b71c1c; }
+    .status-partiallyshipped { background: #ffe9d0; color: #b35200; }
+
+    /* Campaigns + Profitability tabs */
+    #campaigns-view, #profit-view {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 24px;
+      display: none;
+      flex-direction: column;
+      gap: 16px;
+    }
+    #campaigns-view.visible, #profit-view.visible { display: flex; }
+    #campaigns-toolbar, #profit-toolbar {
+      display: flex;
+      align-items: flex-end;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    #campaigns-toolbar h2, #profit-toolbar h2 {
+      font-size: 18px;
+      color: #1a1a2e;
+      margin-right: auto;
+      align-self: center;
+    }
+    #profit-toolbar label {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 11px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    #profit-toolbar input {
+      padding: 7px 10px;
+      border: 1px solid #d0d0d0;
+      border-radius: 6px;
+      font-size: 13px;
+      width: 90px;
+    }
+    #campaigns-toolbar button, #profit-toolbar button {
+      padding: 8px 16px;
+      background: #1a1a2e;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    #campaigns-toolbar button:disabled, #profit-toolbar button:disabled { opacity: 0.6; cursor: not-allowed; }
+    #profit-stamp { font-size: 12px; color: #888; align-self: center; }
+
+    #campaigns-kpis, #profit-kpis {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+    }
+    .kpi-card {
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+    .kpi-card .label {
+      font-size: 11px;
+      color: #777;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .kpi-card .value {
+      font-size: 20px;
+      font-weight: 600;
+      color: #1a1a2e;
+      margin-top: 4px;
+      font-variant-numeric: tabular-nums;
+    }
+    #campaigns-recs, #profit-caveats {
+      background: #fff7e0;
+      border: 1px solid #ffe1a1;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      color: #6e4d00;
+      display: none;
+    }
+    #campaigns-recs.visible, #profit-caveats.visible { display: block; }
+    #campaigns-recs ul, #profit-caveats ul { margin: 4px 0 0 18px; }
+
+    #campaigns-table-wrap, #profit-table-wrap {
+      background: #fff;
+      border-radius: 10px;
+      border: 1px solid #e0e0e0;
+      overflow: auto;
+      max-height: calc(100vh - 360px);
+    }
+    #campaigns-table-wrap thead th,
+    #profit-table-wrap thead th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    #profit-table-wrap tfoot td {
+      background: #f8f9fb;
+      padding: 11px 12px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      border-top: 2px solid #e0e0e0;
+    }
+    .margin-good { color: #1b5e20; }
+    .margin-warn { color: #b35200; }
+    .margin-bad  { color: #b71c1c; }
+    #campaigns-empty, #profit-empty {
+      padding: 32px;
+      text-align: center;
+      color: #888;
+      background: #fff;
+      border: 1px dashed #d0d0d0;
+      border-radius: 10px;
+    }
+
     #restock-empty {
       padding: 32px;
       text-align: center;
@@ -653,6 +859,9 @@
     <nav id="tab-nav">
       <button class="tab-btn active" data-tab="chat">Chat</button>
       <button class="tab-btn" data-tab="restock">Restock</button>
+      <button class="tab-btn" data-tab="orders">Orders</button>
+      <button class="tab-btn" data-tab="campaigns">Campaigns</button>
+      <button class="tab-btn" data-tab="profit">Profitability</button>
     </nav>
 
     <div id="chat-container">
@@ -710,6 +919,117 @@
       </div>
       <div id="restock-empty" style="display:none;">
         No forecasts yet. Click <strong>Refresh forecasts</strong> once your SP-API data has been ingested.
+      </div>
+    </div>
+
+    <div id="orders-view">
+      <div id="orders-toolbar">
+        <h2>Orders</h2>
+        <span id="orders-stamp"></span>
+        <label>Marketplace
+          <select id="orders-marketplace"><option value="">All</option></select>
+        </label>
+        <label>Days back
+          <input id="orders-days" type="number" min="1" max="365" value="30">
+        </label>
+        <label>Status
+          <select id="orders-status">
+            <option value="">Any</option>
+            <option value="Pending">Pending</option>
+            <option value="Unshipped">Unshipped</option>
+            <option value="PartiallyShipped">PartiallyShipped</option>
+            <option value="Shipped">Shipped</option>
+            <option value="Canceled">Canceled</option>
+            <option value="Unfulfillable">Unfulfillable</option>
+            <option value="InvoiceUnconfirmed">InvoiceUnconfirmed</option>
+          </select>
+        </label>
+        <label>Buyer email
+          <input id="orders-buyer" type="search" placeholder="contains…">
+        </label>
+        <button id="orders-refresh">Apply</button>
+      </div>
+
+      <div id="orders-table-wrap">
+        <table class="restock orders">
+          <thead>
+            <tr>
+              <th>Order ID</th>
+              <th>Purchased</th>
+              <th>Status</th>
+              <th>Marketplace</th>
+              <th class="num">Items</th>
+              <th class="num">Total</th>
+              <th>Ship-by</th>
+            </tr>
+          </thead>
+          <tbody id="orders-body"></tbody>
+        </table>
+      </div>
+      <div id="orders-empty" style="display:none;">
+        No orders in this window. Widen the date range or change filters.
+      </div>
+    </div>
+
+    <div id="campaigns-view">
+      <div id="campaigns-toolbar">
+        <h2>Campaign performance</h2>
+        <button id="campaigns-refresh">Refresh</button>
+      </div>
+      <div id="campaigns-kpis"></div>
+      <div id="campaigns-recs"></div>
+      <div id="campaigns-table-wrap">
+        <table class="restock campaigns">
+          <thead>
+            <tr>
+              <th>Campaign</th>
+              <th>Type</th>
+              <th>Status</th>
+              <th>Country</th>
+              <th class="num">Spend</th>
+              <th class="num">Sales</th>
+              <th class="num">Budget</th>
+              <th class="num">ACOS %</th>
+              <th class="num">ROI %</th>
+            </tr>
+          </thead>
+          <tbody id="campaigns-body"></tbody>
+        </table>
+      </div>
+      <div id="campaigns-empty" style="display:none;">
+        No campaign data yet. Make sure Amazon Ads is connected.
+      </div>
+    </div>
+
+    <div id="profit-view">
+      <div id="profit-toolbar">
+        <h2>Profitability</h2>
+        <span id="profit-stamp"></span>
+        <label>Days back
+          <input id="profit-days" type="number" min="1" max="365" value="30">
+        </label>
+        <button id="profit-refresh">Apply</button>
+      </div>
+      <div id="profit-kpis"></div>
+      <div id="profit-caveats"></div>
+      <div id="profit-table-wrap">
+        <table class="restock profit">
+          <thead>
+            <tr>
+              <th>SKU</th>
+              <th class="num">Units</th>
+              <th class="num">Revenue</th>
+              <th class="num">COGS + Inbound</th>
+              <th class="num">Net</th>
+              <th class="num">Margin %</th>
+            </tr>
+          </thead>
+          <tbody id="profit-body"></tbody>
+          <tfoot id="profit-foot"></tfoot>
+        </table>
+      </div>
+      <div id="profit-empty" style="display:none;">
+        No profitable rows yet. Upload COGS for your active SKUs from the sidebar.
       </div>
     </div>
   </div>
@@ -1128,18 +1448,70 @@
     let restockLoaded = false;
     let skuChart = null;
 
+    // ── Orders tab refs ─────────────────────────────────
+    const ordersViewEl = document.getElementById('orders-view');
+    const ordersBodyEl = document.getElementById('orders-body');
+    const ordersEmptyEl = document.getElementById('orders-empty');
+    const ordersStampEl = document.getElementById('orders-stamp');
+    const ordersMarketplaceEl = document.getElementById('orders-marketplace');
+    const ordersDaysEl = document.getElementById('orders-days');
+    const ordersStatusEl = document.getElementById('orders-status');
+    const ordersBuyerEl = document.getElementById('orders-buyer');
+    const ordersRefreshBtn = document.getElementById('orders-refresh');
+    let ordersLoaded = false;
+    const marketplaceNames = {};
+
+    // ── Campaigns + Profitability tab refs ──────────────
+    const campaignsViewEl = document.getElementById('campaigns-view');
+    const campaignsBodyEl = document.getElementById('campaigns-body');
+    const campaignsKpisEl = document.getElementById('campaigns-kpis');
+    const campaignsRecsEl = document.getElementById('campaigns-recs');
+    const campaignsEmptyEl = document.getElementById('campaigns-empty');
+    const campaignsRefreshBtn = document.getElementById('campaigns-refresh');
+    let campaignsLoaded = false;
+
+    const profitViewEl = document.getElementById('profit-view');
+    const profitBodyEl = document.getElementById('profit-body');
+    const profitFootEl = document.getElementById('profit-foot');
+    const profitKpisEl = document.getElementById('profit-kpis');
+    const profitCaveatsEl = document.getElementById('profit-caveats');
+    const profitEmptyEl = document.getElementById('profit-empty');
+    const profitStampEl = document.getElementById('profit-stamp');
+    const profitDaysEl = document.getElementById('profit-days');
+    const profitRefreshBtn = document.getElementById('profit-refresh');
+    let profitLoaded = false;
+
     function setActiveTab(tab) {
       document.querySelectorAll('.tab-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
       });
       const isChat = tab === 'chat';
+      const isRestock = tab === 'restock';
+      const isOrders = tab === 'orders';
+      const isCampaigns = tab === 'campaigns';
+      const isProfit = tab === 'profit';
       chatContainerEl.style.display = isChat ? 'flex' : 'none';
       inputAreaEl.style.display = isChat ? 'flex' : 'none';
-      restockViewEl.classList.toggle('visible', !isChat);
-      if (!isChat && !restockLoaded) {
+      restockViewEl.classList.toggle('visible', isRestock);
+      ordersViewEl.classList.toggle('visible', isOrders);
+      campaignsViewEl.classList.toggle('visible', isCampaigns);
+      profitViewEl.classList.toggle('visible', isProfit);
+      if (isRestock && !restockLoaded) {
         loadRestock();
         loadForecastSettings();
         restockLoaded = true;
+      }
+      if (isOrders && !ordersLoaded) {
+        loadMarketplaces().then(loadOrders);
+        ordersLoaded = true;
+      }
+      if (isCampaigns && !campaignsLoaded) {
+        loadCampaignsPerformance();
+        campaignsLoaded = true;
+      }
+      if (isProfit && !profitLoaded) {
+        loadProfitability();
+        profitLoaded = true;
       }
     }
     document.querySelectorAll('.tab-btn').forEach(b => {
@@ -1254,6 +1626,271 @@
         settingSave.disabled = false;
       }
     });
+
+    // ── Orders tab ──────────────────────────────────────
+    async function loadMarketplaces() {
+      try {
+        const r = await fetch('/amazon/marketplaces', { headers: authHeaders() });
+        if (!r.ok) return;
+        const data = await r.json();
+        const opts = ['<option value="">All</option>'];
+        for (const m of data.marketplaces || []) {
+          marketplaceNames[m.id] = m.name;
+          const label = `${m.name}${m.is_primary ? ' (primary)' : ''}`;
+          opts.push(`<option value="${escapeHtml(m.id)}">${escapeHtml(label)}</option>`);
+        }
+        ordersMarketplaceEl.innerHTML = opts.join('');
+      } catch (_) {}
+    }
+
+    function statusPillClass(status) {
+      if (!status) return 'status-pill';
+      return `status-pill status-${status.toLowerCase()}`;
+    }
+
+    function fmtMoney(amt) {
+      if (!amt) return '—';
+      const n = Number(amt.Amount);
+      if (!isFinite(n)) return '—';
+      return `${n.toFixed(2)} ${amt.CurrencyCode || ''}`.trim();
+    }
+
+    function fmtDate(iso) {
+      if (!iso) return '—';
+      try { return new Date(iso).toLocaleString(); } catch (_) { return iso; }
+    }
+
+    async function loadOrders() {
+      ordersBodyEl.innerHTML = '<tr><td colspan="7" style="padding:20px;color:#888;">Loading…</td></tr>';
+      ordersEmptyEl.style.display = 'none';
+      ordersRefreshBtn.disabled = true;
+      const params = new URLSearchParams();
+      params.set('days_back', String(Number(ordersDaysEl.value) || 30));
+      if (ordersStatusEl.value) params.set('status', ordersStatusEl.value);
+      if (ordersMarketplaceEl.value) params.set('marketplace', ordersMarketplaceEl.value);
+      if (ordersBuyerEl.value.trim()) params.set('buyer_email', ordersBuyerEl.value.trim());
+      try {
+        const r = await fetch(`/amazon/orders?${params}`, { headers: authHeaders() });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        const orders = data.orders || [];
+        ordersStampEl.textContent = `${data.count} orders since ${fmtDate(data.created_after)}`;
+        if (!orders.length) {
+          ordersBodyEl.innerHTML = '';
+          ordersEmptyEl.style.display = 'block';
+          return;
+        }
+        const rows = orders.map(o => {
+          const id = o.AmazonOrderId || '';
+          const status = o.OrderStatus || '';
+          const purchased = fmtDate(o.PurchaseDate);
+          const marketId = o.MarketplaceId || '';
+          const market = marketplaceNames[marketId] || marketId || '—';
+          const items = o.NumberOfItemsShipped != null || o.NumberOfItemsUnshipped != null
+            ? `${o.NumberOfItemsShipped ?? 0} / ${(o.NumberOfItemsShipped ?? 0) + (o.NumberOfItemsUnshipped ?? 0)}`
+            : '—';
+          const total = fmtMoney(o.OrderTotal);
+          const shipBy = o.LatestShipDate ? fmtDate(o.LatestShipDate) : '—';
+          return `
+            <tr data-order-id="${escapeHtml(id)}">
+              <td><strong>${escapeHtml(id)}</strong></td>
+              <td>${escapeHtml(purchased)}</td>
+              <td><span class="${statusPillClass(status)}">${escapeHtml(status || '—')}</span></td>
+              <td>${escapeHtml(market)}</td>
+              <td class="num">${escapeHtml(items)}</td>
+              <td class="num">${escapeHtml(total)}</td>
+              <td>${escapeHtml(shipBy)}</td>
+            </tr>`;
+        });
+        ordersBodyEl.innerHTML = rows.join('');
+        ordersBodyEl.querySelectorAll('tr').forEach(tr => {
+          tr.addEventListener('click', () => openOrderDrawer(tr.dataset.orderId));
+        });
+      } catch (err) {
+        ordersBodyEl.innerHTML = `<tr><td colspan="7" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
+      } finally {
+        ordersRefreshBtn.disabled = false;
+      }
+    }
+
+    ordersRefreshBtn.addEventListener('click', loadOrders);
+
+    async function openOrderDrawer(orderId) {
+      drawerTitle.textContent = orderId;
+      drawerKV.innerHTML = '<div>Loading…</div>';
+      if (skuChart) { skuChart.destroy(); skuChart = null; }
+      drawerEl.classList.add('visible');
+      drawerOverlay.classList.add('visible');
+      try {
+        const r = await fetch(`/amazon/orders/${encodeURIComponent(orderId)}/items`, { headers: authHeaders() });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        const items = data.items || [];
+        if (!items.length) {
+          drawerKV.innerHTML = '<div>No line items.</div>';
+          return;
+        }
+        drawerKV.innerHTML = items.map(it => `
+          <div><span>SKU</span><span>${escapeHtml(it.SellerSKU || '—')}</span></div>
+          <div><span>ASIN</span><span>${escapeHtml(it.ASIN || '—')}</span></div>
+          <div><span>Qty ordered</span><span>${it.QuantityOrdered ?? 0}</span></div>
+          <div><span>Qty shipped</span><span>${it.QuantityShipped ?? 0}</span></div>
+          <div><span>Item price</span><span>${escapeHtml(fmtMoney(it.ItemPrice))}</span></div>
+          <div><span>Promo discount</span><span>${escapeHtml(fmtMoney(it.PromotionDiscount))}</span></div>
+        `).join('');
+      } catch (err) {
+        drawerKV.innerHTML = `<div>Failed to load: ${escapeHtml(String(err))}</div>`;
+      }
+    }
+
+    // ── Campaigns tab ───────────────────────────────────
+    function kpiCard(label, value) {
+      return `<div class="kpi-card"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(String(value))}</div></div>`;
+    }
+
+    function marginClass(m) {
+      if (m == null || isNaN(m)) return '';
+      if (m >= 25) return 'margin-good';
+      if (m >= 10) return 'margin-warn';
+      return 'margin-bad';
+    }
+
+    async function loadCampaignsPerformance() {
+      campaignsBodyEl.innerHTML = '<tr><td colspan="9" style="padding:20px;color:#888;">Loading…</td></tr>';
+      campaignsKpisEl.innerHTML = '';
+      campaignsRecsEl.classList.remove('visible');
+      campaignsEmptyEl.style.display = 'none';
+      campaignsRefreshBtn.disabled = true;
+      try {
+        const r = await fetch('/campaigns/performance', { headers: authHeaders() });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        if (data.empty || !data.overview) {
+          campaignsBodyEl.innerHTML = '';
+          campaignsEmptyEl.style.display = 'block';
+          return;
+        }
+        const ov = data.overview;
+        campaignsKpisEl.innerHTML = [
+          kpiCard('Total campaigns', ov.total_campaigns),
+          kpiCard('Enabled', ov.enabled),
+          kpiCard('Paused', ov.paused),
+          kpiCard('Total spend', `$${ov.total_spend_usd.toLocaleString()}`),
+          kpiCard('Total sales', `$${ov.total_sales_usd.toLocaleString()}`),
+          kpiCard('Overall ACOS', `${ov.overall_acos_pct}%`),
+        ].join('');
+
+        const recs = data.recommendations || [];
+        if (recs.length) {
+          campaignsRecsEl.innerHTML = `<strong>Recommendations</strong><ul>${recs.map(r => `<li>${escapeHtml(r)}</li>`).join('')}</ul>`;
+          campaignsRecsEl.classList.add('visible');
+        }
+
+        const rows = (data.campaigns || []).slice().sort((a, b) => (b.spend || 0) - (a.spend || 0));
+        if (!rows.length) {
+          campaignsBodyEl.innerHTML = '<tr><td colspan="9" style="padding:20px;color:#888;">No campaigns.</td></tr>';
+          return;
+        }
+        campaignsBodyEl.innerHTML = rows.map(c => {
+          const acos = (c.acos == null) ? '—' : (typeof c.acos === 'number' ? `${c.acos}%` : escapeHtml(String(c.acos)));
+          const roi = (c.roi_pct == null) ? '—' : `${c.roi_pct}%`;
+          return `<tr>
+            <td><strong>${escapeHtml(c.name || '—')}</strong></td>
+            <td>${escapeHtml(c.type || '—')}</td>
+            <td>${escapeHtml(c.status || '—')}</td>
+            <td>${escapeHtml(c.country || '—')}</td>
+            <td class="num">$${(c.spend || 0).toLocaleString()}</td>
+            <td class="num">$${(c.sales || 0).toLocaleString()}</td>
+            <td class="num">$${(c.budget || 0).toLocaleString()}</td>
+            <td class="num">${acos}</td>
+            <td class="num">${roi}</td>
+          </tr>`;
+        }).join('');
+      } catch (err) {
+        campaignsBodyEl.innerHTML = `<tr><td colspan="9" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
+      } finally {
+        campaignsRefreshBtn.disabled = false;
+      }
+    }
+    campaignsRefreshBtn.addEventListener('click', loadCampaignsPerformance);
+
+    // ── Profitability tab ───────────────────────────────
+    async function loadProfitability() {
+      profitBodyEl.innerHTML = '<tr><td colspan="6" style="padding:20px;color:#888;">Loading… (this fetches every order in the window)</td></tr>';
+      profitFootEl.innerHTML = '';
+      profitKpisEl.innerHTML = '';
+      profitCaveatsEl.classList.remove('visible');
+      profitEmptyEl.style.display = 'none';
+      profitRefreshBtn.disabled = true;
+      const days = Math.max(1, Number(profitDaysEl.value) || 30);
+      try {
+        const r = await fetch(`/profitability?days_back=${days}`, { headers: authHeaders() });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        if (data.error) throw new Error(data.error);
+
+        profitStampEl.textContent = `${data.orders_count} orders, ${data.skus_count} SKUs · since ${data.created_after ? new Date(data.created_after).toLocaleDateString() : '—'}`;
+
+        const t = data.totals;
+        if (t) {
+          profitKpisEl.innerHTML = [
+            kpiCard('Units sold', t.units.toLocaleString()),
+            kpiCard('Revenue', `$${t.revenue.toLocaleString()}`),
+            kpiCard('COGS + Inbound', `$${t.cogs.toLocaleString()}`),
+            kpiCard('Net profit', `$${t.net.toLocaleString()}`),
+            kpiCard('Margin', `${t.margin}%`),
+          ].join('');
+        }
+
+        const rows = data.rows || [];
+        if (!rows.length) {
+          profitBodyEl.innerHTML = '';
+          profitEmptyEl.style.display = 'block';
+        } else {
+          profitBodyEl.innerHTML = rows.map(r => `
+            <tr>
+              <td><strong>${escapeHtml(r.sku)}</strong></td>
+              <td class="num">${r.units}</td>
+              <td class="num">$${r.revenue.toLocaleString()}</td>
+              <td class="num">$${r.cogs.toLocaleString()}</td>
+              <td class="num ${marginClass(r.margin)}">$${r.net.toLocaleString()}</td>
+              <td class="num ${marginClass(r.margin)}">${r.margin}%</td>
+            </tr>
+          `).join('');
+          if (t) {
+            profitFootEl.innerHTML = `
+              <tr>
+                <td>Totals</td>
+                <td class="num">${t.units}</td>
+                <td class="num">$${t.revenue.toLocaleString()}</td>
+                <td class="num">$${t.cogs.toLocaleString()}</td>
+                <td class="num ${marginClass(t.margin)}">$${t.net.toLocaleString()}</td>
+                <td class="num ${marginClass(t.margin)}">${t.margin}%</td>
+              </tr>`;
+          }
+        }
+
+        const caveats = [];
+        for (const m of data.missing_cogs || []) {
+          caveats.push(`COGS missing for <code>${escapeHtml(m.sku)}</code> — ${m.units} units, $${m.revenue.toLocaleString()} revenue excluded.`);
+        }
+        if ((data.na_price_rows || []).length) {
+          caveats.push(`${data.na_price_rows.length} order item(s) had price N/A and were excluded.`);
+        }
+        if ((data.fetch_errors || []).length) {
+          caveats.push(`${data.fetch_errors.length} order(s) failed to fetch items.`);
+        }
+        if (caveats.length) {
+          profitCaveatsEl.innerHTML = `<strong>Caveats</strong><ul>${caveats.map(c => `<li>${c}</li>`).join('')}</ul>`;
+          profitCaveatsEl.classList.add('visible');
+        }
+      } catch (err) {
+        profitBodyEl.innerHTML = `<tr><td colspan="6" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
+      } finally {
+        profitRefreshBtn.disabled = false;
+      }
+    }
+    profitRefreshBtn.addEventListener('click', loadProfitability);
 
     // ── SKU drawer ──────────────────────────────────────
     const drawerEl = document.getElementById('sku-drawer');

@@ -307,23 +307,58 @@ async def _sp_request(
 
 async def get_orders(
     created_after: str | None = None,
+    created_before: str | None = None,
     statuses: list[str] | None = None,
     max_results: int = 20,
     marketplace: str | list[str] | None = None,
+    paginate: bool = False,
 ) -> dict:
     """List orders across the requested marketplaces (default: all the user
-    is registered in). created_after is ISO-8601 (e.g. '2024-01-01T00:00:00Z')."""
+    is registered in). created_after / created_before are ISO-8601 (e.g.
+    '2024-01-01T00:00:00Z').
+
+    When paginate=True, follow `payload.NextToken` until the window is
+    exhausted and return a merged payload (Orders concatenated, NextToken
+    dropped). SP-API's contract: continuations send only `MarketplaceIds`
+    + `NextToken`."""
     user = require_user()
     marketplace_ids = resolve_marketplace(user, marketplace, multiple=True)
-    params = {
+    base_params = {
         "MarketplaceIds": ",".join(marketplace_ids),
         "MaxResultsPerPage": str(min(max_results, 100)),
     }
     if created_after:
-        params["CreatedAfter"] = created_after
+        base_params["CreatedAfter"] = created_after
+    if created_before:
+        base_params["CreatedBefore"] = created_before
     if statuses:
-        params["OrderStatuses"] = ",".join(statuses)
-    return await _sp_request("GET", "/orders/v0/orders", params=params)
+        base_params["OrderStatuses"] = ",".join(statuses)
+
+    if not paginate:
+        return await _sp_request("GET", "/orders/v0/orders", params=base_params)
+
+    merged: dict = {}
+    orders: list = []
+    page_params = dict(base_params)
+    while True:
+        resp = await _sp_request("GET", "/orders/v0/orders", params=page_params)
+        if not merged:
+            merged = resp
+        payload = resp.get("payload") or {}
+        orders.extend(payload.get("Orders") or [])
+        next_token = payload.get("NextToken")
+        if not next_token:
+            break
+        page_params = {
+            "MarketplaceIds": base_params["MarketplaceIds"],
+            "NextToken": next_token,
+        }
+
+    if "payload" not in merged:
+        merged["payload"] = {}
+    merged["payload"]["Orders"] = orders
+    merged["payload"].pop("NextToken", None)
+    return merged
 
 
 async def get_order(order_id: str) -> dict:
@@ -346,18 +381,59 @@ async def get_inventory_summaries(
 ) -> dict:
     """Get FBA inventory levels. SP-API requires a single granularityId per
     call, so this scopes to one marketplace at a time (default: user's
-    primary, US-preferred)."""
+    primary, US-preferred).
+
+    Follows pagination — the first response carries ~50 SKUs and a
+    `pagination.nextToken`; we keep fetching until the token is gone so
+    every fulfillable SKU lands in the result. SP-API's contract for
+    paginated continuations: send ONLY `nextToken` (no other query
+    params), otherwise it returns InvalidInput.
+    """
     user = require_user()
     marketplace_id = resolve_marketplace(user, marketplace, multiple=False)
-    params = {
+    base_params: dict = {
         "details": str(details).lower(),
         "granularityType": "Marketplace",
         "granularityId": marketplace_id,
         "marketplaceIds": marketplace_id,
     }
     if skus:
-        params["sellerSkus"] = ",".join(skus)
-    return await _sp_request("GET", "/fba/inventory/v1/summaries", params=params)
+        base_params["sellerSkus"] = ",".join(skus)
+
+    # FBA inventory pagination requires the granularity params on EVERY
+    # call, including continuations — only `details` and `sellerSkus`
+    # get dropped after page 1.
+    page_params = dict(base_params)
+    next_token: str | None = None
+    merged: dict = {}
+    summaries: list = []
+    while True:
+        if next_token:
+            page_params = {
+                "granularityType": "Marketplace",
+                "granularityId": marketplace_id,
+                "marketplaceIds": marketplace_id,
+                "nextToken": next_token,
+            }
+        resp = await _sp_request(
+            "GET", "/fba/inventory/v1/summaries", params=page_params
+        )
+        if not merged:
+            merged = resp
+        payload = resp.get("payload") or {}
+        summaries.extend(payload.get("inventorySummaries") or [])
+        next_token = (resp.get("pagination") or {}).get("nextToken")
+        if not next_token:
+            break
+        if skus:
+            # Caller asked for a specific list — first page covers it.
+            break
+
+    if "payload" not in merged:
+        merged["payload"] = {}
+    merged["payload"]["inventorySummaries"] = summaries
+    merged.pop("pagination", None)
+    return merged
 
 
 # ── Reports API (2021-06-30) ────────────────────────────────────────────────

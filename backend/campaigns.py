@@ -113,16 +113,20 @@ async def search_campaigns(query: str) -> str:
     return f"Found {len(matches)} campaign(s) matching '{query}':\n" + _build_summary(matches)
 
 
-async def analyze_performance() -> str:
-    """Analyze campaign performance: ACOS, top/bottom performers, recommendations."""
+async def analyze_performance_data(full: bool = False) -> dict:
+    """Structured campaign performance: overview, top/bottom performers,
+    recommendations. When full=True, also includes every campaign with its
+    derived ACOS/ROI under `campaigns` — used by the FE table. The LLM tool
+    uses full=False so the response stays compact."""
     await _ensure_loaded()
     campaigns = _user_campaigns[_user_key()]
     if not campaigns:
-        return "No campaign data available."
+        return {"empty": True}
 
     top_performers: list[dict] = []
     underperformers: list[dict] = []
     paused_with_spend: list[dict] = []
+    all_rows: list[dict] = []
 
     for c in campaigns:
         spend_amt = float((c.get("spend") or {}).get("amount", 0) or 0)
@@ -132,29 +136,34 @@ async def analyze_performance() -> str:
         status = c.get("status", "")
         ctype = c.get("campaignType", "")
 
+        acos_val = None
+        roi_val = 0.0
         if spend_amt > 0:
-            acos = (spend_amt / sales_amt * 100) if sales_amt > 0 else float("inf")
-            roi = ((sales_amt - spend_amt) / spend_amt * 100) if spend_amt > 0 else 0
+            acos_val = (spend_amt / sales_amt * 100) if sales_amt > 0 else None
+            roi_val = ((sales_amt - spend_amt) / spend_amt * 100)
 
-            entry = {
-                "name": name,
-                "type": ctype,
-                "status": status,
-                "spend": round(spend_amt, 2),
-                "sales": round(sales_amt, 2),
-                "budget": round(budget_amt, 2),
-                "acos": round(acos, 1) if acos != float("inf") else "N/A (no sales)",
-                "roi_pct": round(roi, 1),
-            }
+        entry = {
+            "name": name,
+            "type": ctype,
+            "status": status,
+            "country": c.get("country", ""),
+            "spend": round(spend_amt, 2),
+            "sales": round(sales_amt, 2),
+            "budget": round(budget_amt, 2),
+            "acos": round(acos_val, 1) if acos_val is not None else ("N/A (no sales)" if spend_amt > 0 else None),
+            "roi_pct": round(roi_val, 1),
+        }
+        all_rows.append(entry)
 
+        if spend_amt > 0:
             if sales_amt == 0:
                 underperformers.append(entry)
-            elif acos > 40:
+            elif acos_val is not None and acos_val > 40:
                 underperformers.append(entry)
-            elif acos < 20 and sales_amt > 0:
+            elif acos_val is not None and acos_val < 20 and sales_amt > 0:
                 top_performers.append(entry)
 
-            if status == "Paused" and spend_amt > 0:
+            if status == "Paused":
                 paused_with_spend.append(entry)
 
     total_spend = sum(float((c.get("spend") or {}).get("amount", 0) or 0) for c in campaigns)
@@ -163,8 +172,7 @@ async def analyze_performance() -> str:
     enabled = sum(1 for c in campaigns if c.get("status") == "Enabled")
     paused = sum(1 for c in campaigns if c.get("status") == "Paused")
 
-    import json as _json
-    analysis = {
+    analysis: dict = {
         "overview": {
             "total_campaigns": len(campaigns),
             "enabled": enabled,
@@ -177,6 +185,8 @@ async def analyze_performance() -> str:
         "underperformers": sorted(underperformers, key=lambda x: x.get("spend", 0), reverse=True)[:5],
         "recommendations": [],
     }
+    if full:
+        analysis["campaigns"] = all_rows
 
     if enabled == 0 and len(campaigns) > 0:
         analysis["recommendations"].append(
@@ -210,7 +220,16 @@ async def analyze_performance() -> str:
             "No spend recorded across any campaign — campaigns may need to be enabled and given budget to start generating data."
         )
 
-    return _json.dumps(analysis)
+    return analysis
+
+
+async def analyze_performance() -> str:
+    """Markdown/JSON wrapper used by the LLM tool — compact (no full campaign list)."""
+    import json as _json
+    data = await analyze_performance_data(full=False)
+    if data.get("empty"):
+        return "No campaign data available."
+    return _json.dumps(data)
 
 
 def _extract_id(resp: dict, section_key: str, id_field: str) -> str:

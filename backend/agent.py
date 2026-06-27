@@ -570,20 +570,29 @@ async def _get_cogs(skus=None) -> str:
     return out
 
 
-async def _analyze_profitability(days_back: int | str = 7) -> str:
+async def compute_profitability_data(days_back: int = 7, paginate: bool = False) -> dict:
+    """Structured per-SKU profitability for the FE table. Returns:
+      {orders_count, skus_count, rows, totals, missing_cogs, na_price_rows,
+       fetch_errors, error?}
+    When paginate=True, walks SP-API NextToken so the full window lands in
+    the result — the FE wants this. The markdown LLM tool calls with
+    paginate=False to keep the response snappy."""
+    created_after = (
+        datetime.now(timezone.utc) - timedelta(days=days_back)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
-        days_back = int(days_back)
-    except (TypeError, ValueError):
-        days_back = 7
-
-    created_after = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    try:
-        orders_resp = await amazon_sp.get_orders(created_after=created_after)
+        orders_resp = await amazon_sp.get_orders(
+            created_after=created_after, paginate=paginate,
+        )
     except Exception as e:
-        return f"Error fetching orders: {e}"
+        return {"error": f"Error fetching orders: {e}"}
     orders = orders_resp.get("payload", {}).get("Orders", [])
     if not orders:
-        return f"No orders in the last {days_back} days."
+        return {
+            "orders_count": 0, "skus_count": 0, "rows": [], "totals": None,
+            "missing_cogs": [], "na_price_rows": [], "fetch_errors": [],
+            "days_back": days_back, "created_after": created_after,
+        }
 
     order_ids = [o.get("AmazonOrderId") for o in orders if o.get("AmazonOrderId")]
 
@@ -596,7 +605,7 @@ async def _analyze_profitability(days_back: int | str = 7) -> str:
     items_results = await asyncio.gather(*[fetch_items(oid) for oid in order_ids])
 
     sku_data: dict[str, dict] = defaultdict(lambda: {"units": 0, "revenue": 0.0})
-    na_price_rows: list[tuple[str, str, int]] = []
+    na_price_rows: list[dict] = []
     fetch_errors: list[str] = []
 
     for oid, items_resp in items_results:
@@ -615,48 +624,93 @@ async def _analyze_profitability(days_back: int | str = 7) -> str:
             except (TypeError, ValueError):
                 amount = None
             if amount is None:
-                na_price_rows.append((oid, sku, qty))
+                na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
                 continue
             sku_data[sku]["units"] += qty
             sku_data[sku]["revenue"] += amount
 
-    if not sku_data:
-        return f"Found {len(orders)} orders but no items with a valid price."
-
     skus = sorted(sku_data.keys())
-    try:
-        cogs_rows = await get_cogs(skus)
-    except Exception as e:
-        return f"Error reading COGS: {e}"
-    cogs_map = {r["sku"]: r for r in cogs_rows}
+    cogs_map: dict = {}
+    if skus:
+        try:
+            cogs_rows = await get_cogs(skus)
+            cogs_map = {r["sku"]: r for r in cogs_rows}
+        except Exception as e:
+            return {"error": f"Error reading COGS: {e}"}
 
-    table_rows = []
-    totals = {"units": 0, "revenue": 0.0, "cogs": 0.0, "net": 0.0}
-    missing_cogs: list[tuple[str, int, float]] = []
+    rows: list[dict] = []
+    totals = {"units": 0, "revenue": 0.0, "cogs": 0.0, "net": 0.0, "margin": 0.0}
+    missing_cogs: list[dict] = []
 
     for sku in skus:
         units = sku_data[sku]["units"]
         revenue = sku_data[sku]["revenue"]
         cogs_row = cogs_map.get(sku)
         if not cogs_row:
-            missing_cogs.append((sku, units, revenue))
+            missing_cogs.append({"sku": sku, "units": units, "revenue": round(revenue, 2)})
             continue
         unit_total = cogs_row["unit_cost"] + cogs_row["inbound_shipping_per_unit"]
         cogs_inbound = unit_total * units
         net = revenue - cogs_inbound
         margin = (net / revenue * 100) if revenue > 0 else 0.0
-        table_rows.append({
-            "sku": sku, "units": units, "revenue": revenue,
-            "cogs": cogs_inbound, "net": net, "margin": margin,
+        rows.append({
+            "sku": sku,
+            "units": units,
+            "revenue": round(revenue, 2),
+            "cogs": round(cogs_inbound, 2),
+            "net": round(net, 2),
+            "margin": round(margin, 1),
         })
         totals["units"] += units
         totals["revenue"] += revenue
         totals["cogs"] += cogs_inbound
         totals["net"] += net
 
-    total_margin = (totals["net"] / totals["revenue"] * 100) if totals["revenue"] > 0 else 0.0
+    totals["margin"] = round(
+        (totals["net"] / totals["revenue"] * 100) if totals["revenue"] > 0 else 0.0, 1,
+    )
+    totals["revenue"] = round(totals["revenue"], 2)
+    totals["cogs"] = round(totals["cogs"], 2)
+    totals["net"] = round(totals["net"], 2)
 
-    lines = [f"Profitability — last {days_back} days, {len(orders)} orders, {len(skus)} distinct SKUs.", ""]
+    return {
+        "days_back": days_back,
+        "created_after": created_after,
+        "orders_count": len(orders),
+        "skus_count": len(skus),
+        "rows": rows,
+        "totals": totals,
+        "missing_cogs": missing_cogs,
+        "na_price_rows": na_price_rows,
+        "fetch_errors": fetch_errors,
+    }
+
+
+async def _analyze_profitability(days_back: int | str = 7) -> str:
+    try:
+        days_back = int(days_back)
+    except (TypeError, ValueError):
+        days_back = 7
+
+    data = await compute_profitability_data(days_back=days_back, paginate=False)
+    if "error" in data:
+        return data["error"]
+    if data["orders_count"] == 0:
+        return f"No orders in the last {days_back} days."
+    if data["skus_count"] == 0:
+        return f"Found {data['orders_count']} orders but no items with a valid price."
+
+    table_rows = data["rows"]
+    totals = data["totals"]
+    missing_cogs = data["missing_cogs"]
+    na_price_rows = data["na_price_rows"]
+    fetch_errors = data["fetch_errors"]
+    total_margin = totals["margin"]
+
+    lines = [
+        f"Profitability — last {days_back} days, {data['orders_count']} orders, {data['skus_count']} distinct SKUs.",
+        "",
+    ]
     if table_rows:
         lines.append("| SKU | Units | Revenue | COGS+Inbound | Net | Margin % |")
         lines.append("| --- | --- | --- | --- | --- | --- |")
@@ -678,10 +732,13 @@ async def _analyze_profitability(days_back: int | str = 7) -> str:
         lines.append("No rows in the table — every active SKU was missing COGS.")
 
     caveats = []
-    for sku, units, rev in missing_cogs:
-        caveats.append(f"- COGS missing for '{sku}' ({units} units, ${rev:.2f} revenue) — excluded from totals. Upload via the COGS panel.")
-    for oid, sku, qty in na_price_rows[:5]:
-        caveats.append(f"- Order {oid} ('{sku}' qty {qty}) had price N/A — row excluded.")
+    for m in missing_cogs:
+        caveats.append(
+            f"- COGS missing for '{m['sku']}' ({m['units']} units, ${m['revenue']:.2f} revenue) — "
+            "excluded from totals. Upload via the COGS panel."
+        )
+    for n in na_price_rows[:5]:
+        caveats.append(f"- Order {n['order_id']} ('{n['sku']}' qty {n['qty']}) had price N/A — row excluded.")
     if len(na_price_rows) > 5:
         caveats.append(f"- …and {len(na_price_rows) - 5} more N/A-price rows excluded.")
     for err in fetch_errors[:3]:
