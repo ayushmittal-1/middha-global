@@ -295,7 +295,20 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "analyze_profitability",
-            "description": "Compute per-SKU profitability for recent orders. Pulls orders, order items, and COGS server-side, then returns a fully-formatted markdown table with units, revenue, COGS+inbound, net, and margin per SKU plus totals. Use this for ANY profit / margin / P&L question — do not chain get_orders + get_order_items + get_cogs manually.",
+            "description": (
+                "Compute per-SKU profitability for recent orders using the full "
+                "Amazon FBA Profitability Calculator formula. Pulls orders, order "
+                "items, Product Fees API (referral / FBA / fuel surcharge per ASIN), "
+                "FBA storage report (per-ASIN monthly fee allocated to the window), "
+                "Aurora ad spend (pro-rated, uniform per unit), and the user's "
+                "uploaded COGS. Returns a markdown table with the full per-SKU fee "
+                "breakdown — referral, FBA, fuel, storage, ad cost, product cost, "
+                "inbound shipping, net, margin — plus totals and methodology caveats. "
+                "Use this for ANY profit / margin / P&L question — do not chain "
+                "get_orders + get_order_items + get_cogs manually. "
+                "Note: returns processing fees, aged-inventory surcharge, and "
+                "low-inventory level fee are not yet computed."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -850,6 +863,7 @@ async def _analyze_profitability(days_back: int | str = 7) -> str:
         "",
     ]
     if table_rows:
+        # Main summary table — aggregated Amz Fees column to stay readable.
         lines.append("| SKU | Units | Revenue | Amz Fees | Storage | Ads | COGS+Inbound | Net | Margin % |")
         lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for r in table_rows:
@@ -866,12 +880,44 @@ async def _analyze_profitability(days_back: int | str = 7) -> str:
             f"**${totals['net']:.2f}** | **{total_margin:.1f}%** |"
         )
         lines.append("")
+
+        # Per-SKU fee breakdown — referral / FBA / fuel split + COGS components
+        lines.append("**Per-SKU fee breakdown** (Amazon fees split + COGS components):")
+        lines.append("")
+        lines.append("| SKU | ASIN | Avg price | Referral | FBA | Fuel surcharge | Product cost | Inbound shipping |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        for r in table_rows:
+            lines.append(
+                f"| {r['sku']} | {r['asin'] or '—'} | ${r['avg_price']:.2f} | "
+                f"${r['referral_fee']:.2f} | ${r['fba_fee']:.2f} | ${r['fuel_surcharge']:.2f} | "
+                f"${r['product_cost']:.2f} | ${r['inbound_shipping']:.2f} |"
+            )
+        lines.append(
+            f"| **Totals** | — | — | **${totals['referral_fee']:.2f}** | "
+            f"**${totals['fba_fee']:.2f}** | **${totals['fuel_surcharge']:.2f}** | "
+            f"**${totals['product_cost']:.2f}** | **${totals['inbound_shipping']:.2f}** |"
+        )
+        lines.append("")
         lines.append(
             f"Net profit ${totals['net']:.2f} on ${totals['revenue']:.2f} revenue across "
-            f"{totals['units']} units ({total_margin:.1f}% margin). Per FBA Profitability "
-            "Calculator PDF: revenue minus referral + FBA + fuel surcharge (from Product "
-            "Fees API), allocated storage (FBA report), allocated ads (Aurora), COGS + inbound."
+            f"{totals['units']} units ({total_margin:.1f}% margin)."
         )
+        lines.append("")
+        lines.append(
+            "Formula: Revenue − Referral − FBA − Fuel (Product Fees API per ASIN at avg price) "
+            "− Storage (FBA Storage Charges report, per-ASIN monthly × months in window) "
+            "− Ads (Aurora total spend pro-rated to window, uniform per unit) "
+            "− Product cost − Inbound shipping (your COGS CSV)."
+        )
+        ad_window = data.get("ad_window") or {}
+        if ad_window.get("total_window"):
+            lines.append(
+                f"Ad allocation: ${ad_window['total_window']:.2f} spread across "
+                f"{int(totals['units'])} units = ${ad_window['total_window'] / max(int(totals['units']), 1):.3f}/unit "
+                f"(from {ad_window.get('campaign_count', 0)} Aurora campaigns)."
+            )
+        if data.get("storage_cached_at"):
+            lines.append(f"Storage allocation from FBA report cached at {data['storage_cached_at']}.")
     else:
         lines.append("No rows produced — likely no orders with valid item prices in the window.")
 
@@ -887,7 +933,12 @@ async def _analyze_profitability(days_back: int | str = 7) -> str:
         caveats.append(f"- …and {len(na_price_rows) - 5} more N/A-price rows excluded.")
     for err in fetch_errors[:3]:
         caveats.append(f"- Failed to fetch items for {err}")
-    caveats.append("- Amazon fees and ad spend not included (simple mode).")
+    for err in (data.get("fee_errors") or [])[:3]:
+        caveats.append(f"- Fees API failed for {err}")
+    for w in data.get("warnings") or []:
+        caveats.append(f"- {w}")
+    for c in data.get("caveats") or []:
+        caveats.append(f"- {c}")
     lines.append("")
     lines.append("Caveats:")
     lines.extend(caveats)
