@@ -13,7 +13,7 @@ import hmac
 import io
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlencode, urlparse
 
 import httpx
@@ -369,6 +369,134 @@ async def get_order(order_id: str) -> dict:
 async def get_order_items(order_id: str) -> dict:
     """Get line items for an order."""
     return await _sp_request("GET", f"/orders/v0/orders/{order_id}/orderItems")
+
+
+# ── Product Fees API (v0) ────────────────────────────────────────────────────
+
+
+async def get_fees_estimate(
+    asin: str,
+    price: float,
+    *,
+    is_fba: bool = True,
+    marketplace: str | None = None,
+    currency: str = "USD",
+) -> dict:
+    """Estimate Amazon fees Amazon would charge if this ASIN sold at `price`.
+    Returns {referral, fba, fuel_surcharge, total, breakdown:[...]} where each
+    field is in `currency`. Caller multiplies by units to get the per-SKU
+    fee total over a window.
+
+    Per the PDF: referral, FBA fulfilment fee, and 3.5%-of-FBA fuel surcharge
+    are all returned by Amazon as line items here, so we don't need to
+    maintain a category percentages table or size-tier formulas ourselves.
+    """
+    user = require_user()
+    marketplace_id = resolve_marketplace(user, marketplace, multiple=False)
+    body = {
+        "FeesEstimateRequest": {
+            "MarketplaceId": marketplace_id,
+            "IsAmazonFulfilled": bool(is_fba),
+            "PriceToEstimateFees": {
+                "ListingPrice": {"Amount": round(price, 2), "CurrencyCode": currency},
+            },
+            "Identifier": f"est-{asin}",
+        }
+    }
+    resp = await _sp_request("POST", f"/products/fees/v0/items/{asin}/feesEstimate", body=body)
+    payload = resp.get("payload") or {}
+    result = payload.get("FeesEstimateResult") or {}
+    estimate = (result.get("FeesEstimate") or {})
+    detail_list = (estimate.get("FeeDetailList") or [])
+    total = (estimate.get("TotalFeesEstimate") or {}).get("Amount") or 0
+
+    out = {
+        "referral": 0.0,
+        "fba": 0.0,
+        "fuel_surcharge": 0.0,
+        "variable_closing": 0.0,
+        "total": float(total),
+        "breakdown": [],
+        "status": (result.get("Status") or "").lower(),
+        "error": result.get("Error"),
+    }
+    for d in detail_list:
+        ftype = (d.get("FeeType") or "").lower()
+        amount = float(((d.get("FinalFee") or d.get("FeeAmount") or {}).get("Amount")) or 0)
+        out["breakdown"].append({"type": d.get("FeeType"), "amount": amount})
+        if "referralfee" in ftype:
+            out["referral"] += amount
+        elif "fbafees" in ftype or "fulfillmentfees" in ftype:
+            out["fba"] += amount
+        elif "fuelsurcharge" in ftype:
+            out["fuel_surcharge"] += amount
+        elif "variableclosingfee" in ftype:
+            out["variable_closing"] += amount
+    # If Amazon didn't break out a fuel surcharge separately (some categories
+    # bundle it into FBA), derive it per the PDF formula so the breakdown is
+    # always populated.
+    if out["fba"] > 0 and out["fuel_surcharge"] == 0:
+        out["fuel_surcharge"] = round(out["fba"] * 0.035, 4)
+        # Don't double-count: leave fba as-is. The "total" Amazon returned
+        # is authoritative; fuel_surcharge here is the explanatory split.
+    return out
+
+
+# ── FBA Storage Fees report (per-SKU monthly storage) ───────────────────────
+
+
+async def fetch_storage_fees_per_sku(months_back: int = 2) -> tuple[dict, list[str]]:
+    """Pull GET_FBA_STORAGE_FEE_CHARGES_DATA for the last `months_back` months
+    and return ({asin: avg_monthly_fee}, months_covered).
+
+    The report is keyed by **ASIN** (also has fnsku + product_name; there is
+    no seller_sku column). One ASIN can appear in multiple rows for the same
+    month — one per fulfillment center / FNSKU pair — so we first sum
+    estimated_monthly_storage_fee within each (asin, month), then average
+    across months.
+
+    The profitability calc joins by ASIN (which we already track on every
+    order item). Caller is responsible for caching — the report takes
+    30–120 s to generate."""
+    now = datetime.now(timezone.utc)
+    start = (now.replace(day=1) - timedelta(days=months_back * 31)).replace(day=1)
+    end = now
+    create_resp = await create_report(
+        "GET_FBA_STORAGE_FEE_CHARGES_DATA",
+        start_date=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        end_date=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        single_marketplace=True,
+    )
+    report_id = create_resp.get("reportId")
+    if not report_id:
+        raise RuntimeError(f"Storage report create returned no id: {create_resp}")
+    text = await download_report_raw(report_id, max_polls=24, poll_interval=10)
+
+    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+    # (asin, month) -> summed fee
+    by_asin_month: dict[tuple[str, str], float] = {}
+    months: set[str] = set()
+    for row in reader:
+        asin = (row.get("asin") or "").strip()
+        if not asin:
+            continue
+        try:
+            fee = float(row.get("estimated_monthly_storage_fee") or 0)
+        except (TypeError, ValueError):
+            fee = 0.0
+        month = (row.get("month_of_charge") or "").strip()
+        if not month:
+            continue
+        months.add(month)
+        key = (asin, month)
+        by_asin_month[key] = by_asin_month.get(key, 0.0) + fee
+
+    # Now average across months per ASIN
+    by_asin: dict[str, list[float]] = {}
+    for (asin, _month), fee in by_asin_month.items():
+        by_asin.setdefault(asin, []).append(fee)
+    per_asin_avg = {asin: round(sum(v) / len(v), 4) for asin, v in by_asin.items() if v}
+    return per_asin_avg, sorted(months)
 
 
 # ── FBA Inventory API (v1) ───────────────────────────────────────────────────

@@ -410,7 +410,7 @@ async def campaigns_performance(user: dict = Depends(protect)):
 
 
 @app.get("/profitability")
-async def profitability(days_back: int = 30, user: dict = Depends(protect)):
+async def profitability(days_back: int = 7, user: dict = Depends(protect)):
     """Per-SKU profitability for the requested window. Walks SP-API
     NextToken so the FE sees the whole window."""
     return await compute_profitability_data(days_back=days_back, paginate=True)

@@ -60,6 +60,10 @@ def _forecast_settings():
     return _db().forecastSettings
 
 
+def _storage_cache():
+    return _db().storageFeeCache
+
+
 def _user_oid() -> ObjectId:
     user = require_user()
     return ObjectId(str(user["_id"]))
@@ -83,6 +87,7 @@ async def init_db():
         [("userId", 1), ("sku", 1)], unique=True
     )
     await _forecast_settings().create_index([("userId", 1)], unique=True)
+    await _storage_cache().create_index([("userId", 1)], unique=True)
 
 
 # ── Conversations ────────────────────────────────────────────────────────
@@ -258,6 +263,47 @@ async def get_cogs(skus: list[str] | None = None) -> list[dict]:
         }
         for r in rows
     ]
+
+
+# ── Storage fee cache (24h TTL for FBA storage report) ────────────────────
+
+
+async def get_storage_cache(max_age_hours: int = 24) -> dict | None:
+    """Return cached per-SKU monthly storage fee map or None if stale/missing."""
+    user_id = _user_oid()
+    doc = await _storage_cache().find_one({"userId": user_id})
+    if not doc:
+        return None
+    updated = doc.get("updatedAt")
+    if not updated:
+        return None
+    # Mongo returns naive UTC datetimes — make tz-aware so subtraction works.
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
+    if age_hours > max_age_hours:
+        return None
+    return {
+        "per_sku_monthly": doc.get("perSkuMonthly", {}),
+        "months_covered": doc.get("monthsCovered", []),
+        "updated_at": updated.isoformat(),
+    }
+
+
+async def put_storage_cache(per_sku_monthly: dict, months_covered: list[str]) -> None:
+    user_id = _user_oid()
+    await _storage_cache().update_one(
+        {"userId": user_id},
+        {
+            "$set": {
+                "perSkuMonthly": per_sku_monthly,
+                "monthsCovered": months_covered,
+                "updatedAt": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {"userId": user_id},
+        },
+        upsert=True,
+    )
 
 
 # ── Forecasting: salesDaily / inventorySnapshot / forecastCache ───────────

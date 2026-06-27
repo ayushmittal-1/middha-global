@@ -113,6 +113,53 @@ async def search_campaigns(query: str) -> str:
     return f"Found {len(matches)} campaign(s) matching '{query}':\n" + _build_summary(matches)
 
 
+async def get_ad_spend_for_window(window_days: int) -> dict:
+    """Total Aurora ad spend pro-rated to `window_days`. Returns
+    {total_window, total_lifetime, daily_rate, campaign_count, window_days}.
+    Aurora caches campaigns with cumulative spend over their reporting window;
+    we extract the window from metricsStartDate→metricsEndDate to derive a
+    daily rate, then scale to the profitability window. Per-SKU attribution
+    isn't available in the cached doc, so callers should allocate uniformly
+    against units sold in the same window."""
+    from datetime import datetime as _dt
+
+    await _ensure_loaded()
+    campaigns = _user_campaigns[_user_key()]
+    if not campaigns:
+        return {"total_window": 0.0, "total_lifetime": 0.0, "daily_rate": 0.0,
+                "campaign_count": 0, "window_days": window_days,
+                "metrics_days": 0}
+
+    total_lifetime = 0.0
+    metric_spans: list[int] = []
+    for c in campaigns:
+        spend = float((c.get("spend") or {}).get("amount") or 0)
+        total_lifetime += spend
+        start = c.get("metricsStartDate")
+        end = c.get("metricsEndDate")
+        try:
+            if isinstance(start, str):
+                start = _dt.fromisoformat(start.replace("Z", "+00:00"))
+            if isinstance(end, str):
+                end = _dt.fromisoformat(end.replace("Z", "+00:00"))
+            if start and end:
+                days = max(1, (end - start).days)
+                metric_spans.append(days)
+        except Exception:
+            pass
+
+    metrics_days = max(metric_spans) if metric_spans else 30
+    daily_rate = total_lifetime / metrics_days if metrics_days else 0.0
+    return {
+        "total_window": round(daily_rate * window_days, 2),
+        "total_lifetime": round(total_lifetime, 2),
+        "daily_rate": round(daily_rate, 4),
+        "campaign_count": len(campaigns),
+        "window_days": window_days,
+        "metrics_days": metrics_days,
+    }
+
+
 async def analyze_performance_data(full: bool = False) -> dict:
     """Structured campaign performance: overview, top/bottom performers,
     recommendations. When full=True, also includes every campaign with its

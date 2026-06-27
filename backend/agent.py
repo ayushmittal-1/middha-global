@@ -571,12 +571,25 @@ async def _get_cogs(skus=None) -> str:
 
 
 async def compute_profitability_data(days_back: int = 7, paginate: bool = False) -> dict:
-    """Structured per-SKU profitability for the FE table. Returns:
-      {orders_count, skus_count, rows, totals, missing_cogs, na_price_rows,
-       fetch_errors, error?}
-    When paginate=True, walks SP-API NextToken so the full window lands in
-    the result — the FE wants this. The markdown LLM tool calls with
-    paginate=False to keep the response snappy."""
+    """Per-SKU profitability following the FBA Profitability Calculator PDF:
+
+      Net = Selling Price
+            − Referral Fee
+            − FBA Fulfilment Fee
+            − Fuel Surcharge (3.5% of FBA)
+            − Allocated Storage Fee
+            − Product Cost (COGS)
+            − Shipping Cost to Amazon (inbound)
+            − Advertising Cost (allocated)
+
+    Amazon fees (referral / FBA / fuel) come from Product Fees API per ASIN.
+    Storage comes from GET_FBA_STORAGE_FEE_CHARGES_DATA (cached 24h — first
+    cold call adds 30–120 s). Ads come from Aurora campaigns pro-rated to
+    the window and allocated uniformly per unit. Returns / aged-inventory /
+    low-inventory fees are *not* computed here and surface in `caveats`."""
+    from campaigns import get_ad_spend_for_window
+    from database import get_storage_cache, put_storage_cache
+
     created_after = (
         datetime.now(timezone.utc) - timedelta(days=days_back)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -592,19 +605,43 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
             "orders_count": 0, "skus_count": 0, "rows": [], "totals": None,
             "missing_cogs": [], "na_price_rows": [], "fetch_errors": [],
             "days_back": days_back, "created_after": created_after,
+            "caveats": [], "warnings": [],
         }
 
     order_ids = [o.get("AmazonOrderId") for o in orders if o.get("AmazonOrderId")]
 
-    async def fetch_items(oid: str):
-        try:
-            return oid, await amazon_sp.get_order_items(oid)
-        except Exception as e:
-            return oid, {"_error": str(e)}
+    # SP-API GetOrderItems is 0.5 req/s sustained — pace sequentially with
+    # exponential backoff on 429 so a busy quota doesn't drop every order.
+    items_results: list[tuple[str, dict]] = []
+    pending = list(order_ids)
+    attempt = 1
+    while pending and attempt <= 4:
+        base_sleep = 2.1 * attempt
+        failed: list[str] = []
+        for oid in pending:
+            try:
+                resp = await amazon_sp.get_order_items(oid)
+                items_results.append((oid, resp))
+            except Exception as e:
+                msg = str(e)
+                if "429" in msg or "QuotaExceeded" in msg:
+                    failed.append(oid)
+                    await asyncio.sleep(base_sleep * 2)
+                else:
+                    items_results.append((oid, {"_error": msg}))
+                    continue
+            await asyncio.sleep(base_sleep)
+        pending = failed
+        attempt += 1
+        if pending:
+            await asyncio.sleep(20)
+    # Anything still pending after the retry loop = permanent failure
+    for oid in pending:
+        items_results.append((oid, {"_error": "rate limited after 4 retries"}))
 
-    items_results = await asyncio.gather(*[fetch_items(oid) for oid in order_ids])
-
-    sku_data: dict[str, dict] = defaultdict(lambda: {"units": 0, "revenue": 0.0})
+    sku_data: dict[str, dict] = defaultdict(
+        lambda: {"units": 0, "revenue": 0.0, "asin": None}
+    )
     na_price_rows: list[dict] = []
     fetch_errors: list[str] = []
 
@@ -628,6 +665,8 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
                 continue
             sku_data[sku]["units"] += qty
             sku_data[sku]["revenue"] += amount
+            if not sku_data[sku]["asin"] and it.get("ASIN"):
+                sku_data[sku]["asin"] = it["ASIN"]
 
     skus = sorted(sku_data.keys())
     cogs_map: dict = {}
@@ -638,40 +677,134 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
         except Exception as e:
             return {"error": f"Error reading COGS: {e}"}
 
+    # ── Storage allocation (cached 24h) — keyed by ASIN, not SKU ──────────
+    warnings: list[str] = []
+    storage_per_asin_monthly: dict = {}
+    storage_cached_at: str | None = None
+    storage_meta = await get_storage_cache(max_age_hours=24)
+    if storage_meta:
+        storage_per_asin_monthly = storage_meta.get("per_sku_monthly") or {}
+        storage_cached_at = storage_meta.get("updated_at")
+    else:
+        try:
+            storage_per_asin_monthly, months = await amazon_sp.fetch_storage_fees_per_sku(months_back=2)
+            await put_storage_cache(storage_per_asin_monthly, months)
+            storage_cached_at = datetime.now(timezone.utc).isoformat()
+        except Exception as e:
+            warnings.append(f"Storage report fetch failed ({e}); storage fees set to 0.")
+
+    # ── Ad allocation (uniform per unit) ──────────────────────────────────
+    ad_window = {"total_window": 0.0, "campaign_count": 0}
+    try:
+        ad_window = await get_ad_spend_for_window(window_days=days_back)
+    except Exception as e:
+        warnings.append(f"Ad spend fetch failed ({e}); ad cost set to 0.")
+    total_units_window = sum(d["units"] for d in sku_data.values())
+    ad_cost_per_unit = (
+        ad_window["total_window"] / total_units_window if total_units_window > 0 else 0.0
+    )
+
+    # ── Per-SKU enrichment: Fees API → referral, FBA, fuel ────────────────
+    months_in_window = max(days_back / 30.0, 0.01)
     rows: list[dict] = []
-    totals = {"units": 0, "revenue": 0.0, "cogs": 0.0, "net": 0.0, "margin": 0.0}
+    totals = defaultdict(float)
     missing_cogs: list[dict] = []
+    fee_errors: list[str] = []
 
     for sku in skus:
-        units = sku_data[sku]["units"]
-        revenue = sku_data[sku]["revenue"]
+        d = sku_data[sku]
+        units = d["units"]
+        revenue = round(d["revenue"], 2)
+        avg_price = revenue / units if units else 0.0
+        asin = d["asin"]
+
+        # Amazon fees per unit at the SKU's average selling price
+        referral = fba = fuel = 0.0
+        if asin and avg_price > 0:
+            try:
+                est = await amazon_sp.get_fees_estimate(asin, avg_price, is_fba=True)
+                referral = est["referral"]
+                fba = est["fba"]
+                fuel = est["fuel_surcharge"]
+            except Exception as e:
+                fee_errors.append(f"{sku} ({asin}): {str(e)[:120]}")
+        elif not asin:
+            fee_errors.append(f"{sku}: no ASIN found in order items")
+
+        referral_total = round(referral * units, 2)
+        fba_total = round(fba * units, 2)
+        fuel_total = round(fuel * units, 2)
+        amazon_fees = round(referral_total + fba_total + fuel_total, 2)
+
+        # Storage allocation: monthly per-ASIN × months in window
+        storage = round(
+            float(storage_per_asin_monthly.get(asin or "", 0)) * months_in_window, 2,
+        )
+
+        # Ads allocation: uniform per-unit
+        ad_cost = round(ad_cost_per_unit * units, 2)
+
+        # COGS components (only when uploaded)
         cogs_row = cogs_map.get(sku)
-        if not cogs_row:
-            missing_cogs.append({"sku": sku, "units": units, "revenue": round(revenue, 2)})
-            continue
-        unit_total = cogs_row["unit_cost"] + cogs_row["inbound_shipping_per_unit"]
-        cogs_inbound = unit_total * units
-        net = revenue - cogs_inbound
-        margin = (net / revenue * 100) if revenue > 0 else 0.0
-        rows.append({
+        if cogs_row:
+            product_cost = round(cogs_row["unit_cost"] * units, 2)
+            inbound = round(cogs_row["inbound_shipping_per_unit"] * units, 2)
+        else:
+            product_cost = 0.0
+            inbound = 0.0
+            missing_cogs.append({"sku": sku, "units": units, "revenue": revenue})
+
+        net = round(
+            revenue - amazon_fees - storage - product_cost - inbound - ad_cost, 2,
+        )
+        margin = round((net / revenue * 100), 1) if revenue > 0 else 0.0
+
+        row = {
             "sku": sku,
+            "asin": asin,
             "units": units,
-            "revenue": round(revenue, 2),
-            "cogs": round(cogs_inbound, 2),
-            "net": round(net, 2),
-            "margin": round(margin, 1),
-        })
+            "avg_price": round(avg_price, 2),
+            "revenue": revenue,
+            "referral_fee": referral_total,
+            "fba_fee": fba_total,
+            "fuel_surcharge": fuel_total,
+            "amazon_fees": amazon_fees,
+            "storage_fee": storage,
+            "ad_cost": ad_cost,
+            "product_cost": product_cost,
+            "inbound_shipping": inbound,
+            "cogs_total": round(product_cost + inbound, 2),
+            "net": net,
+            "margin": margin,
+            "cogs_uploaded": cogs_row is not None,
+        }
+        rows.append(row)
+
         totals["units"] += units
         totals["revenue"] += revenue
-        totals["cogs"] += cogs_inbound
+        totals["referral_fee"] += referral_total
+        totals["fba_fee"] += fba_total
+        totals["fuel_surcharge"] += fuel_total
+        totals["amazon_fees"] += amazon_fees
+        totals["storage_fee"] += storage
+        totals["ad_cost"] += ad_cost
+        totals["product_cost"] += product_cost
+        totals["inbound_shipping"] += inbound
+        totals["cogs_total"] += product_cost + inbound
         totals["net"] += net
 
-    totals["margin"] = round(
-        (totals["net"] / totals["revenue"] * 100) if totals["revenue"] > 0 else 0.0, 1,
-    )
-    totals["revenue"] = round(totals["revenue"], 2)
-    totals["cogs"] = round(totals["cogs"], 2)
-    totals["net"] = round(totals["net"], 2)
+    rev = totals["revenue"]
+    totals_out = {k: round(v, 2) for k, v in totals.items()}
+    totals_out["units"] = int(totals["units"])
+    totals_out["margin"] = round((totals["net"] / rev * 100), 1) if rev > 0 else 0.0
+
+    caveats = [
+        "Returns processing fees (Referral × 20% on returned orders) are not computed.",
+        "Aged-inventory and low-inventory surcharges are not computed.",
+        "Ads are allocated uniformly per unit — per-SKU PPC attribution requires productAd joins.",
+    ]
+    if not storage_per_asin_monthly:
+        caveats.append("Storage fees: report unavailable for this window; values are 0.")
 
     return {
         "days_back": days_back,
@@ -679,10 +812,15 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
         "orders_count": len(orders),
         "skus_count": len(skus),
         "rows": rows,
-        "totals": totals,
+        "totals": totals_out,
         "missing_cogs": missing_cogs,
         "na_price_rows": na_price_rows,
         "fetch_errors": fetch_errors,
+        "fee_errors": fee_errors,
+        "ad_window": ad_window,
+        "storage_cached_at": storage_cached_at,
+        "caveats": caveats,
+        "warnings": warnings,
     }
 
 
@@ -712,24 +850,30 @@ async def _analyze_profitability(days_back: int | str = 7) -> str:
         "",
     ]
     if table_rows:
-        lines.append("| SKU | Units | Revenue | COGS+Inbound | Net | Margin % |")
-        lines.append("| --- | --- | --- | --- | --- | --- |")
+        lines.append("| SKU | Units | Revenue | Amz Fees | Storage | Ads | COGS+Inbound | Net | Margin % |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for r in table_rows:
             lines.append(
                 f"| {r['sku']} | {r['units']} | ${r['revenue']:.2f} | "
-                f"${r['cogs']:.2f} | ${r['net']:.2f} | {r['margin']:.1f}% |"
+                f"${r['amazon_fees']:.2f} | ${r['storage_fee']:.2f} | "
+                f"${r['ad_cost']:.2f} | ${r['cogs_total']:.2f} | "
+                f"${r['net']:.2f} | {r['margin']:.1f}% |"
             )
         lines.append(
             f"| **Totals** | **{totals['units']}** | **${totals['revenue']:.2f}** | "
-            f"**${totals['cogs']:.2f}** | **${totals['net']:.2f}** | **{total_margin:.1f}%** |"
+            f"**${totals['amazon_fees']:.2f}** | **${totals['storage_fee']:.2f}** | "
+            f"**${totals['ad_cost']:.2f}** | **${totals['cogs_total']:.2f}** | "
+            f"**${totals['net']:.2f}** | **{total_margin:.1f}%** |"
         )
         lines.append("")
         lines.append(
             f"Net profit ${totals['net']:.2f} on ${totals['revenue']:.2f} revenue across "
-            f"{totals['units']} units ({total_margin:.1f}% margin)."
+            f"{totals['units']} units ({total_margin:.1f}% margin). Per FBA Profitability "
+            "Calculator PDF: revenue minus referral + FBA + fuel surcharge (from Product "
+            "Fees API), allocated storage (FBA report), allocated ads (Aurora), COGS + inbound."
         )
     else:
-        lines.append("No rows in the table — every active SKU was missing COGS.")
+        lines.append("No rows produced — likely no orders with valid item prices in the window.")
 
     caveats = []
     for m in missing_cogs:

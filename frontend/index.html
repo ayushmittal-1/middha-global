@@ -1006,7 +1006,7 @@
         <h2>Profitability</h2>
         <span id="profit-stamp"></span>
         <label>Days back
-          <input id="profit-days" type="number" min="1" max="365" value="30">
+          <input id="profit-days" type="number" min="1" max="365" value="7">
         </label>
         <button id="profit-refresh">Apply</button>
       </div>
@@ -1019,7 +1019,10 @@
               <th>SKU</th>
               <th class="num">Units</th>
               <th class="num">Revenue</th>
-              <th class="num">COGS + Inbound</th>
+              <th class="num" title="Referral + FBA + Fuel surcharge (Product Fees API)">Amz Fees</th>
+              <th class="num" title="Allocated monthly storage × months in window">Storage</th>
+              <th class="num" title="Ad spend pro-rated to window, allocated per unit">Ads</th>
+              <th class="num" title="Product cost + inbound shipping (from your CSV)">COGS + Inbound</th>
               <th class="num">Net</th>
               <th class="num">Margin %</th>
             </tr>
@@ -1816,13 +1819,13 @@
 
     // ── Profitability tab ───────────────────────────────
     async function loadProfitability() {
-      profitBodyEl.innerHTML = '<tr><td colspan="6" style="padding:20px;color:#888;">Loading… (this fetches every order in the window)</td></tr>';
+      profitBodyEl.innerHTML = '<tr><td colspan="9" style="padding:20px;color:#888;">Loading… (first call may take 1–2 min: orders + items + fees per SKU + storage report)</td></tr>';
       profitFootEl.innerHTML = '';
       profitKpisEl.innerHTML = '';
       profitCaveatsEl.classList.remove('visible');
       profitEmptyEl.style.display = 'none';
       profitRefreshBtn.disabled = true;
-      const days = Math.max(1, Number(profitDaysEl.value) || 30);
+      const days = Math.max(1, Number(profitDaysEl.value) || 7);
       try {
         const r = await fetch(`/profitability?days_back=${days}`, { headers: authHeaders() });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -1836,8 +1839,11 @@
           profitKpisEl.innerHTML = [
             kpiCard('Units sold', t.units.toLocaleString()),
             kpiCard('Revenue', `$${t.revenue.toLocaleString()}`),
-            kpiCard('COGS + Inbound', `$${t.cogs.toLocaleString()}`),
-            kpiCard('Net profit', `$${t.net.toLocaleString()}`),
+            kpiCard('Amz fees', `$${(t.amazon_fees || 0).toLocaleString()}`),
+            kpiCard('Storage', `$${(t.storage_fee || 0).toLocaleString()}`),
+            kpiCard('Ad spend', `$${(t.ad_cost || 0).toLocaleString()}`),
+            kpiCard('COGS + Inbound', `$${(t.cogs_total || 0).toLocaleString()}`),
+            kpiCard('Net profit', `$${(t.net || 0).toLocaleString()}`),
             kpiCard('Margin', `${t.margin}%`),
           ].join('');
         }
@@ -1847,45 +1853,70 @@
           profitBodyEl.innerHTML = '';
           profitEmptyEl.style.display = 'block';
         } else {
-          profitBodyEl.innerHTML = rows.map(r => `
-            <tr>
-              <td><strong>${escapeHtml(r.sku)}</strong></td>
-              <td class="num">${r.units}</td>
-              <td class="num">$${r.revenue.toLocaleString()}</td>
-              <td class="num">$${r.cogs.toLocaleString()}</td>
-              <td class="num ${marginClass(r.margin)}">$${r.net.toLocaleString()}</td>
-              <td class="num ${marginClass(r.margin)}">${r.margin}%</td>
-            </tr>
-          `).join('');
+          profitBodyEl.innerHTML = rows.map(r => {
+            const skuLabel = r.cogs_uploaded
+              ? `<strong>${escapeHtml(r.sku)}</strong>`
+              : `<strong>${escapeHtml(r.sku)}</strong> <span title="No COGS uploaded" style="color:#b35200;">⚠</span>`;
+            return `
+              <tr title="ASIN ${escapeHtml(r.asin || '—')} · avg price $${(r.avg_price || 0).toLocaleString()} · referral $${(r.referral_fee || 0).toLocaleString()} + FBA $${(r.fba_fee || 0).toLocaleString()} + fuel $${(r.fuel_surcharge || 0).toLocaleString()}">
+                <td>${skuLabel}</td>
+                <td class="num">${r.units}</td>
+                <td class="num">$${(r.revenue || 0).toLocaleString()}</td>
+                <td class="num">$${(r.amazon_fees || 0).toLocaleString()}</td>
+                <td class="num">$${(r.storage_fee || 0).toLocaleString()}</td>
+                <td class="num">$${(r.ad_cost || 0).toLocaleString()}</td>
+                <td class="num">$${(r.cogs_total || 0).toLocaleString()}</td>
+                <td class="num ${marginClass(r.margin)}">$${(r.net || 0).toLocaleString()}</td>
+                <td class="num ${marginClass(r.margin)}">${r.margin}%</td>
+              </tr>`;
+          }).join('');
           if (t) {
             profitFootEl.innerHTML = `
               <tr>
                 <td>Totals</td>
                 <td class="num">${t.units}</td>
                 <td class="num">$${t.revenue.toLocaleString()}</td>
-                <td class="num">$${t.cogs.toLocaleString()}</td>
-                <td class="num ${marginClass(t.margin)}">$${t.net.toLocaleString()}</td>
+                <td class="num">$${(t.amazon_fees || 0).toLocaleString()}</td>
+                <td class="num">$${(t.storage_fee || 0).toLocaleString()}</td>
+                <td class="num">$${(t.ad_cost || 0).toLocaleString()}</td>
+                <td class="num">$${(t.cogs_total || 0).toLocaleString()}</td>
+                <td class="num ${marginClass(t.margin)}">$${(t.net || 0).toLocaleString()}</td>
                 <td class="num ${marginClass(t.margin)}">${t.margin}%</td>
               </tr>`;
           }
         }
 
         const caveats = [];
+        for (const w of data.warnings || []) {
+          caveats.push(`<span style="color:#b71c1c;">${escapeHtml(w)}</span>`);
+        }
         for (const m of data.missing_cogs || []) {
-          caveats.push(`COGS missing for <code>${escapeHtml(m.sku)}</code> — ${m.units} units, $${m.revenue.toLocaleString()} revenue excluded.`);
+          caveats.push(`COGS missing for <code>${escapeHtml(m.sku)}</code> (${m.units} units, $${m.revenue.toLocaleString()} revenue) — net overstated until uploaded.`);
+        }
+        if ((data.fee_errors || []).length) {
+          caveats.push(`Fees API failed for ${data.fee_errors.length} SKU(s): ${escapeHtml(data.fee_errors.slice(0, 3).join('; '))}`);
         }
         if ((data.na_price_rows || []).length) {
-          caveats.push(`${data.na_price_rows.length} order item(s) had price N/A and were excluded.`);
+          caveats.push(`${data.na_price_rows.length} order item(s) had price N/A and were excluded from revenue.`);
         }
         if ((data.fetch_errors || []).length) {
           caveats.push(`${data.fetch_errors.length} order(s) failed to fetch items.`);
         }
+        if (data.ad_window && data.ad_window.campaign_count) {
+          caveats.push(`Ad allocation: $${(data.ad_window.total_window || 0).toLocaleString()} from ${data.ad_window.campaign_count} campaigns over ${days}d, spread uniformly across ${t ? t.units : 0} units.`);
+        }
+        if (data.storage_cached_at) {
+          caveats.push(`Storage allocation from FBA report, cached ${new Date(data.storage_cached_at).toLocaleString()}.`);
+        }
+        for (const c of data.caveats || []) {
+          caveats.push(escapeHtml(c));
+        }
         if (caveats.length) {
-          profitCaveatsEl.innerHTML = `<strong>Caveats</strong><ul>${caveats.map(c => `<li>${c}</li>`).join('')}</ul>`;
+          profitCaveatsEl.innerHTML = `<strong>Caveats & methodology</strong><ul>${caveats.map(c => `<li>${c}</li>`).join('')}</ul>`;
           profitCaveatsEl.classList.add('visible');
         }
       } catch (err) {
-        profitBodyEl.innerHTML = `<tr><td colspan="6" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
+        profitBodyEl.innerHTML = `<tr><td colspan="9" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
       } finally {
         profitRefreshBtn.disabled = false;
       }
