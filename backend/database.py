@@ -375,18 +375,36 @@ async def upsert_inventory_snapshot(user_id: ObjectId, rows: list[dict]) -> int:
 
 
 async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
-    """Most recent snapshot per SKU. Returns { sku: snapshot_doc }."""
-    pipeline = [
-        {"$match": {"userId": user_id}},
-        {"$sort": {"date": -1}},
-        {"$group": {"_id": "$sku", "doc": {"$first": "$$ROOT"}}},
-    ]
+    """Latest on-hand + inbound per SKU, keyed by sku.
+
+    Sources from Aurora's `products.inventory` subdocument — Aurora's sync
+    is the source of truth. Our own `inventorySnapshot` ingest currently
+    writes zeros (fixed elsewhere), so we bypass it here.
+
+    Shape matches the historic inventorySnapshot rows so `compute_reorder`
+    doesn't need to change:
+      {sku, date, fulfillable, inbound_shipped, inbound_working,
+       reserved, unfulfillable}.
+    """
+    cursor = _db().products.find(
+        {"sellerId": user_id},
+        {"sku": 1, "inventory": 1, "lastSynced": 1, "_id": 0},
+    )
     out: dict[str, dict] = {}
-    async for row in _inventory_snapshot().aggregate(pipeline):
-        doc = row["doc"]
-        doc.pop("_id", None)
-        doc.pop("userId", None)
-        out[doc["sku"]] = doc
+    async for p in cursor:
+        sku = (p.get("sku") or "").strip()
+        if not sku:
+            continue
+        inv = p.get("inventory") or {}
+        out[sku] = {
+            "sku": sku,
+            "date": p.get("lastSynced"),
+            "fulfillable": int(inv.get("fulfillableQuantity") or 0),
+            "inbound_shipped": int(inv.get("inboundShippedQuantity") or 0),
+            "inbound_working": int(inv.get("inboundWorkingQuantity") or 0),
+            "reserved": int(inv.get("reservedQuantity") or 0),
+            "unfulfillable": int(inv.get("unfulfillableQuantity") or 0),
+        }
     return out
 
 
