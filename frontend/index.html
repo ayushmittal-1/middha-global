@@ -1038,17 +1038,25 @@
       </div>
       <div id="profit-kpis"></div>
       <div id="profit-caveats"></div>
-      <div id="profit-table-wrap">
+      <div id="profit-table-wrap" style="overflow-x:auto;">
         <table class="restock profit">
           <thead>
             <tr>
               <th>SKU</th>
               <th class="num">Units</th>
+              <th class="num" title="Revenue ÷ units">Avg Price</th>
               <th class="num">Revenue</th>
-              <th class="num" title="Referral + FBA + Fuel surcharge (Product Fees API)">Amz Fees</th>
-              <th class="num" title="Allocated monthly storage × months in window">Storage</th>
+              <th class="num" title="Selling Price × category referral fee % (Product Fees API)">Referral</th>
+              <th class="num" title="FBA size-tier fulfillment fee per unit × units (Product Fees API)">FBA</th>
+              <th class="num" title="3.5% of FBA fulfillment fee">Fuel</th>
+              <th class="num" title="Amazon inbound placement fee — from Finances API (settlement-posted)">Inbound Placement</th>
+              <th class="num" title="Low Inventory Level Fee — per unit when days-of-supply below threshold (Finances API)">Low Inv</th>
+              <th class="num" title="Monthly storage cost ÷ average units stored × months in window">Storage</th>
+              <th class="num" title="Aged Inventory Surcharge on inventory 181+ days (Finances API)">Aged Inv</th>
               <th class="num" title="Ad spend pro-rated to window, allocated per unit">Ads</th>
-              <th class="num" title="Product cost + inbound shipping (from your CSV)">COGS + Inbound</th>
+              <th class="num" title="Product cost + your inbound shipping to Amazon (from your CSV)">COGS</th>
+              <th class="num" title="20% of referral fee, on returned orders (Finances API)">Return Proc</th>
+              <th class="num" title="Amazon removal / disposal fees allocated per unit (Finances API)">Removal</th>
               <th class="num">Net</th>
               <th class="num">Margin %</th>
             </tr>
@@ -1877,7 +1885,7 @@
 
     // ── Profitability tab ───────────────────────────────
     async function loadProfitability() {
-      profitBodyEl.innerHTML = '<tr><td colspan="9" style="padding:20px;color:#888;">Loading… (first call may take 1–2 min: orders + items + fees per SKU + storage report)</td></tr>';
+      profitBodyEl.innerHTML = '<tr><td colspan="17" style="padding:20px;color:#888;">Loading… (first call may take 1–2 min: orders + items + fees per SKU + storage report + finances events)</td></tr>';
       profitFootEl.innerHTML = '';
       profitKpisEl.innerHTML = '';
       profitCaveatsEl.classList.remove('visible');
@@ -1911,20 +1919,29 @@
           profitBodyEl.innerHTML = '';
           profitEmptyEl.style.display = 'block';
         } else {
+          const money = v => `$${(Number(v) || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}`;
           profitBodyEl.innerHTML = rows.map(r => {
             const skuLabel = r.cogs_uploaded
               ? `<strong>${escapeHtml(r.sku)}</strong>`
               : `<strong>${escapeHtml(r.sku)}</strong> <span title="No COGS uploaded" style="color:#b35200;">⚠</span>`;
             return `
-              <tr title="ASIN ${escapeHtml(r.asin || '—')} · avg price $${(r.avg_price || 0).toLocaleString()} · referral $${(r.referral_fee || 0).toLocaleString()} + FBA $${(r.fba_fee || 0).toLocaleString()} + fuel $${(r.fuel_surcharge || 0).toLocaleString()}">
+              <tr title="ASIN ${escapeHtml(r.asin || '—')}">
                 <td>${skuLabel}</td>
                 <td class="num">${r.units}</td>
-                <td class="num">$${(r.revenue || 0).toLocaleString()}</td>
-                <td class="num">$${(r.amazon_fees || 0).toLocaleString()}</td>
-                <td class="num">$${(r.storage_fee || 0).toLocaleString()}</td>
-                <td class="num">$${(r.ad_cost || 0).toLocaleString()}</td>
-                <td class="num">$${(r.cogs_total || 0).toLocaleString()}</td>
-                <td class="num ${marginClass(r.margin)}">$${(r.net || 0).toLocaleString()}</td>
+                <td class="num">${money(r.avg_price)}</td>
+                <td class="num">${money(r.revenue)}</td>
+                <td class="num">${money(r.referral_fee)}</td>
+                <td class="num">${money(r.fba_fee)}</td>
+                <td class="num">${money(r.fuel_surcharge)}</td>
+                <td class="num">${money(r.inbound_placement_fee)}</td>
+                <td class="num">${money(r.low_inventory_fee)}</td>
+                <td class="num">${money(r.storage_fee)}</td>
+                <td class="num">${money(r.aged_inventory_fee)}</td>
+                <td class="num">${money(r.ad_cost)}</td>
+                <td class="num">${money(r.cogs_total)}</td>
+                <td class="num">${money(r.return_processing_fee)}</td>
+                <td class="num">${money(r.removal_fee)}</td>
+                <td class="num ${marginClass(r.margin)}">${money(r.net)}</td>
                 <td class="num ${marginClass(r.margin)}">${r.margin}%</td>
               </tr>`;
           }).join('');
@@ -1933,12 +1950,20 @@
               <tr>
                 <td>Totals</td>
                 <td class="num">${t.units}</td>
-                <td class="num">$${t.revenue.toLocaleString()}</td>
-                <td class="num">$${(t.amazon_fees || 0).toLocaleString()}</td>
-                <td class="num">$${(t.storage_fee || 0).toLocaleString()}</td>
-                <td class="num">$${(t.ad_cost || 0).toLocaleString()}</td>
-                <td class="num">$${(t.cogs_total || 0).toLocaleString()}</td>
-                <td class="num ${marginClass(t.margin)}">$${(t.net || 0).toLocaleString()}</td>
+                <td class="num">—</td>
+                <td class="num">${money(t.revenue)}</td>
+                <td class="num">${money(t.referral_fee)}</td>
+                <td class="num">${money(t.fba_fee)}</td>
+                <td class="num">${money(t.fuel_surcharge)}</td>
+                <td class="num">${money(t.inbound_placement_fee)}</td>
+                <td class="num">${money(t.low_inventory_fee)}</td>
+                <td class="num">${money(t.storage_fee)}</td>
+                <td class="num">${money(t.aged_inventory_fee)}</td>
+                <td class="num">${money(t.ad_cost)}</td>
+                <td class="num">${money(t.cogs_total)}</td>
+                <td class="num">${money(t.return_processing_fee)}</td>
+                <td class="num">${money(t.removal_fee)}</td>
+                <td class="num ${marginClass(t.margin)}">${money(t.net)}</td>
                 <td class="num ${marginClass(t.margin)}">${t.margin}%</td>
               </tr>`;
           }
@@ -1974,7 +1999,7 @@
           profitCaveatsEl.classList.add('visible');
         }
       } catch (err) {
-        profitBodyEl.innerHTML = `<tr><td colspan="9" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
+        profitBodyEl.innerHTML = `<tr><td colspan="17" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
       } finally {
         profitRefreshBtn.disabled = false;
       }

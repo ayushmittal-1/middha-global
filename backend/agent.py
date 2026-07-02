@@ -717,6 +717,34 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
         ad_window["total_window"] / total_units_window if total_units_window > 0 else 0.0
     )
 
+    # ── Finances API — return processing, low inventory, inbound placement,
+    # aged inventory surcharge, removal fees. Per-SKU where Amazon
+    # attributes; otherwise the totals land in `unattributed_fees` and
+    # get spread uniformly per unit (same treatment as ads).
+    fin_by_sku: dict[str, dict] = {}
+    unattributed_fees = amazon_sp._empty_fee_bucket()
+    try:
+        fin = await amazon_sp.get_financial_events(
+            posted_after=created_after, paginate=True,
+        )
+        fin_by_sku = fin.get("by_sku") or {}
+        unattributed_fees = fin.get("unattributed") or unattributed_fees
+    except Exception as e:
+        warnings.append(
+            f"Finances API fetch failed ({e}); return / low-inv / placement "
+            "/ aged / removal fees set to 0."
+        )
+
+    # Fees Amazon posted without a SellerSKU get spread across units — same
+    # allocation model we use for ads. Removals often lack SKU attribution
+    # (aggregated adjustments), so this matters.
+    unattr_per_unit = {
+        k: (unattributed_fees.get(k, 0.0) / total_units_window
+            if total_units_window > 0 else 0.0)
+        for k in ("return_processing", "low_inventory", "inbound_placement",
+                  "aged_inventory", "removal")
+    }
+
     # ── Per-SKU enrichment: Fees API → referral, FBA, fuel ────────────────
     months_in_window = max(days_back / 30.0, 0.01)
     rows: list[dict] = []
@@ -757,6 +785,24 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
         # Ads allocation: uniform per-unit
         ad_cost = round(ad_cost_per_unit * units, 2)
 
+        # Finances API fees per SKU + share of unattributed pool
+        fin_sku = fin_by_sku.get(sku, {})
+        return_processing_fee = round(
+            (fin_sku.get("return_processing", 0.0)
+             + unattr_per_unit["return_processing"] * units), 2)
+        low_inventory_fee = round(
+            (fin_sku.get("low_inventory", 0.0)
+             + unattr_per_unit["low_inventory"] * units), 2)
+        inbound_placement_fee = round(
+            (fin_sku.get("inbound_placement", 0.0)
+             + unattr_per_unit["inbound_placement"] * units), 2)
+        aged_inventory_fee = round(
+            (fin_sku.get("aged_inventory", 0.0)
+             + unattr_per_unit["aged_inventory"] * units), 2)
+        removal_fee = round(
+            (fin_sku.get("removal", 0.0)
+             + unattr_per_unit["removal"] * units), 2)
+
         # COGS components (only when uploaded)
         cogs_row = cogs_map.get(sku)
         if cogs_row:
@@ -768,7 +814,10 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
             missing_cogs.append({"sku": sku, "units": units, "revenue": revenue})
 
         net = round(
-            revenue - amazon_fees - storage - product_cost - inbound - ad_cost, 2,
+            revenue - amazon_fees - storage - product_cost - inbound - ad_cost
+            - return_processing_fee - low_inventory_fee - inbound_placement_fee
+            - aged_inventory_fee - removal_fee,
+            2,
         )
         margin = round((net / revenue * 100), 1) if revenue > 0 else 0.0
 
@@ -787,6 +836,11 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
             "product_cost": product_cost,
             "inbound_shipping": inbound,
             "cogs_total": round(product_cost + inbound, 2),
+            "return_processing_fee": return_processing_fee,
+            "low_inventory_fee": low_inventory_fee,
+            "inbound_placement_fee": inbound_placement_fee,
+            "aged_inventory_fee": aged_inventory_fee,
+            "removal_fee": removal_fee,
             "net": net,
             "margin": margin,
             "cogs_uploaded": cogs_row is not None,
@@ -804,6 +858,11 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
         totals["product_cost"] += product_cost
         totals["inbound_shipping"] += inbound
         totals["cogs_total"] += product_cost + inbound
+        totals["return_processing_fee"] += return_processing_fee
+        totals["low_inventory_fee"] += low_inventory_fee
+        totals["inbound_placement_fee"] += inbound_placement_fee
+        totals["aged_inventory_fee"] += aged_inventory_fee
+        totals["removal_fee"] += removal_fee
         totals["net"] += net
 
     rev = totals["revenue"]
@@ -812,9 +871,11 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
     totals_out["margin"] = round((totals["net"] / rev * 100), 1) if rev > 0 else 0.0
 
     caveats = [
-        "Returns processing fees (Referral × 20% on returned orders) are not computed.",
-        "Aged-inventory and low-inventory surcharges are not computed.",
+        "Return processing, low-inventory, inbound placement, aged-inventory, "
+        "and removal fees come from the Finances API — Amazon posts these "
+        "at settlement, so very recent orders may not have them yet.",
         "Ads are allocated uniformly per unit — per-SKU PPC attribution requires productAd joins.",
+        "Fees posted without a SellerSKU (typically removals) are spread across units proportionally.",
     ]
     if not storage_per_asin_monthly:
         caveats.append("Storage fees: report unavailable for this window; values are 0.")
@@ -832,6 +893,7 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
         "fee_errors": fee_errors,
         "ad_window": ad_window,
         "storage_cached_at": storage_cached_at,
+        "unattributed_fees": {k: round(v, 2) for k, v in unattributed_fees.items()},
         "caveats": caveats,
         "warnings": warnings,
     }

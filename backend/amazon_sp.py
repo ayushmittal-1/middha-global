@@ -499,6 +499,183 @@ async def fetch_storage_fees_per_sku(months_back: int = 2) -> tuple[dict, list[s
     return per_asin_avg, sorted(months)
 
 
+# ── Finances API (v0) ────────────────────────────────────────────────────────
+
+
+_FEE_TYPE_BUCKETS = [
+    # (bucket key, list of substrings — matched case-insensitively against
+    # Finances API FeeType strings, which have drifted over time)
+    ("return_processing", ("returnfee", "refundcommission", "returnprocessingfee")),
+    ("low_inventory", ("lowinventorylevelfee", "lowinventoryfee")),
+    ("inbound_placement", ("inboundplacement", "inboundconvenience",
+                           "inboundtransportationfee")),
+    ("aged_inventory", ("agedinventorysurcharge", "longtermstoragefee")),
+]
+
+_REMOVAL_ADJUSTMENT_HINTS = ("removal", "disposal")
+
+
+def _classify_fee_type(fee_type: str) -> str | None:
+    ft = (fee_type or "").lower()
+    for bucket, hints in _FEE_TYPE_BUCKETS:
+        if any(h in ft for h in hints):
+            return bucket
+    return None
+
+
+def _empty_fee_bucket() -> dict:
+    return {
+        "return_processing": 0.0,
+        "low_inventory": 0.0,
+        "inbound_placement": 0.0,
+        "aged_inventory": 0.0,
+        "removal": 0.0,
+    }
+
+
+def _fees_from_lists(*lists) -> list[tuple[str, float]]:
+    """Flatten one or more ItemFeeList / ChargeList arrays into
+    [(fee_type, amount)] tuples. Amazon uses `FeeType` in ItemFeeList and
+    sometimes nests amount under `FeeAmount` / `ChargeAmount` / `Amount`."""
+    out: list[tuple[str, float]] = []
+    for lst in lists:
+        if not lst:
+            continue
+        for it in lst:
+            ftype = it.get("FeeType") or it.get("ChargeType") or ""
+            for amount_key in ("FeeAmount", "ChargeAmount"):
+                amt = it.get(amount_key)
+                if amt is not None:
+                    try:
+                        out.append((ftype, float(amt.get("CurrencyAmount", 0) or 0)))
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                    break
+    return out
+
+
+async def get_financial_events(
+    posted_after: str,
+    posted_before: str | None = None,
+    paginate: bool = True,
+    max_pages: int = 20,
+) -> dict:
+    """Pull ListFinancialEvents for the window and normalize into per-SKU
+    fee buckets. Returns:
+
+        {
+          "by_sku":        {sku: {return_processing, low_inventory,
+                                  inbound_placement, aged_inventory,
+                                  removal}},
+          "unattributed":  {…same keys… — fees we couldn't map to a SKU},
+          "totals":        {…same keys, summed across all…},
+          "pages":         int,
+          "posted_after":  str,
+        }
+
+    Covers the 5 fees the FBA calculator PDF lists that aren't in Product
+    Fees API: return processing, low inventory, inbound placement, aged
+    inventory surcharge, and removal fees.
+
+    Rate-limited: Finances API is 0.5 req/s sustained (2 burst). We sleep
+    2 s between pages so a busy quota doesn't drop us. `max_pages` caps
+    the walk so a very long window can't stall the request forever."""
+    from collections import defaultdict
+
+    base_params = {
+        "PostedAfter": posted_after,
+        "MaxResultsPerPage": "100",
+    }
+    if posted_before:
+        base_params["PostedBefore"] = posted_before
+
+    by_sku: dict[str, dict] = defaultdict(_empty_fee_bucket)
+    unattributed = _empty_fee_bucket()
+    pages = 0
+    page_params = dict(base_params)
+
+    while True:
+        resp = await _sp_request(
+            "GET", "/finances/v0/financialEvents", params=page_params,
+        )
+        pages += 1
+        payload = resp.get("payload") or {}
+
+        for evt in payload.get("ShipmentEventList") or []:
+            for item in evt.get("ShipmentItemList") or []:
+                sku = (item.get("SellerSKU") or "").strip()
+                for ftype, amt in _fees_from_lists(
+                    item.get("ItemFeeList"), item.get("ItemChargeList"),
+                ):
+                    bucket = _classify_fee_type(ftype)
+                    if not bucket:
+                        continue
+                    target = by_sku[sku] if sku else unattributed
+                    # Amazon fees show up as negative (charges to seller);
+                    # we want a positive cost figure.
+                    target[bucket] += abs(amt)
+
+        for evt in payload.get("RefundEventList") or []:
+            for item in (evt.get("ShipmentItemAdjustmentList")
+                         or evt.get("ShipmentItemList") or []):
+                sku = (item.get("SellerSKU") or "").strip()
+                for ftype, amt in _fees_from_lists(
+                    item.get("ItemFeeAdjustmentList") or item.get("ItemFeeList"),
+                ):
+                    bucket = _classify_fee_type(ftype)
+                    if not bucket:
+                        continue
+                    target = by_sku[sku] if sku else unattributed
+                    target[bucket] += abs(amt)
+
+        for evt in payload.get("ServiceFeeEventList") or []:
+            sku = (evt.get("SellerSKU") or "").strip()
+            for ftype, amt in _fees_from_lists(evt.get("FeeList")):
+                bucket = _classify_fee_type(ftype)
+                if not bucket:
+                    continue
+                target = by_sku[sku] if sku else unattributed
+                target[bucket] += abs(amt)
+
+        for evt in payload.get("AdjustmentEventList") or []:
+            adj_type = (evt.get("AdjustmentType") or "").lower()
+            if not any(h in adj_type for h in _REMOVAL_ADJUSTMENT_HINTS):
+                continue
+            for item in evt.get("AdjustmentItemList") or []:
+                sku = (item.get("SellerSKU") or "").strip()
+                amt_obj = item.get("PerUnitAmount") or item.get("TotalAmount") or {}
+                try:
+                    amt = float(amt_obj.get("CurrencyAmount", 0) or 0)
+                except (TypeError, ValueError, AttributeError):
+                    amt = 0.0
+                target = by_sku[sku] if sku else unattributed
+                target["removal"] += abs(amt)
+
+        next_token = payload.get("NextToken")
+        if not paginate or not next_token or pages >= max_pages:
+            break
+        # SP-API continuations: only NextToken (rest of the query is
+        # remembered by Amazon).
+        page_params = {"NextToken": next_token}
+        await asyncio.sleep(2.0)
+
+    totals = _empty_fee_bucket()
+    for bucket in by_sku.values():
+        for k in totals:
+            totals[k] += bucket[k]
+    for k in totals:
+        totals[k] = round(totals[k] + unattributed[k], 2)
+
+    return {
+        "by_sku": {sku: {k: round(v, 2) for k, v in bucket.items()}
+                   for sku, bucket in by_sku.items()},
+        "unattributed": {k: round(v, 2) for k, v in unattributed.items()},
+        "totals": totals,
+        "pages": pages,
+        "posted_after": posted_after,
+    }
+
+
 # ── FBA Inventory API (v1) ───────────────────────────────────────────────────
 
 
