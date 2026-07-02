@@ -247,6 +247,14 @@ async def upsert_cogs(rows: list[dict]) -> int:
     return written
 
 
+async def delete_cogs(sku: str) -> int:
+    """Delete a single COGS row for the current user. Returns number of
+    docs removed (0 if the SKU wasn't in the collection)."""
+    user_id = _user_oid()
+    result = await _cogs().delete_one({"userId": user_id, "sku": (sku or "").strip()})
+    return result.deleted_count
+
+
 async def get_cogs(skus: list[str] | None = None) -> list[dict]:
     user_id = _user_oid()
     query: dict = {"userId": user_id}

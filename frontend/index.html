@@ -639,6 +639,44 @@
     .status-partiallyshipped { background: #ffe9d0; color: #b35200; }
 
     /* Campaigns + Profitability tabs */
+    #cogs-view {
+      display: none;
+      flex-direction: column;
+      flex: 1;
+      overflow-y: auto;
+      background: #fafafa;
+    }
+    #cogs-view.visible { display: flex; }
+    #cogs-toolbar {
+      display: flex; align-items: center; gap: 12px;
+      padding: 16px 20px; border-bottom: 1px solid #e5e5e5;
+      background: #fff; flex-wrap: wrap;
+    }
+    #cogs-toolbar h2 { margin: 0; font-size: 18px; color: #1a1a2e; }
+    #cogs-toolbar input, #cogs-toolbar button {
+      padding: 6px 10px; font-size: 13px;
+      border: 1px solid #d0d0d0; border-radius: 4px;
+      background: #fff; color: #1a1a2e;
+    }
+    #cogs-toolbar button {
+      background: #4a6cf7; color: #fff; border-color: #4a6cf7; cursor: pointer;
+    }
+    #cogs-toolbar button:hover { background: #3a5bd6; }
+    #cogs-table-wrap { padding: 12px 20px; }
+    #cogs-body input {
+      padding: 4px 6px; font-size: 13px; border: 1px solid transparent;
+      background: transparent; text-align: right; width: 100px;
+      border-radius: 3px;
+    }
+    #cogs-body input:hover, #cogs-body input:focus {
+      border-color: #d0d0d0; background: #fff; outline: none;
+    }
+    #cogs-body .cogs-delete {
+      padding: 3px 8px; font-size: 12px;
+      background: transparent; color: #b71c1c; border: 1px solid #eee;
+      border-radius: 3px; cursor: pointer;
+    }
+    #cogs-body .cogs-delete:hover { background: #fee; border-color: #b71c1c; }
     #campaigns-view, #profit-view {
       flex: 1;
       min-height: 0;
@@ -884,6 +922,7 @@
       <button class="tab-btn" data-tab="orders">Orders</button>
       <button class="tab-btn" data-tab="campaigns">Campaigns</button>
       <button class="tab-btn" data-tab="profit">Profitability</button>
+      <button class="tab-btn" data-tab="cogs">COGS</button>
     </nav>
 
     <div id="chat-container">
@@ -1068,6 +1107,37 @@
       </div>
       <div id="profit-empty" style="display:none;">
         No profitable rows yet. Upload COGS for your active SKUs from the sidebar.
+      </div>
+    </div>
+
+    <div id="cogs-view">
+      <div id="cogs-toolbar">
+        <h2>COGS</h2>
+        <span id="cogs-stamp"></span>
+        <form id="cogs-add-form" style="display:flex; gap:6px; align-items:center; margin-left:auto;">
+          <input id="cogs-add-sku"  type="text"   placeholder="SKU"                   required style="min-width:180px;">
+          <input id="cogs-add-cost" type="number" placeholder="Unit cost"     step="0.01" min="0.01" required style="width:110px;">
+          <input id="cogs-add-ship" type="number" placeholder="Inbound ship/unit" step="0.01" min="0" style="width:130px;">
+          <button type="submit">Add / Update</button>
+        </form>
+      </div>
+      <div id="cogs-status" style="margin: 6px 20px; font-size: 13px; color:#666;"></div>
+      <div id="cogs-table-wrap">
+        <table class="restock">
+          <thead>
+            <tr>
+              <th>SKU</th>
+              <th class="num" title="Product cost per unit (from supplier)">Unit cost ($)</th>
+              <th class="num" title="Your shipping cost per unit to get inventory to Amazon">Inbound ship/unit ($)</th>
+              <th>Updated</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="cogs-body"></tbody>
+        </table>
+      </div>
+      <div id="cogs-empty" style="display:none; padding:20px; color:#888;">
+        No COGS rows yet. Add one above or upload a CSV from the sidebar.
       </div>
     </div>
   </div>
@@ -1522,6 +1592,17 @@
     const profitRefreshBtn = document.getElementById('profit-refresh');
     let profitLoaded = false;
 
+    const cogsViewEl = document.getElementById('cogs-view');
+    const cogsBodyEl = document.getElementById('cogs-body');
+    const cogsStampEl = document.getElementById('cogs-stamp');
+    const cogsStatusEl = document.getElementById('cogs-status');
+    const cogsEmptyEl = document.getElementById('cogs-empty');
+    const cogsAddForm = document.getElementById('cogs-add-form');
+    const cogsAddSkuEl = document.getElementById('cogs-add-sku');
+    const cogsAddCostEl = document.getElementById('cogs-add-cost');
+    const cogsAddShipEl = document.getElementById('cogs-add-ship');
+    let cogsLoaded = false;
+
     function setActiveTab(tab) {
       document.querySelectorAll('.tab-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
@@ -1531,12 +1612,14 @@
       const isOrders = tab === 'orders';
       const isCampaigns = tab === 'campaigns';
       const isProfit = tab === 'profit';
+      const isCogs = tab === 'cogs';
       chatContainerEl.style.display = isChat ? 'flex' : 'none';
       inputAreaEl.style.display = isChat ? 'flex' : 'none';
       restockViewEl.classList.toggle('visible', isRestock);
       ordersViewEl.classList.toggle('visible', isOrders);
       campaignsViewEl.classList.toggle('visible', isCampaigns);
       profitViewEl.classList.toggle('visible', isProfit);
+      cogsViewEl.classList.toggle('visible', isCogs);
       if (isRestock && !restockLoaded) {
         loadRestock();
         loadForecastSettings();
@@ -1553,6 +1636,10 @@
       if (isProfit && !profitLoaded) {
         loadProfitability();
         profitLoaded = true;
+      }
+      if (isCogs && !cogsLoaded) {
+        loadCogs();
+        cogsLoaded = true;
       }
     }
     document.querySelectorAll('.tab-btn').forEach(b => {
@@ -2007,6 +2094,125 @@
       }
     }
     profitRefreshBtn.addEventListener('click', loadProfitability);
+
+    // ── COGS editor ─────────────────────────────────────
+    let cogsFlashTimer = null;
+    function cogsFlash(msg, isError = false) {
+      cogsStatusEl.textContent = msg;
+      cogsStatusEl.style.color = isError ? '#b71c1c' : '#2e7d32';
+      if (cogsFlashTimer) clearTimeout(cogsFlashTimer);
+      cogsFlashTimer = setTimeout(() => { cogsStatusEl.textContent = ''; }, 3000);
+    }
+
+    async function loadCogs() {
+      cogsBodyEl.innerHTML = '<tr><td colspan="5" style="padding:20px;color:#888;">Loading…</td></tr>';
+      cogsEmptyEl.style.display = 'none';
+      try {
+        const r = await fetch('/cogs', { headers: authHeaders() });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        cogsStampEl.textContent = `${data.count} SKU(s) with COGS`;
+        renderCogsRows(data.rows || []);
+      } catch (err) {
+        cogsBodyEl.innerHTML = `<tr><td colspan="5" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
+      }
+    }
+
+    function renderCogsRows(rows) {
+      if (!rows.length) {
+        cogsBodyEl.innerHTML = '';
+        cogsEmptyEl.style.display = 'block';
+        return;
+      }
+      cogsEmptyEl.style.display = 'none';
+      cogsBodyEl.innerHTML = rows.map(r => `
+        <tr data-sku="${escapeHtml(r.sku)}">
+          <td><strong>${escapeHtml(r.sku)}</strong></td>
+          <td class="num"><input type="number" step="0.01" min="0.01" data-field="unit_cost" value="${r.unit_cost ?? ''}"></td>
+          <td class="num"><input type="number" step="0.01" min="0"    data-field="inbound_shipping_per_unit" value="${r.inbound_shipping_per_unit ?? 0}"></td>
+          <td style="color:#888; font-size:12px;">${r.updated_at ? new Date(r.updated_at).toLocaleString() : '—'}</td>
+          <td><button class="cogs-delete" type="button">Delete</button></td>
+        </tr>
+      `).join('');
+
+      // Autosave on blur — one PUT per row edit. Only fires when the value
+      // actually changed, so tabbing through the table doesn't spam writes.
+      cogsBodyEl.querySelectorAll('input').forEach(inp => {
+        inp.dataset.original = inp.value;
+        inp.addEventListener('blur', () => saveCogsInput(inp));
+        inp.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); inp.blur(); }
+        });
+      });
+      cogsBodyEl.querySelectorAll('.cogs-delete').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const sku = btn.closest('tr').dataset.sku;
+          if (confirm(`Delete COGS row for ${sku}?`)) deleteCogsRow(sku);
+        });
+      });
+    }
+
+    async function saveCogsInput(inp) {
+      if (inp.value === inp.dataset.original) return;
+      const tr = inp.closest('tr');
+      const sku = tr.dataset.sku;
+      const unit_cost = parseFloat(tr.querySelector('input[data-field="unit_cost"]').value);
+      const inbound_shipping_per_unit = parseFloat(tr.querySelector('input[data-field="inbound_shipping_per_unit"]').value || 0);
+      if (!(unit_cost > 0)) {
+        cogsFlash(`${sku}: unit_cost must be > 0`, true);
+        inp.value = inp.dataset.original;
+        return;
+      }
+      try {
+        const r = await fetch(`/cogs/${encodeURIComponent(sku)}`, {
+          method: 'PUT',
+          headers: authHeaders({ 'content-type': 'application/json' }),
+          body: JSON.stringify({ unit_cost, inbound_shipping_per_unit }),
+        });
+        const j = await r.json();
+        if (j.error) throw new Error(j.error);
+        inp.dataset.original = inp.value;
+        cogsFlash(`Saved ${sku}`);
+      } catch (err) {
+        cogsFlash(`${sku}: ${err.message || err}`, true);
+        inp.value = inp.dataset.original;
+      }
+    }
+
+    async function deleteCogsRow(sku) {
+      try {
+        const r = await fetch(`/cogs/${encodeURIComponent(sku)}`, {
+          method: 'DELETE', headers: authHeaders(),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        cogsFlash(`Removed ${sku}`);
+        loadCogs();
+      } catch (err) {
+        cogsFlash(`Delete failed: ${err.message || err}`, true);
+      }
+    }
+
+    cogsAddForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const sku = cogsAddSkuEl.value.trim();
+      const unit_cost = parseFloat(cogsAddCostEl.value);
+      const inbound_shipping_per_unit = parseFloat(cogsAddShipEl.value || 0);
+      if (!sku || !(unit_cost > 0)) { cogsFlash('SKU + positive unit cost required', true); return; }
+      try {
+        const r = await fetch(`/cogs/${encodeURIComponent(sku)}`, {
+          method: 'PUT',
+          headers: authHeaders({ 'content-type': 'application/json' }),
+          body: JSON.stringify({ unit_cost, inbound_shipping_per_unit }),
+        });
+        const j = await r.json();
+        if (j.error) throw new Error(j.error);
+        cogsFlash(`Saved ${sku}`);
+        cogsAddSkuEl.value = ''; cogsAddCostEl.value = ''; cogsAddShipEl.value = '';
+        loadCogs();
+      } catch (err) {
+        cogsFlash(`${sku}: ${err.message || err}`, true);
+      }
+    });
 
     // ── SKU drawer ──────────────────────────────────────
     const drawerEl = document.getElementById('sku-drawer');

@@ -25,6 +25,7 @@ from database import (
     delete_session,
     upsert_cogs,
     get_cogs,
+    delete_cogs,
     get_forecast_settings,
     update_forecast_settings,
     get_forecast_cache,
@@ -244,6 +245,30 @@ async def upload_cogs(request: Request, user: dict = Depends(protect)):
 async def list_cogs(user: dict = Depends(protect)):
     rows = await get_cogs()
     return {"count": len(rows), "rows": rows}
+
+
+@app.put("/cogs/{sku}")
+async def upsert_cogs_single(
+    sku: str, request: Request, user: dict = Depends(protect),
+):
+    """Insert or update a single COGS row. Body: {unit_cost,
+    inbound_shipping_per_unit?}. Used by the inline COGS editor in the
+    FE — one PUT per row edit, keyed by SKU."""
+    body = await request.json()
+    written = await upsert_cogs([{
+        "sku": sku,
+        "unit_cost": body.get("unit_cost"),
+        "inbound_shipping_per_unit": body.get("inbound_shipping_per_unit", 0),
+    }])
+    if not written:
+        return {"error": "invalid unit_cost (must be a positive number)"}
+    return {"saved": 1, "sku": sku}
+
+
+@app.delete("/cogs/{sku}")
+async def delete_cogs_endpoint(sku: str, user: dict = Depends(protect)):
+    removed = await delete_cogs(sku)
+    return {"removed": removed, "sku": sku}
 
 
 # ── Forecasting endpoints ──────────────────────────────────────────────────
