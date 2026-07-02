@@ -1,9 +1,15 @@
 import os
 import httpx
 
-from auth import require_user
+from auth import _db, require_user
 
 AURORA_API_URL = os.getenv("AURORA_API_URL", "https://aurorabackend-is4p.onrender.com/api/ads")
+
+# Extra campaigns we own that live outside Aurora's ads collection —
+# Aurora's nightly sync overwrites `ads` and mongoose strips any field
+# not in its schema (like our `skus` list). Anything written to this
+# collection survives untouched and gets merged in at read time.
+MIDDHA_CAMPAIGN_COLLECTION = "middhaAdCampaigns"
 
 # Cache campaigns per-user so different sellers don't see each other's data.
 _user_campaigns: dict[str, list[dict]] = {}
@@ -53,10 +59,47 @@ async def fetch_all_campaigns(user: dict | None = None) -> None:
                 break
             page += 1
 
+    # Merge in any test / manual campaigns we own — Aurora doesn't touch
+    # `middhaAdCampaigns`, so entries here survive across Aurora syncs
+    # AND preserve custom fields like `skus` that Aurora's schema strips.
+    extras = await _load_middha_campaigns(user["_id"])
+    if extras:
+        seen = {c.get("campaignId") for c in all_campaigns}
+        for e in extras:
+            if e.get("campaignId") in seen:
+                continue  # a matching Aurora doc wins for real campaigns
+            all_campaigns.append(e)
+
     key = str(user["_id"])
     _user_campaigns[key] = all_campaigns
     _user_summary[key] = _build_summary(all_campaigns)
-    print(f"Loaded {len(all_campaigns)} campaigns for user {user.get('email')}")
+    print(
+        f"Loaded {len(all_campaigns)} campaigns for user {user.get('email')} "
+        f"(+{len(extras)} from {MIDDHA_CAMPAIGN_COLLECTION})"
+    )
+
+
+async def _load_middha_campaigns(user_id) -> list[dict]:
+    """Load extra / test campaigns for this user from our own collection.
+    Docs shaped like Aurora's Ad output — datetimes are ISO-serialized so
+    downstream code sees the same string format the HTTP path returns."""
+    try:
+        cursor = _db()[MIDDHA_CAMPAIGN_COLLECTION].find(
+            {"sellerId": user_id}, {"_id": 0, "sellerId": 0},
+        )
+        rows = await cursor.to_list(length=None)
+    except Exception as e:
+        print(f"[{MIDDHA_CAMPAIGN_COLLECTION}] load failed: {e}")
+        return []
+    # Normalize datetime → ISO string for the fields we rely on downstream,
+    # so consumers written for the HTTP shape keep working.
+    from datetime import datetime as _dt
+    for r in rows:
+        for k in ("startDate", "endDate", "metricsStartDate", "metricsEndDate", "lastSynced"):
+            v = r.get(k)
+            if isinstance(v, _dt):
+                r[k] = v.isoformat()
+    return rows
 
 
 async def _ensure_loaded() -> None:
@@ -161,14 +204,20 @@ async def get_ad_spend_for_range(start, end) -> dict:
     def _to_dt(v):
         if v is None:
             return None
+        result: _dt | None = None
         if isinstance(v, _dt):
-            return v if v.tzinfo else v.replace(tzinfo=_tz.utc)
-        if isinstance(v, str):
+            result = v
+        elif isinstance(v, str):
             try:
-                return _dt.fromisoformat(v.replace("Z", "+00:00"))
+                result = _dt.fromisoformat(v.replace("Z", "+00:00"))
             except ValueError:
                 return None
-        return None
+        if result is None:
+            return None
+        # Always return tz-aware so max()/min()/subtraction never mix naive
+        # with aware (raises TypeError). Assume any naive value is UTC —
+        # Aurora writes both flavors depending on the ingest path.
+        return result if result.tzinfo else result.replace(tzinfo=_tz.utc)
 
     win_start = _to_dt(start)
     win_end = _to_dt(end)

@@ -1,11 +1,11 @@
-"""One-shot seed: insert a TEST campaign into Aurora's `ads` collection
-covering every SellerSKU in `products` for the given user, so we can
-exercise the per-SKU ad-allocation path on Profitability.
+"""One-shot seed: insert a TEST campaign covering every SellerSKU in
+`products` for the given user, so we can exercise the per-SKU ad-
+allocation path on Profitability.
 
-Aurora's Ad schema doesn't natively have a `skus` field — we add it
-here. Mongoose ignores unknown fields on read, so this doesn't break
-Aurora's own writes to the doc; our Python side reads it via
-`get_ad_spend_for_range`.
+We write to `middhaAdCampaigns` — a collection we own — instead of
+Aurora's `ads`. Aurora's nightly sync overwrites `ads` and its mongoose
+schema strips unknown fields (like our `skus` list). Our own collection
+sits outside that sync and preserves whatever we put in it.
 
 Run:
     cd backend && python _seed_test_campaign.py
@@ -19,6 +19,7 @@ load_dotenv("/Users/ayushmittal/Downloads/middha-global/.env")
 
 from bson import ObjectId  # noqa: E402
 from auth import _db  # noqa: E402
+from campaigns import MIDDHA_CAMPAIGN_COLLECTION  # noqa: E402
 
 USER_ID = ObjectId("69e0c751361814d89de3fa0b")
 PROFILE_ID = "TEST_PROFILE"
@@ -63,16 +64,16 @@ async def main() -> None:
         "metricsEndDate": end,
         "lastSynced": now,
         "updatedAt": now,
-        # Non-standard field for our per-SKU attribution path.
+        # SKU attribution list — this is what the per-SKU allocation reads.
         "skus": skus,
     }
-    res = await db.ads.update_one(
-        {"sellerId": USER_ID, "profileId": PROFILE_ID, "campaignId": CAMPAIGN_ID},
+    res = await db[MIDDHA_CAMPAIGN_COLLECTION].update_one(
+        {"sellerId": USER_ID, "campaignId": CAMPAIGN_ID},
         {"$set": doc, "$setOnInsert": {"createdAt": now}},
         upsert=True,
     )
     action = "inserted" if res.upserted_id else "updated"
-    print(f"{action} TEST campaign — {CAMPAIGN_ID}")
+    print(f"{action} into {MIDDHA_CAMPAIGN_COLLECTION}: {CAMPAIGN_ID}")
     print(f"  window:  {start.date()} → {end.date()} (60d)")
     print(f"  spend:   $600, sales: $1800 (ACOS ~33%)")
     print(f"  skus:    {len(skus)} SellerSKUs attached")
