@@ -643,6 +643,14 @@ async def compute_profitability_data(
         end_dt = now
         start_dt = end_dt - timedelta(days=days_back)
 
+    # SP-API rejects CreatedBefore < 2 minutes before "now" — a 23:59Z
+    # end-of-day for today's date is in the future. Clamp so `end_dt`
+    # never exceeds now-3min. Preserves the user's intent (whole day
+    # of history) while keeping Amazon happy.
+    api_ceiling = now - timedelta(minutes=3)
+    if end_dt > api_ceiling:
+        end_dt = api_ceiling
+
     created_after = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     created_before = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     window_days = max((end_dt - start_dt).total_seconds() / 86400.0, 0.5)
