@@ -441,6 +441,24 @@
     }
     #restock-toolbar button:disabled { opacity: 0.6; cursor: not-allowed; }
     #restock-stamp { font-size: 12px; color: #888; }
+    #restock-count {
+      font-size: 12px;
+      color: #555;
+      background: #eef1f7;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-variant-numeric: tabular-nums;
+    }
+    #restock-show-no-demand-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #555;
+      cursor: pointer;
+      user-select: none;
+    }
+    #restock-show-no-demand-label input { cursor: pointer; }
 
     #restock-settings {
       background: #fff;
@@ -484,7 +502,8 @@
       background: #fff;
       border-radius: 10px;
       border: 1px solid #e0e0e0;
-      overflow: hidden;
+      overflow-y: auto;
+      max-height: calc(100vh - 280px);
     }
     table.restock {
       width: 100%;
@@ -501,6 +520,9 @@
       text-transform: uppercase;
       letter-spacing: 0.5px;
       border-bottom: 1px solid #e0e0e0;
+      position: sticky;
+      top: 0;
+      z-index: 1;
     }
     table.restock tbody tr {
       border-bottom: 1px solid #f0f0f0;
@@ -880,7 +902,11 @@
     <div id="restock-view">
       <div id="restock-toolbar">
         <h2>Restock dashboard</h2>
+        <span id="restock-count"></span>
         <span id="restock-stamp"></span>
+        <label id="restock-show-no-demand-label" title="Include SKUs with no recent demand and no PO suggestion">
+          <input type="checkbox" id="restock-show-no-demand"> Show no-demand SKUs
+        </label>
         <button id="restock-settings-toggle" class="secondary">Settings</button>
         <button id="restock-refresh">Refresh forecasts</button>
       </div>
@@ -1440,9 +1466,12 @@
     const restockBodyEl = document.getElementById('restock-body');
     const restockEmptyEl = document.getElementById('restock-empty');
     const restockStampEl = document.getElementById('restock-stamp');
+    const restockCountEl = document.getElementById('restock-count');
+    const restockShowNoDemandEl = document.getElementById('restock-show-no-demand');
     const restockRefreshBtn = document.getElementById('restock-refresh');
     const restockSettingsToggle = document.getElementById('restock-settings-toggle');
     const restockSettingsPanel = document.getElementById('restock-settings');
+    let restockCache = [];  // last fetch — re-rendered on toggle
     const settingLead = document.getElementById('setting-lead-time');
     const settingMoq = document.getElementById('setting-moq');
     const settingCover = document.getElementById('setting-target-cover');
@@ -1534,44 +1563,73 @@
       return `${d.toFixed(1)} d`;
     }
 
+    function isNoDemand(row) {
+      // A row is "no demand" when the model has no signal AND there's no
+      // action to take: undefined days of cover and a zero PO suggestion.
+      return (row.days_of_cover === null || row.days_of_cover === undefined)
+        && (!row.recommended_po_qty || row.recommended_po_qty === 0);
+    }
+
+    function renderRestockRows() {
+      restockBodyEl.innerHTML = '';
+      const showAll = restockShowNoDemandEl.checked;
+      const visible = showAll
+        ? restockCache
+        : restockCache.filter(r => !isNoDemand(r));
+
+      const hiddenCount = restockCache.length - visible.length;
+      const tail = hiddenCount > 0 && !showAll
+        ? ` (${hiddenCount} no-demand hidden)`
+        : '';
+      restockCountEl.textContent = `${visible.length} SKU${visible.length === 1 ? '' : 's'}${tail}`;
+
+      for (const row of visible) {
+        const tr = document.createElement('tr');
+        tr.dataset.sku = row.sku;
+        const docCls = urgencyClass(row.days_of_cover);
+        tr.innerHTML = `
+          <td><strong>${escapeHtml(row.sku)}</strong></td>
+          <td class="num">${row.on_hand ?? 0}</td>
+          <td class="num">${row.inbound ?? 0}</td>
+          <td class="num">${row.next_30_day_forecast ?? 0}</td>
+          <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>
+          <td>${row.reorder_by_date ?? '—'}</td>
+          <td class="num"><strong>${row.recommended_po_qty ?? 0}</strong></td>
+        `;
+        tr.addEventListener('click', () => openSkuDrawer(row.sku));
+        restockBodyEl.appendChild(tr);
+      }
+    }
+
     async function loadRestock() {
       restockBodyEl.innerHTML = '';
       restockEmptyEl.style.display = 'none';
+      restockCountEl.textContent = '';
       try {
         const r = await fetch('/forecasting/restock', { headers: authHeaders() });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
-        if (!data.rows || data.rows.length === 0) {
+        restockCache = data.rows || [];
+        if (restockCache.length === 0) {
           restockEmptyEl.style.display = 'block';
           restockStampEl.textContent = '';
           return;
         }
         let latest = '';
-        for (const row of data.rows) {
+        for (const row of restockCache) {
           if (row.generated_at && row.generated_at > latest) latest = row.generated_at;
-          const tr = document.createElement('tr');
-          tr.dataset.sku = row.sku;
-          const docCls = urgencyClass(row.days_of_cover);
-          tr.innerHTML = `
-            <td><strong>${escapeHtml(row.sku)}</strong></td>
-            <td class="num">${row.on_hand ?? 0}</td>
-            <td class="num">${row.inbound ?? 0}</td>
-            <td class="num">${row.next_30_day_forecast ?? 0}</td>
-            <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>
-            <td>${row.reorder_by_date ?? '—'}</td>
-            <td class="num"><strong>${row.recommended_po_qty ?? 0}</strong></td>
-          `;
-          tr.addEventListener('click', () => openSkuDrawer(row.sku));
-          restockBodyEl.appendChild(tr);
         }
         if (latest) {
           const d = new Date(latest);
           restockStampEl.textContent = `Last refreshed ${d.toLocaleString()}`;
         }
+        renderRestockRows();
       } catch (err) {
         restockBodyEl.innerHTML = `<tr><td colspan="7" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
       }
     }
+
+    restockShowNoDemandEl.addEventListener('change', renderRestockRows);
 
     restockRefreshBtn.addEventListener('click', async () => {
       restockRefreshBtn.disabled = true;
@@ -1963,25 +2021,76 @@
           <div><span>Recommended PO</span><span>${reorder.recommended_po_qty ?? 0}</span></div>
           <div><span>MOQ / lead time</span><span>${reorder.moq ?? 1} / ${reorder.lead_time_days ?? '?'}d</span></div>
         `;
+        // Build a continuous timeline: 90 days of historical actuals,
+        // then the 90-day forecast. We densify the history (fill missing
+        // days with 0) so the actuals trace doesn't have visual gaps
+        // wherever a SKU didn't sell that day.
         const fc = data.forecast || [];
-        const labels = fc.map(r => r.date.slice(0, 10));
-        const p50 = fc.map(r => r.p50);
-        const p90 = fc.map(r => r.p90);
+        const hist = data.history || [];
+        const histByDate = new Map();
+        for (const h of hist) histByDate.set(h.date.slice(0, 10), h);
+
+        const today = new Date(); today.setUTCHours(0, 0, 0, 0);
+        const histLabels = [];
+        const actuals = [];
+        const stockoutMask = [];
+        for (let i = 90; i >= 1; i--) {
+          const d = new Date(today); d.setUTCDate(d.getUTCDate() - i);
+          const key = d.toISOString().slice(0, 10);
+          histLabels.push(key);
+          const h = histByDate.get(key);
+          actuals.push(h ? h.units : 0);
+          stockoutMask.push(h && h.stockout_corrected);
+        }
+        const fcLabels = fc.map(r => r.date.slice(0, 10));
+        const labels = histLabels.concat(fcLabels);
+
+        // Align series to the full x-axis with null padding so each line
+        // only renders on its own segment.
+        const actualsAligned = actuals.concat(new Array(fcLabels.length).fill(null));
+        const stockoutPoints = actuals.map((v, i) => stockoutMask[i] ? v : null)
+          .concat(new Array(fcLabels.length).fill(null));
+        const p50Aligned = new Array(histLabels.length).fill(null)
+          .concat(fc.map(r => r.p50));
+        const p90Aligned = new Array(histLabels.length).fill(null)
+          .concat(fc.map(r => r.p90));
+
         if (skuChart) skuChart.destroy();
         skuChart = new Chart(chartCanvas, {
           type: 'line',
           data: {
             labels,
             datasets: [
-              { label: 'p90 (upper)', data: p90, borderColor: '#c5d2ff', backgroundColor: 'rgba(74,108,247,0.10)', fill: '-1', pointRadius: 0, borderWidth: 1 },
-              { label: 'p50 forecast', data: p50, borderColor: '#4a6cf7', backgroundColor: 'rgba(74,108,247,0.05)', pointRadius: 0, borderWidth: 2, tension: 0.2 },
+              { label: '90d actuals', data: actualsAligned,
+                borderColor: '#1a1a2e', backgroundColor: 'transparent',
+                pointRadius: 0, borderWidth: 1.5, tension: 0.15 },
+              { label: 'stockout days', data: stockoutPoints,
+                borderColor: 'transparent', backgroundColor: '#c62828',
+                pointRadius: 3, showLine: false },
+              { label: 'p90 (upper)', data: p90Aligned,
+                borderColor: '#c5d2ff', backgroundColor: 'rgba(74,108,247,0.10)',
+                fill: '-1', pointRadius: 0, borderWidth: 1 },
+              { label: 'p50 forecast', data: p50Aligned,
+                borderColor: '#4a6cf7', backgroundColor: 'rgba(74,108,247,0.05)',
+                pointRadius: 0, borderWidth: 2, tension: 0.2 },
             ],
           },
           options: {
             responsive: true, maintainAspectRatio: false,
-            plugins: { legend: { display: true, labels: { font: { size: 11 } } } },
+            spanGaps: false,
+            plugins: {
+              legend: { display: true, labels: { font: { size: 11 } } },
+              tooltip: {
+                callbacks: {
+                  label: (ctx) => {
+                    if (ctx.dataset.label === 'stockout days') return 'stockout (excluded from training)';
+                    return `${ctx.dataset.label}: ${ctx.parsed.y}`;
+                  },
+                },
+              },
+            },
             scales: {
-              x: { ticks: { maxTicksLimit: 8, font: { size: 10 } } },
+              x: { ticks: { maxTicksLimit: 10, font: { size: 10 } } },
               y: { beginAtZero: true, ticks: { font: { size: 10 } } },
             },
           },

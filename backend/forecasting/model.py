@@ -26,6 +26,7 @@ import pandas as pd
 from bson import ObjectId
 
 from database import (
+    _forecast_cache,
     get_forecast_settings_for_user,
     get_sales_daily_for_user,
     latest_inventory_for_user,
@@ -37,6 +38,22 @@ log = logging.getLogger("forecasting.model")
 
 MIN_HISTORY_DAYS = 60
 DEFAULT_HORIZON = 90
+
+
+def _is_real_sku(sku: str) -> bool:
+    """Drop Amazon-generated promo / giveaway SKUs from the forecast.
+
+    Amazon mints SKUs like `amzn.gr.NQ-...` for Vine reviewer copies,
+    one-off giveaways, and other internal events. They aren't real
+    catalog inventory the seller would ever place a PO for — including
+    them just clutters the restock dashboard.
+    """
+    s = (sku or "").strip().lower()
+    if not s:
+        return False
+    if s.startswith("amzn.gr."):
+        return False
+    return True
 
 # Confirmed Prime Day-style events. Extend yearly. lower/upper window padding
 # lets Prophet attribute a few surrounding days of lift to the event.
@@ -256,7 +273,15 @@ async def refresh_forecasts_for_user(
         all_rows = await get_sales_daily_for_user(user_id, sku=None, since=since)
         by_sku: dict[str, list[dict]] = {}
         for r in all_rows:
+            if not _is_real_sku(r["sku"]):
+                continue
             by_sku.setdefault(r["sku"], []).append(r)
+        # Drop any cache entries for SKUs we've now decided to exclude
+        # (e.g. amzn.gr.* from earlier runs) so they vanish from the UI.
+        await _forecast_cache().delete_many({
+            "userId": user_id,
+            "sku": {"$regex": "^amzn\\.gr\\."},
+        })
     else:
         by_sku = {}
         for sku in skus:

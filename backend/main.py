@@ -28,6 +28,7 @@ from database import (
     get_forecast_settings,
     update_forecast_settings,
     get_forecast_cache,
+    get_sales_daily,
 )
 from forecasting.ingest import (
     backfill_user,
@@ -323,11 +324,29 @@ async def forecasting_restock(user: dict = Depends(protect)):
 
 @app.get("/forecasting/sku/{sku}")
 async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
-    """Full forecast (90-day p50/p90) for one SKU — drives the detail chart."""
+    """Full forecast (90-day p50/p90) plus last 90 days of actuals for one
+    SKU — drives the detail chart. Stockout days are flagged so the FE can
+    render them differently (the model trained without them)."""
+    from datetime import datetime, timezone, timedelta as _td
+
     cached = await get_forecast_cache(skus=[sku])
     if not cached:
         return {"error": f"No forecast for {sku}. Run /forecasting/refresh first."}
     c = cached[0]
+
+    since = datetime.now(timezone.utc) - _td(days=90)
+    raw_history = await get_sales_daily(sku=sku, since=since)
+    # Densify the array on the frontend; here we just emit the (date,
+    # units, stockout_corrected) tuples for whichever days we have rows.
+    history = [
+        {
+            "date": r["date"].isoformat() if hasattr(r.get("date"), "isoformat") else r.get("date"),
+            "units": int(r.get("units_ordered") or 0),
+            "stockout_corrected": bool(r.get("stockout_corrected", False)),
+        }
+        for r in raw_history
+    ]
+
     return {
         "sku": sku,
         "method": c.get("method"),
@@ -336,6 +355,7 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
         "drivers": c.get("drivers"),
         "reorder": c.get("reorder"),
         "forecast": c.get("forecast"),
+        "history": history,
     }
 
 
@@ -480,13 +500,49 @@ SP_API_AUTH_URL = "https://sellercentral.amazon.com/apps/authorize/consent"
 
 
 @app.get("/amazon/sp-login")
-async def sp_api_login(redirect_uri: str | None = None):
-    """Redirect user to Seller Central to authorize the SP-API app."""
+async def sp_api_login(
+    request: Request,
+    redirect_uri: str | None = None,
+    token: str | None = None,
+    authorization: str | None = None,
+):
+    """Redirect user to Seller Central to authorize the SP-API app.
+
+    The caller's JWT is embedded into OAuth `state` so `/amazon/sp-callback`
+    can identify the user after Amazon's 302 redirect — browsers can't
+    attach an Authorization header to a redirect, so we can't use the
+    normal `protect` dependency on the callback. The token is accepted
+    either as `?token=<jwt>` (works from a plain browser link) or as an
+    `Authorization: Bearer <jwt>` header (works from XHR)."""
+    # Local import — avoids exposing internal helpers in the module namespace.
+    from auth import _verify_token, _load_user
+
+    jwt_token = token
+    if not jwt_token:
+        auth_header = authorization or request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            jwt_token = auth_header.split(" ", 1)[1]
+    if not jwt_token:
+        return HTMLResponse(
+            "<h2>SP-API OAuth Error</h2><p>Missing auth — pass your JWT as "
+            "<code>?token=&lt;jwt&gt;</code> or in an <code>Authorization: "
+            "Bearer</code> header.</p>",
+            status_code=401,
+        )
+    try:
+        _load_user_id = _verify_token(jwt_token).get("id")
+        await _load_user(_load_user_id)  # ensure the user still exists
+    except Exception as e:
+        return HTMLResponse(
+            f"<h2>SP-API OAuth Error</h2><p>Auth failed: {e}</p>",
+            status_code=401,
+        )
+
     ru = redirect_uri or DEFAULT_REDIRECT_URI
     params = urlencode({
         "application_id": SP_API_APP_ID,
         "redirect_uri": ru,
-        "state": "sp_api_auth",
+        "state": jwt_token,
     })
     print(f"[sp_login] Redirecting to Seller Central consent: {SP_API_AUTH_URL}?{params}")
     return RedirectResponse(f"{SP_API_AUTH_URL}?{params}")
@@ -495,7 +551,6 @@ async def sp_api_login(redirect_uri: str | None = None):
 @app.get("/amazon/sp-callback")
 async def sp_api_callback(
     request: Request,
-    user: dict = Depends(protect),
     spapi_oauth_code: str | None = None,
     state: str | None = None,
     selling_partner_id: str | None = None,
@@ -503,7 +558,12 @@ async def sp_api_callback(
     error_description: str | None = None,
 ):
     """Handle SP-API OAuth callback — exchange code for refresh token and
-    persist it as the authenticated user's amazonRefreshToken."""
+    persist it as the authenticated user's amazonRefreshToken.
+
+    Authenticates via the JWT embedded in `state` (set by /amazon/sp-login),
+    since Amazon's redirect strips any Authorization header."""
+    from auth import _verify_token, _load_user
+
     if error or not spapi_oauth_code:
         detail = error_description or error or "No authorization code was provided."
         print(f"[sp_callback] no code. error={error!r} description={error_description!r}")
@@ -512,6 +572,25 @@ async def sp_api_callback(
             "<p>Start the flow again from <code>/amazon/sp-login</code>.</p>",
             status_code=400,
         )
+
+    if not state:
+        return HTMLResponse(
+            "<h2>SP-API OAuth Error</h2><p>Missing state — start the flow at "
+            "<code>/amazon/sp-login</code>.</p>",
+            status_code=400,
+        )
+
+    try:
+        decoded = _verify_token(state)
+        user = await _load_user(decoded.get("id"))
+    except Exception as e:
+        return HTMLResponse(
+            f"<h2>SP-API OAuth Error</h2><p>Auth failed: {e}</p>",
+            status_code=401,
+        )
+
+    user["_token"] = state
+    current_user.set(user)
 
     print(f"[sp_callback] code={spapi_oauth_code[:8]}... seller_id={selling_partner_id}")
 

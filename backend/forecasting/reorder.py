@@ -96,6 +96,20 @@ def compute_reorder(
 
     target_units = target_cover * avg_daily_overall + safety_stock
     raw_po = target_units - available
+
+    # Sanity ceiling — Prophet on sparse SKUs can project an exponential
+    # recovery and balloon the recommendation into the thousands. Cap
+    # against the recent 28-day rate × 180 days (≈ 6 months), with a
+    # token floor for low-velocity SKUs and a hard floor when there's
+    # been zero recent demand at all.
+    recent_avg = float(drivers.get("recent_avg") or 0)
+    if recent_avg > 0:
+        ceiling = max(recent_avg * 180.0, 50.0)
+    else:
+        # No demand in the last 28 days → don't recommend more than a
+        # token reorder, even if the historical fit is high.
+        ceiling = 30.0
+    raw_po = min(raw_po, ceiling)
     recommended_po_qty = _round_up_to_moq(raw_po, moq)
 
     return {
