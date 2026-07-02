@@ -311,6 +311,10 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "next_30_day_forecast": round(next30, 1),
             "days_of_cover": reorder.get("days_of_cover"),
             "reorder_by_date": reorder.get("reorder_by_date"),
+            "reorder_by_date_air": reorder.get("reorder_by_date_air"),
+            "reorder_by_date_sea": reorder.get("reorder_by_date_sea"),
+            "air_lead_time_days": reorder.get("air_lead_time_days"),
+            "sea_lead_time_days": reorder.get("sea_lead_time_days"),
             "recommended_po_qty": reorder.get("recommended_po_qty", 0),
             "drivers": c.get("drivers"),
         })

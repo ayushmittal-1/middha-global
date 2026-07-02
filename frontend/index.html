@@ -936,7 +936,8 @@
               <th class="num">Inbound</th>
               <th class="num">30-day forecast</th>
               <th>Days of cover</th>
-              <th>Reorder by</th>
+              <th title="Latest date to order if shipping by air (fast — 24h transit)">Order by (air)</th>
+              <th title="Latest date to order if shipping by sea (slow — 2 months transit)">Order by (sea)</th>
               <th class="num">Suggested PO</th>
             </tr>
           </thead>
@@ -1601,7 +1602,8 @@
           <td class="num">${row.inbound ?? 0}</td>
           <td class="num">${row.next_30_day_forecast ?? 0}</td>
           <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>
-          <td>${row.reorder_by_date ?? '—'}</td>
+          <td title="Assumes ${row.air_lead_time_days ?? 1}d transit">${row.reorder_by_date_air ?? '—'}</td>
+          <td title="Assumes ${row.sea_lead_time_days ?? 60}d transit">${row.reorder_by_date_sea ?? '—'}</td>
           <td class="num"><strong>${row.recommended_po_qty ?? 0}</strong></td>
         `;
         tr.addEventListener('click', () => openSkuDrawer(row.sku));
@@ -2040,7 +2042,8 @@
           <div><span>On hand</span><span>${reorder.on_hand ?? 0}</span></div>
           <div><span>Inbound</span><span>${reorder.inbound ?? 0}</span></div>
           <div><span>Days of cover</span><span>${reorder.days_of_cover ?? '—'}</span></div>
-          <div><span>Reorder by</span><span>${reorder.reorder_by_date ?? '—'}</span></div>
+          <div><span>Order by (air, ${reorder.air_lead_time_days ?? 1}d transit)</span><span>${reorder.reorder_by_date_air ?? '—'}</span></div>
+          <div><span>Order by (sea, ${reorder.sea_lead_time_days ?? 60}d transit)</span><span>${reorder.reorder_by_date_sea ?? '—'}</span></div>
           <div><span>Safety stock</span><span>${reorder.safety_stock ?? 0}</span></div>
           <div><span>Reorder point</span><span>${reorder.reorder_point ?? 0}</span></div>
           <div><span>Recommended PO</span><span>${reorder.recommended_po_qty ?? 0}</span></div>

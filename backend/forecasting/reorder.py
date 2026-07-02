@@ -21,6 +21,15 @@ import math
 from datetime import datetime, timedelta, timezone
 
 
+# ── Shipping-mode lead times ─────────────────────────────────────────────
+# How long an inbound order takes to arrive at Amazon FBA after the PO is
+# placed. Used to derive two reorder-by dates the client sees on the
+# Restock tab: one if they intend to airfreight the restock, one if they
+# ship by sea. Tweak these to match your supplier's real transit times.
+AIR_LEAD_TIME_DAYS = 1     # 24 hours — express/air freight
+SEA_LEAD_TIME_DAYS = 60    # 2 months — sea freight
+
+
 # Common service levels → z-scores. We snap to the nearest bucket rather
 # than carrying scipy as a dependency for this single lookup.
 _Z_TABLE: list[tuple[float, float]] = [
@@ -90,9 +99,23 @@ def compute_reorder(
     days_of_cover = (available / avg_daily_overall) if avg_daily_overall > 0 else None
 
     reorder_by_date = None
+    reorder_by_date_air = None
+    reorder_by_date_sea = None
     if days_of_cover is not None:
+        # Original — uses the user's per-org lead_time setting. Kept for
+        # backwards compatibility with anything still reading it.
         slack_days = max(0.0, days_of_cover - lead_time)
         reorder_by_date = (today + timedelta(days=slack_days)).date().isoformat()
+
+        # Air freight (~24h) — very late reorder deadline.
+        slack_air = max(0.0, days_of_cover - AIR_LEAD_TIME_DAYS)
+        reorder_by_date_air = (today + timedelta(days=slack_air)).date().isoformat()
+
+        # Sea freight (~2 months) — much earlier deadline. If DoC ≤ lead
+        # time, slack is 0 and the date is today ("order NOW to avoid a
+        # stockout even at the fastest possible sea transit").
+        slack_sea = max(0.0, days_of_cover - SEA_LEAD_TIME_DAYS)
+        reorder_by_date_sea = (today + timedelta(days=slack_sea)).date().isoformat()
 
     target_units = target_cover * avg_daily_overall + safety_stock
     raw_po = target_units - available
@@ -121,6 +144,10 @@ def compute_reorder(
         "reorder_point": int(math.ceil(reorder_point)),
         "days_of_cover": round(days_of_cover, 1) if days_of_cover is not None else None,
         "reorder_by_date": reorder_by_date,
+        "reorder_by_date_air": reorder_by_date_air,
+        "reorder_by_date_sea": reorder_by_date_sea,
+        "air_lead_time_days": AIR_LEAD_TIME_DAYS,
+        "sea_lead_time_days": SEA_LEAD_TIME_DAYS,
         "recommended_po_qty": recommended_po_qty,
         "service_level": service_level,
         "lead_time_days": lead_time,
