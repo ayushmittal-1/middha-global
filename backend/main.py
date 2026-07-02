@@ -459,10 +459,21 @@ async def campaigns_performance(user: dict = Depends(protect)):
 
 
 @app.get("/profitability")
-async def profitability(days_back: int = 7, user: dict = Depends(protect)):
+async def profitability(
+    days_back: int = 7,
+    start: str | None = None,
+    end: str | None = None,
+    user: dict = Depends(protect),
+):
     """Per-SKU profitability for the requested window. Walks SP-API
-    NextToken so the FE sees the whole window."""
-    return await compute_profitability_data(days_back=days_back, paginate=True)
+    NextToken so the FE sees the whole window.
+
+    Accepts either `?start=YYYY-MM-DD&end=YYYY-MM-DD` (preferred, matches
+    the FE date pickers) or `?days_back=N` (legacy, still used by the LLM
+    tool). If both are given, start/end wins."""
+    return await compute_profitability_data(
+        days_back=days_back, start=start, end=end, paginate=True,
+    )
 
 
 # ── Amazon OAuth endpoints ─────────────────────────────────────────────────

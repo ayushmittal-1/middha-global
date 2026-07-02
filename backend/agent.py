@@ -583,7 +583,12 @@ async def _get_cogs(skus=None) -> str:
     return out
 
 
-async def compute_profitability_data(days_back: int = 7, paginate: bool = False) -> dict:
+async def compute_profitability_data(
+    days_back: int = 7,
+    start: str | datetime | None = None,
+    end: str | datetime | None = None,
+    paginate: bool = False,
+) -> dict:
     """Per-SKU profitability following the FBA Profitability Calculator PDF:
 
       Net = Selling Price
@@ -598,17 +603,55 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
     Amazon fees (referral / FBA / fuel) come from Product Fees API per ASIN.
     Storage comes from GET_FBA_STORAGE_FEE_CHARGES_DATA (cached 24h — first
     cold call adds 30–120 s). Ads come from Aurora campaigns pro-rated to
-    the window and allocated uniformly per unit. Returns / aged-inventory /
-    low-inventory fees are *not* computed here and surface in `caveats`."""
-    from campaigns import get_ad_spend_for_window
+    the window and allocated per SKU when a campaign lists its SKUs;
+    otherwise spread uniformly across units sold. Returns / removals /
+    low-inv / inbound-placement / aged-inv fees come from Finances API.
+
+    Window is defined by `start`/`end` (YYYY-MM-DD strings or datetimes)
+    when either is provided; falls back to `days_back` for legacy callers
+    (LLM tool). End-exclusive vs Amazon docs is orders-`CreatedBefore`;
+    for the FE picker that's inclusive-of-end-date so we push end to
+    23:59:59Z."""
+    from campaigns import get_ad_spend_for_range
     from database import get_storage_cache, put_storage_cache
 
-    created_after = (
-        datetime.now(timezone.utc) - timedelta(days=days_back)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Normalize window → (created_after ISO Z, created_before ISO Z or None,
+    # window_days float).
+    now = datetime.now(timezone.utc)
+    def _parse_dt(v, end_of_day: bool = False) -> datetime | None:
+        if v is None or v == "":
+            return None
+        if isinstance(v, datetime):
+            return v.replace(tzinfo=v.tzinfo or timezone.utc)
+        s = str(v).strip()
+        # Accept 'YYYY-MM-DD' or full ISO.
+        if len(s) == 10:
+            d = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if end_of_day:
+                d = d.replace(hour=23, minute=59, second=59)
+            return d
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+    start_dt = _parse_dt(start)
+    end_dt = _parse_dt(end, end_of_day=True)
+    if start_dt or end_dt:
+        if not start_dt:
+            start_dt = now - timedelta(days=days_back)
+        if not end_dt:
+            end_dt = now
+    else:
+        end_dt = now
+        start_dt = end_dt - timedelta(days=days_back)
+
+    created_after = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    created_before = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    window_days = max((end_dt - start_dt).total_seconds() / 86400.0, 0.5)
+
     try:
         orders_resp = await amazon_sp.get_orders(
-            created_after=created_after, paginate=paginate,
+            created_after=created_after,
+            created_before=created_before,
+            paginate=paginate,
         )
     except Exception as e:
         return {"error": f"Error fetching orders: {e}"}
@@ -617,7 +660,9 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
         return {
             "orders_count": 0, "skus_count": 0, "rows": [], "totals": None,
             "missing_cogs": [], "na_price_rows": [], "fetch_errors": [],
-            "days_back": days_back, "created_after": created_after,
+            "days_back": round(window_days, 2), "window_days": round(window_days, 2),
+            "start": start_dt.date().isoformat(), "end": end_dt.date().isoformat(),
+            "created_after": created_after, "created_before": created_before,
             "caveats": [], "warnings": [],
         }
 
@@ -706,15 +751,23 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
         except Exception as e:
             warnings.append(f"Storage report fetch failed ({e}); storage fees set to 0.")
 
-    # ── Ad allocation (uniform per unit) ──────────────────────────────────
-    ad_window = {"total_window": 0.0, "campaign_count": 0}
+    # ── Ad allocation ────────────────────────────────────────────────────
+    # Per-SKU when a campaign lists its SKUs (Aurora Ad.skus[]); campaigns
+    # without a SKU list fall into `unattributed` and get spread uniformly
+    # per unit (legacy behavior).
+    ad_window = {
+        "total_window": 0.0, "campaign_count": 0,
+        "by_sku": {}, "unattributed": 0.0,
+    }
     try:
-        ad_window = await get_ad_spend_for_window(window_days=days_back)
+        ad_window = await get_ad_spend_for_range(start=start_dt, end=end_dt)
     except Exception as e:
         warnings.append(f"Ad spend fetch failed ({e}); ad cost set to 0.")
+    ad_by_sku: dict[str, float] = ad_window.get("by_sku") or {}
+    ad_unattributed: float = float(ad_window.get("unattributed") or 0.0)
     total_units_window = sum(d["units"] for d in sku_data.values())
-    ad_cost_per_unit = (
-        ad_window["total_window"] / total_units_window if total_units_window > 0 else 0.0
+    ad_unattr_per_unit = (
+        ad_unattributed / total_units_window if total_units_window > 0 else 0.0
     )
 
     # ── Finances API — return processing, low inventory, inbound placement,
@@ -746,7 +799,7 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
     }
 
     # ── Per-SKU enrichment: Fees API → referral, FBA, fuel ────────────────
-    months_in_window = max(days_back / 30.0, 0.01)
+    months_in_window = max(window_days / 30.0, 0.01)
     rows: list[dict] = []
     totals = defaultdict(float)
     missing_cogs: list[dict] = []
@@ -782,8 +835,11 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
             float(storage_per_asin_monthly.get(asin or "", 0)) * months_in_window, 2,
         )
 
-        # Ads allocation: uniform per-unit
-        ad_cost = round(ad_cost_per_unit * units, 2)
+        # Ads: per-campaign attribution when the campaign lists this SKU,
+        # plus a share of the unattributed pool spread per unit.
+        ad_cost = round(
+            float(ad_by_sku.get(sku, 0.0)) + ad_unattr_per_unit * units, 2,
+        )
 
         # Finances API fees per SKU + share of unattributed pool
         fin_sku = fin_by_sku.get(sku, {})
@@ -881,8 +937,12 @@ async def compute_profitability_data(days_back: int = 7, paginate: bool = False)
         caveats.append("Storage fees: report unavailable for this window; values are 0.")
 
     return {
-        "days_back": days_back,
+        "days_back": round(window_days, 2),
+        "window_days": round(window_days, 2),
+        "start": start_dt.date().isoformat(),
+        "end": end_dt.date().isoformat(),
         "created_after": created_after,
+        "created_before": created_before,
         "orders_count": len(orders),
         "skus_count": len(skus),
         "rows": rows,

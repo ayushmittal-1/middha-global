@@ -1071,8 +1071,11 @@
       <div id="profit-toolbar">
         <h2>Profitability</h2>
         <span id="profit-stamp"></span>
-        <label>Days back
-          <input id="profit-days" type="number" min="1" max="365" value="7">
+        <label>From
+          <input id="profit-start" type="date">
+        </label>
+        <label>To
+          <input id="profit-end" type="date">
         </label>
         <button id="profit-refresh">Apply</button>
       </div>
@@ -1588,7 +1591,16 @@
     const profitCaveatsEl = document.getElementById('profit-caveats');
     const profitEmptyEl = document.getElementById('profit-empty');
     const profitStampEl = document.getElementById('profit-stamp');
-    const profitDaysEl = document.getElementById('profit-days');
+    const profitStartEl = document.getElementById('profit-start');
+    const profitEndEl = document.getElementById('profit-end');
+    // Default range: last 7 days ending today. `toISOString().slice(0,10)`
+    // gives UTC date; that's what the backend expects anyway.
+    (function initProfitDates() {
+      const today = new Date();
+      const back7 = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+      profitEndEl.value   = today.toISOString().slice(0, 10);
+      profitStartEl.value = back7.toISOString().slice(0, 10);
+    })();
     const profitRefreshBtn = document.getElementById('profit-refresh');
     let profitLoaded = false;
 
@@ -1980,14 +1992,21 @@
       profitCaveatsEl.classList.remove('visible');
       profitEmptyEl.style.display = 'none';
       profitRefreshBtn.disabled = true;
-      const days = Math.max(1, Number(profitDaysEl.value) || 7);
+      const start = profitStartEl.value;
+      const end = profitEndEl.value;
+      if (!start || !end || start > end) {
+        profitBodyEl.innerHTML = `<tr><td colspan="17" style="padding:20px;color:#c62828;">Pick a valid start ≤ end date.</td></tr>`;
+        profitRefreshBtn.disabled = false;
+        return;
+      }
       try {
-        const r = await fetch(`/profitability?days_back=${days}`, { headers: authHeaders() });
+        const qs = new URLSearchParams({ start, end }).toString();
+        const r = await fetch(`/profitability?${qs}`, { headers: authHeaders() });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
         if (data.error) throw new Error(data.error);
 
-        profitStampEl.textContent = `${data.orders_count} orders, ${data.skus_count} SKUs · since ${data.created_after ? new Date(data.created_after).toLocaleDateString() : '—'}`;
+        profitStampEl.textContent = `${data.orders_count} orders, ${data.skus_count} SKUs · ${data.start ?? start} → ${data.end ?? end} (${data.window_days ?? '?'}d)`;
 
         const t = data.totals;
         if (t) {
@@ -2075,7 +2094,9 @@
           caveats.push(`${data.fetch_errors.length} order(s) failed to fetch items.`);
         }
         if (data.ad_window && data.ad_window.campaign_count) {
-          caveats.push(`Ad allocation: $${(data.ad_window.total_window || 0).toLocaleString()} from ${data.ad_window.campaign_count} campaigns over ${days}d, spread uniformly across ${t ? t.units : 0} units.`);
+          const aw = data.ad_window;
+          const attributed = Object.keys(aw.by_sku || {}).length;
+          caveats.push(`Ad allocation: $${(aw.total_window || 0).toLocaleString()} from ${aw.campaign_count} campaigns over ${data.window_days ?? '?'}d — $${(aw.total_window - (aw.unattributed || 0)).toFixed(2)} attributed per-SKU across ${attributed} SKUs, $${(aw.unattributed || 0).toFixed(2)} spread uniformly across ${t ? t.units : 0} units.`);
         }
         if (data.storage_cached_at) {
           caveats.push(`Storage allocation from FBA report, cached ${new Date(data.storage_cached_at).toLocaleString()}.`);
