@@ -343,7 +343,6 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "reorder_by_date_sea": reorder.get("reorder_by_date_sea"),  # legacy alias
             "air_transit_days": reorder.get("air_transit_days"),
             "ocean_transit_days": reorder.get("ocean_transit_days"),
-            "prep_lead_time_days": reorder.get("prep_lead_time_days"),
             "inbound_shipments_count": reorder.get("inbound_shipments_count", 0),
             "next_shipment_eta": reorder.get("next_shipment_eta"),
             "recommended_po_qty": reorder.get("recommended_po_qty", 0),

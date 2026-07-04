@@ -588,11 +588,6 @@ DEFAULT_FORECAST_SETTINGS = {
     "moq": 1,
     "target_cover_days": 90,
     "service_level": 0.95,
-    # Days between "seller decides to ship" and shipment physically
-    # dispatches. Prep time at origin: packing, palletizing, hand-off to
-    # freight forwarder. Subtracted from the ship-by dates the Restock
-    # tab shows so the seller sees an actionable "start prepping" date.
-    "prep_lead_time_days": 7,
 }
 
 

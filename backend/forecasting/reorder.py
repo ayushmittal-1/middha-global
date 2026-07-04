@@ -14,12 +14,11 @@ The new model:
   3. Simulate the stock timeline: start at on_hand today, deplete at the
      forecasted daily demand, add each shipment's outstanding units on its
      ETA. Find the first day the balance hits zero — the `stockout_date`.
-  4. Ship-by-air date  = stockout_date − AIR_TRANSIT_DAYS   − prep_lead
-     Ship-by-ocean date = stockout_date − OCEAN_TRANSIT_DAYS − prep_lead
+  4. Ship-by-air date  = stockout_date − AIR_TRANSIT_DAYS
+     Ship-by-ocean date = stockout_date − OCEAN_TRANSIT_DAYS
 
-`prep_lead_time_days` is the seller-configurable handling time between
-"decide to ship" and "shipment physically departs" (packing, freight
-forwarder hand-off). AIR/OCEAN transit constants are the time from
+Ship-by dates are dispatch deadlines — the seller factors in their own
+prep/packing time on top. AIR/OCEAN transit constants are the time from
 dispatch → arrival at the Amazon FC.
 
 Safety stock is intentionally zero — the seller asked to be alerted at
@@ -156,8 +155,7 @@ def compute_reorder(
     inv_snapshot : one row from products.inventory (via
         latest_inventory_for_user) or None.
     drivers : forecast drivers dict — used for `recent_avg` PO ceiling.
-    settings : forecast settings (lead_time_days, prep_lead_time_days,
-        moq, target_cover_days, service_level).
+    settings : forecast settings (moq, target_cover_days).
     shipments : per-SKU active inbound shipments, each
         {shipment_id, eta, qty_outstanding, mode, carrier_name, status}.
         Empty list = no shipments in-flight for this SKU.
@@ -171,7 +169,6 @@ def compute_reorder(
     moq = int(settings.get("moq", 1))
     target_cover = int(settings.get("target_cover_days", 90))
     service_level = float(settings.get("service_level", 0.95))
-    prep_lead = int(settings.get("prep_lead_time_days", 7))
 
     shipments = shipments or []
 
@@ -193,7 +190,6 @@ def compute_reorder(
         "reorder_by_date_sea": None,  # legacy alias
         "air_transit_days": AIR_TRANSIT_DAYS,
         "ocean_transit_days": OCEAN_TRANSIT_DAYS,
-        "prep_lead_time_days": prep_lead,
         "recommended_po_qty": 0,
         "service_level": service_level,
         "moq": moq,
@@ -223,8 +219,7 @@ def compute_reorder(
     def _ship_by(transit_days: int) -> str | None:
         if stockout_dt is None:
             return None
-        buffer = timedelta(days=transit_days + prep_lead)
-        latest = stockout_dt - buffer
+        latest = stockout_dt - timedelta(days=transit_days)
         # Clamp negative values ("you're already too late") to today so
         # the seller sees "ship NOW" rather than a past date.
         if latest < today:
@@ -257,7 +252,7 @@ def compute_reorder(
         # Safety stock kept in the response for backwards compat, but the
         # sim uses pure depletion so we report zero here.
         "safety_stock": 0,
-        "reorder_point": int(math.ceil(avg_daily_overall * (AIR_TRANSIT_DAYS + prep_lead))),
+        "reorder_point": int(math.ceil(avg_daily_overall * AIR_TRANSIT_DAYS)),
         "days_of_cover": round(days_of_cover, 1) if days_of_cover is not None else None,
         "stockout_date": stockout_date,
         # Legacy field — some agent code still reads it. Point at the
@@ -268,7 +263,6 @@ def compute_reorder(
         "reorder_by_date_sea": reorder_by_date_ocean,  # legacy alias
         "air_transit_days": AIR_TRANSIT_DAYS,
         "ocean_transit_days": OCEAN_TRANSIT_DAYS,
-        "prep_lead_time_days": prep_lead,
         "recommended_po_qty": recommended_po_qty,
         "service_level": service_level,
         "moq": moq,
