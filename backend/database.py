@@ -68,6 +68,10 @@ def _placement_fee_cache():
     return _db().inboundPlacementFeeCache
 
 
+def _aged_inventory_cache():
+    return _db().agedInventoryFeeCache
+
+
 def _user_oid() -> ObjectId:
     user = require_user()
     return ObjectId(str(user["_id"]))
@@ -93,6 +97,9 @@ async def init_db():
     await _forecast_settings().create_index([("userId", 1)], unique=True)
     await _storage_cache().create_index([("userId", 1)], unique=True)
     await _placement_fee_cache().create_index(
+        [("userId", 1)], unique=True
+    )
+    await _aged_inventory_cache().create_index(
         [("userId", 1)], unique=True
     )
 
@@ -354,6 +361,43 @@ async def put_placement_fee_cache(
             "$set": {
                 "perSku": per_sku,
                 "monthsCovered": months_covered,
+                "updatedAt": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {"userId": user_id},
+        },
+        upsert=True,
+    )
+
+
+# ── Aged inventory fee cache (24h TTL) ──────────────────────────────────
+
+
+async def get_aged_inventory_cache(max_age_hours: int = 24) -> dict | None:
+    user_id = _user_oid()
+    doc = await _aged_inventory_cache().find_one({"userId": user_id})
+    if not doc:
+        return None
+    updated = doc.get("updatedAt")
+    if not updated:
+        return None
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
+    if age_hours > max_age_hours:
+        return None
+    return {
+        "per_sku": doc.get("perSku", {}),
+        "updated_at": updated.isoformat(),
+    }
+
+
+async def put_aged_inventory_cache(per_sku: dict) -> None:
+    user_id = _user_oid()
+    await _aged_inventory_cache().update_one(
+        {"userId": user_id},
+        {
+            "$set": {
+                "perSku": per_sku,
                 "updatedAt": datetime.now(timezone.utc),
             },
             "$setOnInsert": {"userId": user_id},

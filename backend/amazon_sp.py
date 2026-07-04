@@ -600,8 +600,11 @@ async def get_financial_events(
         )
         pages += 1
         payload = resp.get("payload") or {}
+        # SP-API nests all *EventList fields under `FinancialEvents`.
+        # `NextToken` stays at the top level of `payload`.
+        events = payload.get("FinancialEvents") or {}
 
-        for evt in payload.get("ShipmentEventList") or []:
+        for evt in events.get("ShipmentEventList") or []:
             for item in evt.get("ShipmentItemList") or []:
                 sku = (item.get("SellerSKU") or "").strip()
                 for ftype, amt in _fees_from_lists(
@@ -615,7 +618,7 @@ async def get_financial_events(
                     # we want a positive cost figure.
                     target[bucket] += abs(amt)
 
-        for evt in payload.get("RefundEventList") or []:
+        for evt in events.get("RefundEventList") or []:
             for item in (evt.get("ShipmentItemAdjustmentList")
                          or evt.get("ShipmentItemList") or []):
                 sku = (item.get("SellerSKU") or "").strip()
@@ -628,7 +631,7 @@ async def get_financial_events(
                     target = by_sku[sku] if sku else unattributed
                     target[bucket] += abs(amt)
 
-        for evt in payload.get("ServiceFeeEventList") or []:
+        for evt in events.get("ServiceFeeEventList") or []:
             sku = (evt.get("SellerSKU") or "").strip()
             for ftype, amt in _fees_from_lists(evt.get("FeeList")):
                 bucket = _classify_fee_type(ftype)
@@ -637,7 +640,7 @@ async def get_financial_events(
                 target = by_sku[sku] if sku else unattributed
                 target[bucket] += abs(amt)
 
-        for evt in payload.get("AdjustmentEventList") or []:
+        for evt in events.get("AdjustmentEventList") or []:
             adj_type = (evt.get("AdjustmentType") or "").lower()
             if not any(h in adj_type for h in _REMOVAL_ADJUSTMENT_HINTS):
                 continue
@@ -673,6 +676,183 @@ async def get_financial_events(
         "totals": totals,
         "pages": pages,
         "posted_after": posted_after,
+    }
+
+
+async def fetch_inbound_placement_fees_per_sku(
+    months_back: int = 12,
+) -> tuple[dict, list[str]]:
+    """Pull GET_FBA_INBOUND_PLACEMENT_SERVICE_FEE_INVOICE_DATA for the
+    last `months_back` months and return
+    ({sku: {"fee_total": $, "units_received": N}}, months_covered).
+
+    This is the same data the seller sees in their Amazon dashboard
+    (SKU × units received × per-unit rate × total charge). We accumulate
+    fees + units per SKU across all inbound shipments in the window so
+    the caller can compute a weighted per-unit rate and amortize like
+    COGS: units_sold_in_window × avg_fee_per_unit.
+
+    We avoid the Finances API / shipment-items reconstruction path
+    because it double-counts non-fee-qualifying SKUs in the same
+    shipment's denominator, diluting the per-unit rate 15-20×.
+
+    Caller is responsible for caching — the report takes 30-120 s to
+    generate.
+    """
+    now = datetime.now(timezone.utc)
+    start = (now.replace(day=1) - timedelta(days=months_back * 31)).replace(day=1)
+    end = now
+    # Report ID matches the Seller Central Report Central path
+    # (/reportcentral/INBOUND_PLACEMENT_FEES_CHARGES/1).
+    create_resp = await create_report(
+        "GET_FBA_INBOUND_PLACEMENT_FEES_CHARGES_DATA",
+        start_date=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        end_date=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        single_marketplace=True,
+    )
+    report_id = create_resp.get("reportId")
+    if not report_id:
+        raise RuntimeError(
+            f"Placement fee report create returned no id: {create_resp}"
+        )
+    text = await download_report_raw(report_id, max_polls=24, poll_interval=10)
+
+    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+    per_sku: dict[str, dict] = {}
+    months: set[str] = set()
+    # Amazon exports have drifted between snake_case and "friendly" column
+    # names; accept common variants so we don't break if they rename.
+    sku_keys = ("sku", "seller_sku", "SKU")
+    qty_keys = ("actual_received_quantity", "received_quantity",
+                "Actual received quantity")
+    fee_keys = ("total_fba_inbound_placement_service_fee_charge",
+                "total_charge", "total_charges",
+                "Total FBA inbound placement service fee charge")
+    date_keys = ("transaction_date", "Transaction date")
+    for row in reader:
+        def _get(keys):
+            for k in keys:
+                v = row.get(k)
+                if v is not None and v != "":
+                    return v
+            return None
+        sku = (_get(sku_keys) or "").strip()
+        if not sku:
+            continue
+        try:
+            units = int(float(_get(qty_keys) or 0))
+        except (TypeError, ValueError):
+            units = 0
+        try:
+            fee = float(_get(fee_keys) or 0)
+        except (TypeError, ValueError):
+            fee = 0.0
+        if units <= 0 and fee == 0:
+            continue
+        bucket = per_sku.setdefault(
+            sku, {"fee_total": 0.0, "units_received": 0}
+        )
+        bucket["fee_total"] += fee
+        bucket["units_received"] += units
+        dt = (_get(date_keys) or "").strip()
+        if dt:
+            months.add(dt[:7])  # YYYY-MM prefix
+
+    per_sku_rounded = {
+        sku: {
+            "fee_total": round(v["fee_total"], 2),
+            "units_received": v["units_received"],
+        }
+        for sku, v in per_sku.items()
+    }
+    return per_sku_rounded, sorted(months)
+
+
+async def fetch_aged_inventory_fees_per_sku() -> dict:
+    """Pull GET_FBA_INVENTORY_PLANNING_DATA (snapshot) and sum Amazon's
+    per-SKU aged-inventory-surcharge projections into a monthly per-SKU
+    total.
+
+    The report lists Amazon's own `estimated-ais-<bucket>-days` columns
+    per SKU — the aged inventory surcharge Amazon will charge that SKU
+    this month, already segmented by age bucket. We sum the buckets to
+    get the SKU's projected monthly aged fee. The caller amortizes over
+    the sales window (× months_in_window) the same way we do for
+    storage.
+
+    Works on Draft SP-API apps (unlike GET_FBA_INVENTORY_AGE_DATA and
+    the LONGTERM_STORAGE_FEE_CHARGES report, which are Published-only).
+
+    Returns {sku: {"monthly_fee": $, "total_aged_units": N}}. Caller is
+    responsible for caching — the report takes 30-120 s to generate.
+    """
+    create_resp = await create_report(
+        "GET_FBA_INVENTORY_PLANNING_DATA",
+        single_marketplace=True,
+    )
+    report_id = create_resp.get("reportId")
+    if not report_id:
+        raise RuntimeError(
+            f"Inventory planning report create returned no id: {create_resp}"
+        )
+    text = await download_report_raw(report_id, max_polls=30, poll_interval=10)
+
+    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+    ais_fee_cols = (
+        "estimated-ais-181-210-days",
+        "estimated-ais-211-240-days",
+        "estimated-ais-241-270-days",
+        "estimated-ais-271-300-days",
+        "estimated-ais-301-330-days",
+        "estimated-ais-331-365-days",
+        "estimated-ais-366-455-days",
+        "estimated-ais-456-plus-days",
+    )
+    ais_qty_cols = (
+        "quantity-to-be-charged-ais-181-210-days",
+        "quantity-to-be-charged-ais-211-240-days",
+        "quantity-to-be-charged-ais-241-270-days",
+        "quantity-to-be-charged-ais-271-300-days",
+        "quantity-to-be-charged-ais-301-330-days",
+        "quantity-to-be-charged-ais-331-365-days",
+        "quantity-to-be-charged-ais-366-455-days",
+        "quantity-to-be-charged-ais-456-plus-days",
+    )
+
+    def _f(v):
+        try:
+            return float(v) if v not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _i(v):
+        try:
+            return int(float(v)) if v not in (None, "") else 0
+        except (TypeError, ValueError):
+            return 0
+
+    per_sku: dict[str, dict] = {}
+    for row in reader:
+        sku = (row.get("sku") or row.get("seller-sku") or "").strip()
+        if not sku:
+            continue
+        monthly_fee = sum(_f(row.get(c)) for c in ais_fee_cols)
+        aged_units = sum(_i(row.get(c)) for c in ais_qty_cols)
+        if monthly_fee == 0 and aged_units == 0:
+            continue
+        bucket = per_sku.setdefault(
+            sku, {"monthly_fee": 0.0, "total_aged_units": 0}
+        )
+        # A SKU can appear once per (fnsku, marketplace) — sum defensively.
+        bucket["monthly_fee"] += monthly_fee
+        bucket["total_aged_units"] += aged_units
+
+    return {
+        sku: {
+            "monthly_fee": round(v["monthly_fee"], 2),
+            "total_aged_units": v["total_aged_units"],
+        }
+        for sku, v in per_sku.items()
     }
 
 

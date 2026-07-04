@@ -613,7 +613,14 @@ async def compute_profitability_data(
     for the FE picker that's inclusive-of-end-date so we push end to
     23:59:59Z."""
     from campaigns import get_ad_spend_for_range
-    from database import get_storage_cache, put_storage_cache
+    from database import (
+        get_aged_inventory_cache,
+        get_placement_fee_cache,
+        get_storage_cache,
+        put_aged_inventory_cache,
+        put_placement_fee_cache,
+        put_storage_cache,
+    )
 
     # Normalize window → (created_after ISO Z, created_before ISO Z or None,
     # window_days float).
@@ -806,6 +813,68 @@ async def compute_profitability_data(
                   "aged_inventory", "removal")
     }
 
+    # ── Inbound placement fees: pulled from Amazon's Inbound Placement
+    # Service Fee report (GET_FBA_INBOUND_PLACEMENT_FEES_CHARGES_DATA) so
+    # we get the exact per-SKU × per-unit rate Amazon charged. Cached 24 h.
+    # Fees are booked at inbound receipt (not per sale), so we compute a
+    # lifetime weighted per-unit rate: fee_total / units_received across
+    # the report window, then bill units_sold_in_window × avg_per_unit.
+    # Supersedes the placement piece of `fin_by_sku` / `unattr_per_unit`.
+    placement_avg_per_unit: dict[str, float] | None = {}
+    placement_cache_meta = await get_placement_fee_cache(max_age_hours=24)
+    try:
+        if placement_cache_meta:
+            placement_per_sku = placement_cache_meta.get("per_sku") or {}
+        else:
+            placement_per_sku, months = (
+                await amazon_sp.fetch_inbound_placement_fees_per_sku(
+                    months_back=12
+                )
+            )
+            await put_placement_fee_cache(placement_per_sku, months)
+        for sku, b in placement_per_sku.items():
+            u = int(b.get("units_received") or 0)
+            if u > 0:
+                placement_avg_per_unit[sku] = float(b.get("fee_total") or 0) / u
+    except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
+        warnings.append(
+            f"Inbound placement resolution failed "
+            f"({type(e).__name__}: {e!r}); placement fees will fall "
+            "back to the in-window unattributed spread."
+        )
+        placement_avg_per_unit = None  # sentinel: use fallback below
+    placement_unresolved_per_unit = 0.0  # report is authoritative — no residual
+
+    # ── Aged inventory fees: Amazon's Inventory Planning report lists
+    # per-SKU `estimated-ais-<bucket>-days` — projected monthly aged
+    # inventory surcharge, already segmented by age bucket. We sum the
+    # buckets to a per-SKU monthly total and amortize over the sales
+    # window (× months_in_window), same shape as storage. Cached 24 h.
+    # Works on Draft SP-API apps (unlike LONGTERM_STORAGE_FEE_CHARGES).
+    aged_monthly_per_sku: dict[str, float] | None = {}
+    aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
+    try:
+        if aged_cache_meta:
+            aged_per_sku = aged_cache_meta.get("per_sku") or {}
+        else:
+            aged_per_sku = await amazon_sp.fetch_aged_inventory_fees_per_sku()
+            await put_aged_inventory_cache(aged_per_sku)
+        for sku, b in aged_per_sku.items():
+            fee = float(b.get("monthly_fee") or 0)
+            if fee > 0:
+                aged_monthly_per_sku[sku] = fee
+    except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
+        warnings.append(
+            f"Aged inventory resolution failed "
+            f"({type(e).__name__}: {e!r}); aged fees will fall back "
+            "to the in-window unattributed spread."
+        )
+        aged_monthly_per_sku = None  # sentinel: use fallback below
+
     # ── Per-SKU enrichment: Fees API → referral, FBA, fuel ────────────────
     months_in_window = max(window_days / 30.0, 0.01)
     rows: list[dict] = []
@@ -857,12 +926,32 @@ async def compute_profitability_data(
         low_inventory_fee = round(
             (fin_sku.get("low_inventory", 0.0)
              + unattr_per_unit["low_inventory"] * units), 2)
-        inbound_placement_fee = round(
-            (fin_sku.get("inbound_placement", 0.0)
-             + unattr_per_unit["inbound_placement"] * units), 2)
-        aged_inventory_fee = round(
-            (fin_sku.get("aged_inventory", 0.0)
-             + unattr_per_unit["aged_inventory"] * units), 2)
+        # Placement: shipment-attributed per-unit average × units sold,
+        # plus a share of fees we couldn't tie to a shipment (spread per
+        # unit like the other unattributed buckets). When resolution
+        # failed entirely (`placement_avg_per_unit is None`), fall back
+        # to the sales-window numbers so we never regress to $0.
+        if placement_avg_per_unit is None:
+            inbound_placement_fee = round(
+                (fin_sku.get("inbound_placement", 0.0)
+                 + unattr_per_unit["inbound_placement"] * units), 2)
+        else:
+            inbound_placement_fee = round(
+                placement_avg_per_unit.get(sku, 0.0) * units
+                + placement_unresolved_per_unit * units,
+                2,
+            )
+        # Aged inventory: per-SKU monthly projection from the Planning
+        # report × months in window. Falls back to the sales-window
+        # unattributed spread when resolution fails.
+        if aged_monthly_per_sku is None:
+            aged_inventory_fee = round(
+                (fin_sku.get("aged_inventory", 0.0)
+                 + unattr_per_unit["aged_inventory"] * units), 2)
+        else:
+            aged_inventory_fee = round(
+                aged_monthly_per_sku.get(sku, 0.0) * months_in_window, 2
+            )
         removal_fee = round(
             (fin_sku.get("removal", 0.0)
              + unattr_per_unit["removal"] * units), 2)
@@ -1254,16 +1343,6 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
       {"type": "error",       "content": "..."}
     The caller is responsible for sending a final {"type": "done"} after iteration.
     """
-    if not (GROQ_API_KEY or "").strip():
-        yield {
-            "type": "error",
-            "content": (
-                "GROQ_API_KEY is not configured. Add it to aiModel/.env, then restart "
-                "the AI service (uvicorn on port 8000)."
-            ),
-        }
-        return
-
     # Ensure session exists in DB; auto-title from first user message
     await create_session(session_id)
     history = await get_messages(session_id)
