@@ -64,6 +64,10 @@ def _storage_cache():
     return _db().storageFeeCache
 
 
+def _placement_fee_cache():
+    return _db().inboundPlacementFeeCache
+
+
 def _user_oid() -> ObjectId:
     user = require_user()
     return ObjectId(str(user["_id"]))
@@ -88,6 +92,9 @@ async def init_db():
     )
     await _forecast_settings().create_index([("userId", 1)], unique=True)
     await _storage_cache().create_index([("userId", 1)], unique=True)
+    await _placement_fee_cache().create_index(
+        [("userId", 1)], unique=True
+    )
 
 
 # ── Conversations ────────────────────────────────────────────────────────
@@ -314,6 +321,47 @@ async def put_storage_cache(per_sku_monthly: dict, months_covered: list[str]) ->
     )
 
 
+# ── Inbound placement fee report cache (24h TTL, like storage fees) ─────
+
+
+async def get_placement_fee_cache(max_age_hours: int = 24) -> dict | None:
+    user_id = _user_oid()
+    doc = await _placement_fee_cache().find_one({"userId": user_id})
+    if not doc:
+        return None
+    updated = doc.get("updatedAt")
+    if not updated:
+        return None
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
+    if age_hours > max_age_hours:
+        return None
+    return {
+        "per_sku": doc.get("perSku", {}),
+        "months_covered": doc.get("monthsCovered", []),
+        "updated_at": updated.isoformat(),
+    }
+
+
+async def put_placement_fee_cache(
+    per_sku: dict, months_covered: list[str],
+) -> None:
+    user_id = _user_oid()
+    await _placement_fee_cache().update_one(
+        {"userId": user_id},
+        {
+            "$set": {
+                "perSku": per_sku,
+                "monthsCovered": months_covered,
+                "updatedAt": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {"userId": user_id},
+        },
+        upsert=True,
+    )
+
+
 # ── Forecasting: salesDaily / inventorySnapshot / forecastCache ───────────
 #
 # These helpers take an explicit `user_id` because they are also called from
@@ -416,6 +464,90 @@ async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
     return out
 
 
+async def active_inbound_shipments_for_user(
+    user_id: ObjectId,
+) -> dict[str, list[dict]]:
+    """Return per-SKU list of in-flight FBA shipments arriving at Amazon.
+
+    Source is the shared `shipments` collection written by auroraBackend's
+    ShipmentSyncManager. We surface only outstanding units (expected − received)
+    so the reorder simulation doesn't double-count what Amazon has already
+    checked in.
+
+    Shape per shipment entry:
+      {shipment_id, name, status, eta (datetime, UTC midnight),
+       qty_outstanding, carrier_name, mode}
+
+    `mode` is inferred from carrierName ('air' | 'ocean' | 'ground').
+    """
+    # In-flight = not yet received by Amazon and not cancelled. Delivered
+    # shipments are excluded because Aurora sets `unitsLocated` shortly
+    # after and the on-hand snapshot picks them up — counting them here
+    # too would double-book.
+    active_statuses = [
+        "WORKING", "READY_TO_SHIP", "CHECKED_IN",
+        "SHIPPED", "IN_TRANSIT", "RECEIVING",
+    ]
+    cursor = _db().shipments.find(
+        {
+            "sellerId": user_id,
+            "shipmentType": "fba_fc",
+            "status": {"$in": active_statuses},
+        },
+        {
+            "_id": 0,
+            "shipmentId": 1, "referenceId": 1, "status": 1, "displayStatus": 1,
+            "estimatedDeliveryDate": 1, "shipDate": 1, "lastUpdatedDate": 1,
+            "carrierName": 1, "lineItems": 1,
+        },
+    )
+    from forecasting.reorder import infer_shipment_mode
+
+    now = datetime.now(timezone.utc)
+    by_sku: dict[str, list[dict]] = {}
+    async for shp in cursor:
+        eta = (
+            shp.get("estimatedDeliveryDate")
+            or shp.get("shipDate")
+            or shp.get("lastUpdatedDate")
+        )
+        if eta and eta.tzinfo is None:
+            eta = eta.replace(tzinfo=timezone.utc)
+        # Undated shipments (rare, mostly WORKING plans) don't help the
+        # sim — skip them rather than injecting arbitrary dates.
+        if not eta:
+            continue
+        # Clamp to today: a delivery date in the past on a still-active
+        # shipment just means it's late, treat it as landing now.
+        if eta < now:
+            eta = now
+        carrier = shp.get("carrierName") or ""
+        mode = infer_shipment_mode(carrier)
+        for li in shp.get("lineItems") or []:
+            sku = (li.get("sku") or "").strip()
+            if not sku:
+                continue
+            expected = int(li.get("unitsExpected") or 0)
+            received = int(li.get("unitsReceived") or 0)
+            outstanding = max(0, expected - received)
+            if outstanding <= 0:
+                continue
+            by_sku.setdefault(sku, []).append({
+                "shipment_id": shp.get("shipmentId"),
+                "name": shp.get("referenceId"),
+                "status": shp.get("status"),
+                "display_status": shp.get("displayStatus"),
+                "eta": eta,
+                "qty_outstanding": outstanding,
+                "carrier_name": carrier or None,
+                "mode": mode,
+            })
+    # Sort each SKU's shipments by ETA — the reorder sim walks them in order.
+    for sku in by_sku:
+        by_sku[sku].sort(key=lambda s: s["eta"])
+    return by_sku
+
+
 async def upsert_forecast_cache(user_id: ObjectId, sku: str, payload: dict) -> None:
     # Keep userId/sku out of $set — Mongo rejects an update that touches
     # the same path in both $set and $setOnInsert.
@@ -456,6 +588,11 @@ DEFAULT_FORECAST_SETTINGS = {
     "moq": 1,
     "target_cover_days": 90,
     "service_level": 0.95,
+    # Days between "seller decides to ship" and shipment physically
+    # dispatches. Prep time at origin: packing, palletizing, hand-off to
+    # freight forwarder. Subtracted from the ship-by dates the Restock
+    # tab shows so the seller sees an actionable "start prepping" date.
+    "prep_lead_time_days": 7,
 }
 
 

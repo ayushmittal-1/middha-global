@@ -863,6 +863,40 @@
       font-weight: 600;
     }
     #sku-chart-wrap { position: relative; height: 260px; }
+    .sku-shipments {
+      grid-column: 1 / -1;
+      margin-top: 12px;
+      border-top: 1px solid #eee;
+      padding-top: 12px;
+    }
+    .sku-shipments-title {
+      font-size: 11px; color: #777; text-transform: uppercase;
+      letter-spacing: 0.5px; margin-bottom: 8px;
+    }
+    .sku-shipments table {
+      width: 100%; border-collapse: collapse; font-size: 12px;
+    }
+    .sku-shipments th, .sku-shipments td {
+      text-align: left; padding: 6px 8px; border-bottom: 1px solid #f0f0f0;
+    }
+    .sku-shipments th {
+      font-weight: 600; color: #555; background: #fafafa;
+    }
+    .sku-shipments td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .sku-shipments-empty {
+      grid-column: 1 / -1;
+      margin-top: 12px;
+      padding: 10px; background: #fafafa; border-radius: 4px;
+      color: #777; font-style: italic; font-size: 12px;
+    }
+    .mode-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 10px;
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .mode-air { background: #e3f2fd; color: #1565c0; }
+    .mode-ocean { background: #e0f7fa; color: #00695c; }
+    .mode-ground { background: #f1f0f5; color: #555; }
     #sku-drawer-overlay {
       position: fixed; inset: 0;
       background: rgba(0,0,0,0.25);
@@ -1073,8 +1107,8 @@
       </div>
 
       <div id="restock-settings">
-        <label>Lead time (days)
-          <input id="setting-lead-time" type="number" min="1" max="365">
+        <label title="Days you need at origin to pack + hand off to the freight forwarder before a shipment physically dispatches">Prep lead time (days)
+          <input id="setting-prep-lead" type="number" min="0" max="90">
         </label>
         <label>MOQ
           <input id="setting-moq" type="number" min="1">
@@ -1097,9 +1131,10 @@
               <th class="num">Inbound</th>
               <th class="num">30-day forecast</th>
               <th>Days of cover</th>
-              <th title="Latest date to order if shipping by air (fast — 24h transit)">Order by (air)</th>
-              <th title="Latest date to order if shipping by sea (slow — 2 months transit)">Order by (sea)</th>
-              <th class="num">Suggested PO</th>
+              <th title="Projected stockout date given on-hand + inbound shipments − daily demand">Stockout on</th>
+              <th title="Latest date to start prepping a shipment via air freight (fast — ~10d transit + prep)">Ship by (Air)</th>
+              <th title="Latest date to start prepping a shipment via ocean freight (slow — ~45d transit + prep)">Ship by (Ocean)</th>
+              <th class="num">Suggested qty</th>
             </tr>
           </thead>
           <tbody id="restock-body"></tbody>
@@ -1726,7 +1761,7 @@
     const restockSettingsToggle = document.getElementById('restock-settings-toggle');
     const restockSettingsPanel = document.getElementById('restock-settings');
     let restockCache = [];  // last fetch — re-rendered on toggle
-    const settingLead = document.getElementById('setting-lead-time');
+    const settingPrepLead = document.getElementById('setting-prep-lead');
     const settingMoq = document.getElementById('setting-moq');
     const settingCover = document.getElementById('setting-target-cover');
     const settingSvc = document.getElementById('setting-service-level');
@@ -1867,14 +1902,21 @@
         const tr = document.createElement('tr');
         tr.dataset.sku = row.sku;
         const docCls = urgencyClass(row.days_of_cover);
+        const inboundTip = row.inbound_shipments_count
+          ? `${row.inbound_shipments_count} in-flight shipment${row.inbound_shipments_count === 1 ? '' : 's'}` +
+            (row.next_shipment_eta ? ` (next ETA ${row.next_shipment_eta})` : '')
+          : 'No in-flight shipments';
+        const airTip = `${row.air_transit_days ?? 10}d transit + ${row.prep_lead_time_days ?? 7}d prep`;
+        const oceanTip = `${row.ocean_transit_days ?? 45}d transit + ${row.prep_lead_time_days ?? 7}d prep`;
         tr.innerHTML = `
           <td><strong>${escapeHtml(row.sku)}</strong></td>
           <td class="num">${row.on_hand ?? 0}</td>
-          <td class="num">${row.inbound ?? 0}</td>
+          <td class="num" title="${inboundTip}">${row.inbound ?? 0}</td>
           <td class="num">${row.next_30_day_forecast ?? 0}</td>
           <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>
-          <td title="Assumes ${row.air_lead_time_days ?? 1}d transit">${row.reorder_by_date_air ?? '—'}</td>
-          <td title="Assumes ${row.sea_lead_time_days ?? 60}d transit">${row.reorder_by_date_sea ?? '—'}</td>
+          <td>${row.stockout_date ?? '—'}</td>
+          <td title="${airTip}">${row.reorder_by_date_air ?? '—'}</td>
+          <td title="${oceanTip}">${row.reorder_by_date_ocean ?? row.reorder_by_date_sea ?? '—'}</td>
           <td class="num"><strong>${row.recommended_po_qty ?? 0}</strong></td>
         `;
         tr.addEventListener('click', () => openSkuDrawer(row.sku));
@@ -1939,7 +1981,7 @@
         const r = await fetch('/forecasting/settings', { headers: authHeaders() });
         if (!r.ok) return;
         const s = await r.json();
-        settingLead.value = s.lead_time_days;
+        settingPrepLead.value = s.prep_lead_time_days ?? 7;
         settingMoq.value = s.moq;
         settingCover.value = s.target_cover_days;
         settingSvc.value = s.service_level;
@@ -1954,7 +1996,7 @@
           method: 'PUT',
           headers: authHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({
-            lead_time_days: Number(settingLead.value),
+            prep_lead_time_days: Number(settingPrepLead.value),
             moq: Number(settingMoq.value),
             target_cover_days: Number(settingCover.value),
             service_level: Number(settingSvc.value),
@@ -1962,6 +2004,9 @@
         });
         settingSave.textContent = 'Saved';
         setTimeout(() => { settingSave.textContent = 'Save'; settingSave.disabled = false; }, 900);
+        // Recompute so the ship-by dates reflect the new prep lead time.
+        await fetch('/forecasting/refresh', { method: 'POST', headers: authHeaders() });
+        await loadRestock();
       } catch (err) {
         alert(`Save failed: ${err}`);
         settingSave.textContent = 'Save';
@@ -2435,18 +2480,41 @@
         }
         const reorder = data.reorder || {};
         const drivers = data.drivers || {};
+        const shipments = data.inbound_shipments || [];
+        const airTransit = reorder.air_transit_days ?? 10;
+        const oceanTransit = reorder.ocean_transit_days ?? 45;
+        const prepLead = reorder.prep_lead_time_days ?? 7;
+        const shipmentsHtml = shipments.length ? `
+          <div class="sku-shipments">
+            <div class="sku-shipments-title">In-flight shipments (${shipments.length})</div>
+            <table>
+              <thead><tr><th>Shipment</th><th>Status</th><th>Mode</th><th>Qty</th><th>ETA</th></tr></thead>
+              <tbody>
+                ${shipments.map(s => `
+                  <tr>
+                    <td>${escapeHtml(s.name || s.shipment_id || '—')}</td>
+                    <td>${escapeHtml(s.display_status || s.status || '—')}</td>
+                    <td><span class="mode-badge mode-${escapeHtml(s.mode || 'ground')}">${escapeHtml(s.mode || 'ground')}</span></td>
+                    <td class="num">${s.qty_outstanding ?? 0}</td>
+                    <td>${escapeHtml(s.eta || '—')}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        ` : `<div class="sku-shipments-empty">No in-flight inbound shipments for this SKU.</div>`;
         drawerKV.innerHTML = `
           <div><span>Method</span><span>${escapeHtml(data.method || '—')}</span></div>
           <div><span>Recent avg</span><span>${drivers.recent_avg ?? 0}/day</span></div>
           <div><span>On hand</span><span>${reorder.on_hand ?? 0}</span></div>
-          <div><span>Inbound</span><span>${reorder.inbound ?? 0}</span></div>
+          <div><span>Inbound (outstanding)</span><span>${reorder.inbound ?? 0}</span></div>
           <div><span>Days of cover</span><span>${reorder.days_of_cover ?? '—'}</span></div>
-          <div><span>Order by (air, ${reorder.air_lead_time_days ?? 1}d transit)</span><span>${reorder.reorder_by_date_air ?? '—'}</span></div>
-          <div><span>Order by (sea, ${reorder.sea_lead_time_days ?? 60}d transit)</span><span>${reorder.reorder_by_date_sea ?? '—'}</span></div>
-          <div><span>Safety stock</span><span>${reorder.safety_stock ?? 0}</span></div>
-          <div><span>Reorder point</span><span>${reorder.reorder_point ?? 0}</span></div>
-          <div><span>Recommended PO</span><span>${reorder.recommended_po_qty ?? 0}</span></div>
-          <div><span>MOQ / lead time</span><span>${reorder.moq ?? 1} / ${reorder.lead_time_days ?? '?'}d</span></div>
+          <div><span>Projected stockout</span><span>${reorder.stockout_date ?? 'not within horizon'}</span></div>
+          <div><span>Ship by Air (${airTransit}d transit + ${prepLead}d prep)</span><span>${reorder.reorder_by_date_air ?? '—'}</span></div>
+          <div><span>Ship by Ocean (${oceanTransit}d transit + ${prepLead}d prep)</span><span>${reorder.reorder_by_date_ocean ?? reorder.reorder_by_date_sea ?? '—'}</span></div>
+          <div><span>Suggested next-shipment qty</span><span>${reorder.recommended_po_qty ?? 0}</span></div>
+          <div><span>MOQ / target cover</span><span>${reorder.moq ?? 1} / ${reorder.target_cover_days ?? '?'}d</span></div>
+          ${shipmentsHtml}
         `;
         // Build a continuous timeline: 90 days of historical actuals,
         // then the 90-day forecast. We densify the history (fill missing

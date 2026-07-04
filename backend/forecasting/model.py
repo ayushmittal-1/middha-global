@@ -27,6 +27,7 @@ from bson import ObjectId
 
 from database import (
     _forecast_cache,
+    active_inbound_shipments_for_user,
     get_forecast_settings_for_user,
     get_sales_daily_for_user,
     latest_inventory_for_user,
@@ -289,6 +290,8 @@ async def refresh_forecasts_for_user(
 
     inv_map = await latest_inventory_for_user(user_id)
     settings = await get_forecast_settings_for_user(user_id)
+    # Pulled once; each SKU's shipments feed the stockout timeline sim.
+    shipments_by_sku = await active_inbound_shipments_for_user(user_id)
 
     written = 0
     methods: dict[str, int] = {}
@@ -302,6 +305,7 @@ async def refresh_forecasts_for_user(
         result["horizon_days"] = horizon
         result["reorder"] = compute_reorder(
             result["forecast"], inv_map.get(sku), result["drivers"], settings,
+            shipments=shipments_by_sku.get(sku, []),
             today=today,
         )
         await upsert_forecast_cache(user_id, sku, result)

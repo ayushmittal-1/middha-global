@@ -1,18 +1,31 @@
 """
 Reorder math — pure functions, no I/O.
 
-Takes a forecast (output of `model.py`), the current inventory snapshot,
-and the user's forecast settings; returns the reorder fields the dashboard
-and the agent surface.
+The Restock tab used to frame reorder dates as "when the seller places a PO
+with their supplier", using a coarse per-org lead time. That was wrong for
+FBA sellers: they don't manage supplier POs through this app, they manage
+what's already in transit to Amazon.
 
-Formulas:
-- safety_stock = z(service_level) * std(daily_demand) * sqrt(lead_time)
-- reorder_point = avg_daily_demand_over_lead_time * lead_time + safety_stock
-- days_of_cover = (on_hand + inbound) / avg_daily_demand
-- reorder_by_date = today + max(0, days_of_cover - lead_time) days
-- recommended_po_qty = max(0, ceil(target_cover_days * avg_daily -
-                                   on_hand - inbound - safety_stock))
-  rounded up to the next MOQ multiple.
+The new model:
+
+  1. Read the seller's current on-hand at FBA.
+  2. Walk every in-flight inbound shipment (from Aurora's `shipments`
+     collection) — each has an ETA and outstanding units per SKU.
+  3. Simulate the stock timeline: start at on_hand today, deplete at the
+     forecasted daily demand, add each shipment's outstanding units on its
+     ETA. Find the first day the balance hits zero — the `stockout_date`.
+  4. Ship-by-air date  = stockout_date − AIR_TRANSIT_DAYS   − prep_lead
+     Ship-by-ocean date = stockout_date − OCEAN_TRANSIT_DAYS − prep_lead
+
+`prep_lead_time_days` is the seller-configurable handling time between
+"decide to ship" and "shipment physically departs" (packing, freight
+forwarder hand-off). AIR/OCEAN transit constants are the time from
+dispatch → arrival at the Amazon FC.
+
+Safety stock is intentionally zero — the seller asked to be alerted at
+pure depletion, and the timeline sim already accounts for real inbound.
+`recommended_po_qty` targets `target_cover_days` of forward demand net of
+what's already inbound.
 """
 
 from __future__ import annotations
@@ -21,17 +34,17 @@ import math
 from datetime import datetime, timedelta, timezone
 
 
-# ── Shipping-mode lead times ─────────────────────────────────────────────
-# How long an inbound order takes to arrive at Amazon FBA after the PO is
-# placed. Used to derive two reorder-by dates the client sees on the
-# Restock tab: one if they intend to airfreight the restock, one if they
-# ship by sea. Tweak these to match your supplier's real transit times.
-AIR_LEAD_TIME_DAYS = 1     # 24 hours — express/air freight
-SEA_LEAD_TIME_DAYS = 60    # 2 months — sea freight
+# ── Transit time constants ───────────────────────────────────────────────
+# Time from the seller's origin to Amazon FC once a shipment physically
+# dispatches. Rough China → US defaults; per-org override via forecast
+# settings can come later.
+AIR_TRANSIT_DAYS = 10
+OCEAN_TRANSIT_DAYS = 45
 
 
-# Common service levels → z-scores. We snap to the nearest bucket rather
-# than carrying scipy as a dependency for this single lookup.
+# Common service levels → z-scores. Kept for backwards compat with the
+# response shape — safety stock is no longer applied but the coefficient
+# is still surfaced in case a future feature wants it.
 _Z_TABLE: list[tuple[float, float]] = [
     (0.80, 0.84), (0.85, 1.04), (0.90, 1.28),
     (0.95, 1.65), (0.975, 1.96), (0.99, 2.33),
@@ -50,107 +63,218 @@ def _round_up_to_moq(qty: float, moq: int) -> int:
     return moq * math.ceil(qty / moq)
 
 
+# ── Shipment mode inference ─────────────────────────────────────────────
+
+# Case-insensitive substring keywords. Matched against Aurora's stored
+# `carrierName` (which is populated for shipped shipments and often for
+# WORKING ones too). `ocean` wins ties over `air` because carriers like
+# "OceanX Air" don't exist — ocean keywords are more specific.
+_AIR_KEYWORDS = (
+    "air", "express", "dhl", "fedex", "sf express", "aramex", "tnt",
+    "ups worldwide", "ups saver",
+)
+_OCEAN_KEYWORDS = (
+    "ocean", "sea", "fcl", "lcl", "maersk", "msc", "cosco", "hapag",
+    "yang ming", "cma cgm", "one line", "evergreen",
+)
+
+
+def infer_shipment_mode(carrier_name: str) -> str:
+    """Return 'air' | 'ocean' | 'ground'. Ground is the fallback for
+    empty carriers and Amazon-partnered/small-parcel domestic runs."""
+    hay = (carrier_name or "").lower().strip()
+    if not hay:
+        return "ground"
+    if any(k in hay for k in _OCEAN_KEYWORDS):
+        return "ocean"
+    if any(k in hay for k in _AIR_KEYWORDS):
+        return "air"
+    return "ground"
+
+
+# ── Stockout timeline simulation ────────────────────────────────────────
+
+def _simulate_stockout_date(
+    on_hand: int,
+    daily_demand: float,
+    shipments: list[dict],
+    today: datetime,
+    horizon_days: int = 365,
+) -> datetime | None:
+    """Walk the stock balance from `today` forward. Deplete at `daily_demand`
+    per day and top up on each shipment's ETA. Return the first date the
+    balance would hit zero, or None if it doesn't within horizon_days.
+
+    `shipments` is a list of {eta: datetime, qty_outstanding: int}, already
+    sorted by ETA.
+    """
+    if daily_demand <= 0:
+        # No demand → never stocks out (this is what "no demand" SKUs hit).
+        return None
+
+    balance = float(on_hand)
+    cursor_day = today
+
+    for shp in shipments:
+        eta = shp["eta"]
+        if eta <= cursor_day:
+            # Late/current arrivals — treat as landing at the cursor.
+            balance += shp["qty_outstanding"]
+            continue
+        days_between = (eta - cursor_day).total_seconds() / 86400.0
+        depletion = days_between * daily_demand
+        if balance - depletion <= 0:
+            # Stockout falls in this interval.
+            days_until = balance / daily_demand
+            return cursor_day + timedelta(days=math.ceil(days_until))
+        balance -= depletion
+        balance += shp["qty_outstanding"]
+        cursor_day = eta
+
+    # No more shipments — extrapolate.
+    days_until = balance / daily_demand
+    if days_until > horizon_days:
+        return None
+    return cursor_day + timedelta(days=math.ceil(days_until))
+
+
+# ── Main entry point ────────────────────────────────────────────────────
+
 def compute_reorder(
     forecast: list[dict],
     inv_snapshot: dict | None,
     drivers: dict,
     settings: dict,
+    shipments: list[dict] | None = None,
     today: datetime | None = None,
 ) -> dict:
-    """All four reorder fields plus the supporting numbers the UI shows.
+    """All reorder fields the dashboard / drawer / agent surface.
 
-    `forecast` is the list-of-dicts emitted by `model.py` (each row has
-    `p50`). `inv_snapshot` is one row from `inventorySnapshot` or None
-    (treated as zero). `drivers.recent_std` is used for the safety-stock
-    sigma — that's the std of observed daily demand, which is what the
-    standard formula wants (not the forecast spread).
+    Parameters
+    ----------
+    forecast : list of dicts with `p50` — output of model.py.
+    inv_snapshot : one row from products.inventory (via
+        latest_inventory_for_user) or None.
+    drivers : forecast drivers dict — used for `recent_avg` PO ceiling.
+    settings : forecast settings (lead_time_days, prep_lead_time_days,
+        moq, target_cover_days, service_level).
+    shipments : per-SKU active inbound shipments, each
+        {shipment_id, eta, qty_outstanding, mode, carrier_name, status}.
+        Empty list = no shipments in-flight for this SKU.
     """
     if today is None:
         today = datetime.now(timezone.utc)
+    # Normalise `today` to midnight UTC so the returned dates align with
+    # the frontend's day-granularity display.
+    today = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
 
-    lead_time = int(settings.get("lead_time_days", 30))
     moq = int(settings.get("moq", 1))
     target_cover = int(settings.get("target_cover_days", 90))
     service_level = float(settings.get("service_level", 0.95))
+    prep_lead = int(settings.get("prep_lead_time_days", 7))
+
+    shipments = shipments or []
 
     on_hand = int((inv_snapshot or {}).get("fulfillable", 0))
-    inbound = int((inv_snapshot or {}).get("inbound_working", 0)) + \
-              int((inv_snapshot or {}).get("inbound_shipped", 0))
+    inbound_outstanding = sum(int(s.get("qty_outstanding", 0)) for s in shipments)
 
     horizon_p50 = [float(r.get("p50", 0)) for r in forecast]
+    empty_response = {
+        "on_hand": on_hand,
+        "inbound": inbound_outstanding,
+        "avg_daily_demand": 0.0,
+        "safety_stock": 0,
+        "reorder_point": 0,
+        "days_of_cover": None,
+        "stockout_date": None,
+        "reorder_by_date": None,
+        "reorder_by_date_air": None,
+        "reorder_by_date_ocean": None,
+        "reorder_by_date_sea": None,  # legacy alias
+        "air_transit_days": AIR_TRANSIT_DAYS,
+        "ocean_transit_days": OCEAN_TRANSIT_DAYS,
+        "prep_lead_time_days": prep_lead,
+        "recommended_po_qty": 0,
+        "service_level": service_level,
+        "moq": moq,
+        "target_cover_days": target_cover,
+        "inbound_shipments_count": len(shipments),
+        "next_shipment_eta": (
+            shipments[0]["eta"].date().isoformat() if shipments else None
+        ),
+    }
     if not horizon_p50:
-        return {
-            "on_hand": on_hand, "inbound": inbound,
-            "avg_daily_demand": 0.0, "safety_stock": 0,
-            "reorder_point": 0, "days_of_cover": None,
-            "reorder_by_date": None, "recommended_po_qty": 0,
-        }
+        return empty_response
 
-    lead = horizon_p50[:lead_time] or horizon_p50
-    avg_daily_lead = sum(lead) / len(lead)
     avg_daily_overall = sum(horizon_p50) / len(horizon_p50)
 
-    sigma = float(drivers.get("recent_std", 0.0))
-    safety_stock = _z(service_level) * sigma * math.sqrt(max(lead_time, 1))
+    days_of_cover: float | None = None
+    if avg_daily_overall > 0:
+        days_of_cover = (on_hand + inbound_outstanding) / avg_daily_overall
 
-    reorder_point = avg_daily_lead * lead_time + safety_stock
+    stockout_dt = _simulate_stockout_date(
+        on_hand=on_hand,
+        daily_demand=avg_daily_overall,
+        shipments=shipments,
+        today=today,
+    )
+    stockout_date = stockout_dt.date().isoformat() if stockout_dt else None
 
-    available = on_hand + inbound
-    days_of_cover = (available / avg_daily_overall) if avg_daily_overall > 0 else None
+    def _ship_by(transit_days: int) -> str | None:
+        if stockout_dt is None:
+            return None
+        buffer = timedelta(days=transit_days + prep_lead)
+        latest = stockout_dt - buffer
+        # Clamp negative values ("you're already too late") to today so
+        # the seller sees "ship NOW" rather than a past date.
+        if latest < today:
+            latest = today
+        return latest.date().isoformat()
 
-    reorder_by_date = None
-    reorder_by_date_air = None
-    reorder_by_date_sea = None
-    if days_of_cover is not None:
-        # Original — uses the user's per-org lead_time setting. Kept for
-        # backwards compatibility with anything still reading it.
-        slack_days = max(0.0, days_of_cover - lead_time)
-        reorder_by_date = (today + timedelta(days=slack_days)).date().isoformat()
+    reorder_by_date_air = _ship_by(AIR_TRANSIT_DAYS)
+    reorder_by_date_ocean = _ship_by(OCEAN_TRANSIT_DAYS)
 
-        # Air freight (~24h) — very late reorder deadline.
-        slack_air = max(0.0, days_of_cover - AIR_LEAD_TIME_DAYS)
-        reorder_by_date_air = (today + timedelta(days=slack_air)).date().isoformat()
+    # Recommend enough to hit target_cover days after the ocean shipment
+    # arrives, net of what's already inbound. Rough model — good enough
+    # to drive the "how much to ship" column.
+    target_units = target_cover * avg_daily_overall
+    raw_po = target_units - (on_hand + inbound_outstanding)
 
-        # Sea freight (~2 months) — much earlier deadline. If DoC ≤ lead
-        # time, slack is 0 and the date is today ("order NOW to avoid a
-        # stockout even at the fastest possible sea transit").
-        slack_sea = max(0.0, days_of_cover - SEA_LEAD_TIME_DAYS)
-        reorder_by_date_sea = (today + timedelta(days=slack_sea)).date().isoformat()
-
-    target_units = target_cover * avg_daily_overall + safety_stock
-    raw_po = target_units - available
-
-    # Sanity ceiling — Prophet on sparse SKUs can project an exponential
-    # recovery and balloon the recommendation into the thousands. Cap
-    # against the recent 28-day rate × 180 days (≈ 6 months), with a
-    # token floor for low-velocity SKUs and a hard floor when there's
-    # been zero recent demand at all.
+    # Sanity ceiling — same guard as before. Prophet on sparse SKUs can
+    # balloon the projection; cap against recent 28-day rate × 180 days.
     recent_avg = float(drivers.get("recent_avg") or 0)
     if recent_avg > 0:
         ceiling = max(recent_avg * 180.0, 50.0)
     else:
-        # No demand in the last 28 days → don't recommend more than a
-        # token reorder, even if the historical fit is high.
         ceiling = 30.0
     raw_po = min(raw_po, ceiling)
     recommended_po_qty = _round_up_to_moq(raw_po, moq)
 
     return {
         "on_hand": on_hand,
-        "inbound": inbound,
+        "inbound": inbound_outstanding,
         "avg_daily_demand": round(avg_daily_overall, 2),
-        "avg_daily_demand_lead": round(avg_daily_lead, 2),
-        "safety_stock": int(math.ceil(safety_stock)),
-        "reorder_point": int(math.ceil(reorder_point)),
+        # Safety stock kept in the response for backwards compat, but the
+        # sim uses pure depletion so we report zero here.
+        "safety_stock": 0,
+        "reorder_point": int(math.ceil(avg_daily_overall * (AIR_TRANSIT_DAYS + prep_lead))),
         "days_of_cover": round(days_of_cover, 1) if days_of_cover is not None else None,
-        "reorder_by_date": reorder_by_date,
+        "stockout_date": stockout_date,
+        # Legacy field — some agent code still reads it. Point at the
+        # ocean date since that's the earlier / more conservative one.
+        "reorder_by_date": reorder_by_date_ocean,
         "reorder_by_date_air": reorder_by_date_air,
-        "reorder_by_date_sea": reorder_by_date_sea,
-        "air_lead_time_days": AIR_LEAD_TIME_DAYS,
-        "sea_lead_time_days": SEA_LEAD_TIME_DAYS,
+        "reorder_by_date_ocean": reorder_by_date_ocean,
+        "reorder_by_date_sea": reorder_by_date_ocean,  # legacy alias
+        "air_transit_days": AIR_TRANSIT_DAYS,
+        "ocean_transit_days": OCEAN_TRANSIT_DAYS,
+        "prep_lead_time_days": prep_lead,
         "recommended_po_qty": recommended_po_qty,
         "service_level": service_level,
-        "lead_time_days": lead_time,
         "moq": moq,
         "target_cover_days": target_cover,
+        "inbound_shipments_count": len(shipments),
+        "next_shipment_eta": (
+            shipments[0]["eta"].date().isoformat() if shipments else None
+        ),
     }

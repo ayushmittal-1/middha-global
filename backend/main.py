@@ -30,6 +30,7 @@ from database import (
     update_forecast_settings,
     get_forecast_cache,
     get_sales_daily,
+    active_inbound_shipments_for_user,
 )
 from forecasting.ingest import (
     backfill_user,
@@ -335,11 +336,16 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "inbound": reorder.get("inbound", 0),
             "next_30_day_forecast": round(next30, 1),
             "days_of_cover": reorder.get("days_of_cover"),
+            "stockout_date": reorder.get("stockout_date"),
             "reorder_by_date": reorder.get("reorder_by_date"),
             "reorder_by_date_air": reorder.get("reorder_by_date_air"),
-            "reorder_by_date_sea": reorder.get("reorder_by_date_sea"),
-            "air_lead_time_days": reorder.get("air_lead_time_days"),
-            "sea_lead_time_days": reorder.get("sea_lead_time_days"),
+            "reorder_by_date_ocean": reorder.get("reorder_by_date_ocean"),
+            "reorder_by_date_sea": reorder.get("reorder_by_date_sea"),  # legacy alias
+            "air_transit_days": reorder.get("air_transit_days"),
+            "ocean_transit_days": reorder.get("ocean_transit_days"),
+            "prep_lead_time_days": reorder.get("prep_lead_time_days"),
+            "inbound_shipments_count": reorder.get("inbound_shipments_count", 0),
+            "next_shipment_eta": reorder.get("next_shipment_eta"),
             "recommended_po_qty": reorder.get("recommended_po_qty", 0),
             "drivers": c.get("drivers"),
         })
@@ -376,6 +382,24 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
         for r in raw_history
     ]
 
+    from bson import ObjectId as _OID
+    shipments_by_sku = await active_inbound_shipments_for_user(
+        _OID(str(user["_id"])),
+    )
+    shipments = [
+        {
+            "shipment_id": s.get("shipment_id"),
+            "name": s.get("name"),
+            "status": s.get("status"),
+            "display_status": s.get("display_status"),
+            "eta": s["eta"].date().isoformat() if s.get("eta") else None,
+            "qty_outstanding": s.get("qty_outstanding"),
+            "carrier_name": s.get("carrier_name"),
+            "mode": s.get("mode"),
+        }
+        for s in shipments_by_sku.get(sku, [])
+    ]
+
     return {
         "sku": sku,
         "method": c.get("method"),
@@ -385,6 +409,7 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
         "reorder": c.get("reorder"),
         "forecast": c.get("forecast"),
         "history": history,
+        "inbound_shipments": shipments,
     }
 
 
