@@ -198,6 +198,9 @@ def compute_reorder(
         "next_shipment_eta": (
             shipments[0]["eta"].date().isoformat() if shipments else None
         ),
+        "next_shipment_qty": (
+            int(shipments[0]["qty_outstanding"]) if shipments else None
+        ),
     }
     if not horizon_p50:
         return empty_response
@@ -270,5 +273,8 @@ def compute_reorder(
         "inbound_shipments_count": len(shipments),
         "next_shipment_eta": (
             shipments[0]["eta"].date().isoformat() if shipments else None
+        ),
+        "next_shipment_qty": (
+            int(shipments[0]["qty_outstanding"]) if shipments else None
         ),
     }

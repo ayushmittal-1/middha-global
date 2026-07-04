@@ -334,6 +334,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
             "on_hand": reorder.get("on_hand", 0),
             "inbound": reorder.get("inbound", 0),
+            "avg_daily_demand": reorder.get("avg_daily_demand", 0),
             "next_30_day_forecast": round(next30, 1),
             "days_of_cover": reorder.get("days_of_cover"),
             "stockout_date": reorder.get("stockout_date"),
@@ -345,6 +346,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "ocean_transit_days": reorder.get("ocean_transit_days"),
             "inbound_shipments_count": reorder.get("inbound_shipments_count", 0),
             "next_shipment_eta": reorder.get("next_shipment_eta"),
+            "next_shipment_qty": reorder.get("next_shipment_qty"),
             "recommended_po_qty": reorder.get("recommended_po_qty", 0),
             "drivers": c.get("drivers"),
         })

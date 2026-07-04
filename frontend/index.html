@@ -897,6 +897,17 @@
     .mode-air { background: #e3f2fd; color: #1565c0; }
     .mode-ocean { background: #e0f7fa; color: #00695c; }
     .mode-ground { background: #f1f0f5; color: #555; }
+    .next-arrival {
+      display: inline-flex; align-items: baseline; gap: 6px;
+      font-size: 12px; color: #1a1a2e;
+      background: #eef4ff; padding: 3px 8px; border-radius: 6px;
+      white-space: nowrap;
+    }
+    .next-arrival strong { color: #1a1a2e; font-weight: 700; }
+    .next-arrival-more {
+      font-size: 10px; color: #6b7bbf; font-weight: 500;
+    }
+    .next-arrival-none { color: #bbb; }
     #sku-drawer-overlay {
       position: fixed; inset: 0;
       background: rgba(0,0,0,0.25);
@@ -1122,7 +1133,9 @@
             <tr>
               <th>SKU</th>
               <th class="num">On hand</th>
-              <th class="num">Inbound</th>
+              <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th>
+              <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next arrival</th>
+              <th class="num" title="Forecasted average orders per day (drives the stockout timeline and ship-by dates)">Orders/day</th>
               <th class="num">30-day forecast</th>
               <th>Days of cover</th>
               <th title="Projected stockout date given on-hand + inbound shipments − daily demand">Stockout on</th>
@@ -1894,16 +1907,23 @@
         const tr = document.createElement('tr');
         tr.dataset.sku = row.sku;
         const docCls = urgencyClass(row.days_of_cover);
-        const inboundTip = row.inbound_shipments_count
-          ? `${row.inbound_shipments_count} in-flight shipment${row.inbound_shipments_count === 1 ? '' : 's'}` +
-            (row.next_shipment_eta ? ` (next ETA ${row.next_shipment_eta})` : '')
-          : 'No in-flight shipments';
+        const inboundCount = row.inbound_shipments_count ?? 0;
+        const inboundTip = inboundCount
+          ? `${inboundCount} in-flight shipment${inboundCount === 1 ? '' : 's'} feeding the projection`
+          : 'No in-flight shipments — projection uses on-hand + demand only';
+        const nextArrivalCell = row.next_shipment_eta
+          ? `<span class="next-arrival"><strong>${row.next_shipment_qty ?? 0}</strong> by ${row.next_shipment_eta}` +
+            (inboundCount > 1 ? ` <span class="next-arrival-more">+${inboundCount - 1} more</span>` : '') +
+            `</span>`
+          : `<span class="next-arrival-none">—</span>`;
         const airTip = `Dispatch by this date — ${row.air_transit_days ?? 10}d air transit to Amazon FC`;
         const oceanTip = `Dispatch by this date — ${row.ocean_transit_days ?? 45}d ocean transit to Amazon FC`;
         tr.innerHTML = `
           <td><strong>${escapeHtml(row.sku)}</strong></td>
           <td class="num">${row.on_hand ?? 0}</td>
           <td class="num" title="${inboundTip}">${row.inbound ?? 0}</td>
+          <td title="${inboundTip}">${nextArrivalCell}</td>
+          <td class="num">${(row.avg_daily_demand ?? 0).toFixed(2)}</td>
           <td class="num">${row.next_30_day_forecast ?? 0}</td>
           <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>
           <td>${row.stockout_date ?? '—'}</td>
@@ -1940,7 +1960,7 @@
         }
         renderRestockRows();
       } catch (err) {
-        restockBodyEl.innerHTML = `<tr><td colspan="7" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
+        restockBodyEl.innerHTML = `<tr><td colspan="11" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
       }
     }
 
