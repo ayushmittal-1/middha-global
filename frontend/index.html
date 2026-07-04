@@ -869,6 +869,128 @@
       display: none; z-index: 800;
     }
     #sku-drawer-overlay.visible { display: block; }
+
+    /* ── Embedded in Aurora dashboard (must be last) ───── */
+    body.embedded-in-aurora {
+      height: 100%;
+      min-height: 100%;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    body.embedded-in-aurora #sidebar {
+      width: 240px;
+      background: #0b1220;
+      border-right: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    body.embedded-in-aurora #sidebar-header { padding: 12px; }
+    body.embedded-in-aurora #new-chat-btn {
+      background: rgba(30, 139, 255, 0.16);
+      border-color: rgba(30, 139, 255, 0.35);
+      color: #dbeafe;
+      border-radius: 10px;
+      font-weight: 600;
+    }
+    body.embedded-in-aurora #new-chat-btn:hover { background: rgba(30, 139, 255, 0.28); }
+    body.embedded-in-aurora .session-item { border-radius: 10px; color: #cbd5e1; }
+    body.embedded-in-aurora .session-item:hover,
+    body.embedded-in-aurora .session-item.active {
+      background: rgba(30, 139, 255, 0.14);
+      color: #fff;
+    }
+    body.embedded-in-aurora #cogs-panel,
+    body.embedded-in-aurora #sidebar-footer,
+    body.embedded-in-aurora #main > header {
+      display: none !important;
+    }
+    body.embedded-in-aurora #main { background: #0f172a; }
+    body.embedded-in-aurora #tab-nav {
+      background: #111827;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      gap: 4px;
+      padding: 8px 12px 0;
+      overflow-x: auto;
+    }
+    body.embedded-in-aurora .tab-btn {
+      background: transparent !important;
+      color: #94a3b8 !important;
+      border: none !important;
+      border-bottom: 2px solid transparent !important;
+      border-radius: 8px 8px 0 0;
+      padding: 10px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    body.embedded-in-aurora .tab-btn:hover {
+      color: #e2e8f0 !important;
+      background: rgba(255, 255, 255, 0.04) !important;
+    }
+    body.embedded-in-aurora .tab-btn.active {
+      color: #93c5fd !important;
+      border-bottom-color: #1e8bff !important;
+      background: rgba(30, 139, 255, 0.1) !important;
+    }
+    body.embedded-in-aurora #chat-container,
+    body.embedded-in-aurora #restock-view,
+    body.embedded-in-aurora #orders-view,
+    body.embedded-in-aurora #campaigns-view,
+    body.embedded-in-aurora #profit-view,
+    body.embedded-in-aurora #cogs-view {
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    body.embedded-in-aurora .welcome { color: #94a3b8; margin-top: 48px; }
+    body.embedded-in-aurora .welcome h2 { color: #f8fafc !important; font-size: 1.35rem; }
+    body.embedded-in-aurora .message.user {
+      background: linear-gradient(135deg, #1e8bff, #2563eb);
+      color: #fff;
+      box-shadow: 0 6px 16px rgba(37, 99, 235, 0.25);
+    }
+    body.embedded-in-aurora .message.assistant {
+      background: #1e293b;
+      color: #e2e8f0;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      box-shadow: none;
+    }
+    body.embedded-in-aurora .message.assistant.streaming { border-left: 3px solid #1e8bff; }
+    body.embedded-in-aurora .tool-result-card {
+      background: #111827;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-left: 4px solid #1e8bff;
+      color: #cbd5e1;
+    }
+    body.embedded-in-aurora .tool-result-header { color: #93c5fd; }
+    body.embedded-in-aurora .tool-result-body { color: #cbd5e1; }
+    body.embedded-in-aurora .tool-indicator { color: #93c5fd; }
+    body.embedded-in-aurora #input-area {
+      background: #111827;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 14px 18px;
+    }
+    body.embedded-in-aurora #message-input {
+      background: #0f172a;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: #f8fafc;
+      border-radius: 12px;
+    }
+    body.embedded-in-aurora #message-input::placeholder { color: #64748b; }
+    body.embedded-in-aurora #message-input:focus {
+      border-color: #1e8bff;
+      box-shadow: 0 0 0 3px rgba(30, 139, 255, 0.18);
+    }
+    body.embedded-in-aurora #send-btn {
+      background: #1e8bff;
+      border-radius: 12px;
+      padding: 12px 20px;
+    }
+    body.embedded-in-aurora #send-btn:hover { background: #1570d4; }
+    body.embedded-in-aurora #send-btn:disabled { background: #334155; color: #94a3b8; }
+    body.embedded-in-aurora table,
+    body.embedded-in-aurora th,
+    body.embedded-in-aurora td {
+      color: #e2e8f0;
+      border-color: rgba(255, 255, 255, 0.08);
+    }
   </style>
 </head>
 <body>
@@ -913,7 +1035,7 @@
   <!-- Main chat area -->
   <div id="main">
     <header>
-      <span>&#128202;</span> Campaign QA Chatbot
+      <span>&#128202;</span> Aurora AI Assistant
     </header>
 
     <nav id="tab-nav">
@@ -1173,6 +1295,28 @@
     // so no CORS. It verifies the password against the shared Mongo users
     // collection and issues a JWT signed with Aurora's JWT_SECRET, so the
     // resulting token works against Aurora as well.
+    //
+    // When embedded in Aurora (`?token=<jwt>&embedded=1`), we accept the
+    // parent app's session and skip the login overlay.
+    const urlParams = new URLSearchParams(location.search);
+    const isEmbedded = urlParams.get('embedded') === '1' || window.self !== window.top;
+
+    function bootstrapTokenFromAurora() {
+      const tokenFromQuery = (urlParams.get('token') || '').trim();
+      if (tokenFromQuery) {
+        localStorage.setItem('auth_token', tokenFromQuery);
+        const emailFromQuery = (urlParams.get('email') || '').trim();
+        if (emailFromQuery) localStorage.setItem('user_email', emailFromQuery);
+        // Strip secrets from the address bar while keeping embedded mode.
+        const clean = new URL(location.href);
+        clean.searchParams.delete('token');
+        clean.searchParams.delete('email');
+        if (isEmbedded) clean.searchParams.set('embedded', '1');
+        history.replaceState({}, '', clean.pathname + clean.search + clean.hash);
+      }
+    }
+    bootstrapTokenFromAurora();
+
     function getAuthToken() {
       return (localStorage.getItem('auth_token') || '').trim();
     }
@@ -1185,6 +1329,15 @@
       localStorage.removeItem('user_email');
       localStorage.removeItem('session_id');
       if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+      if (isEmbedded) {
+        // Parent Aurora owns the session — ask it to handle logout/navigation.
+        try {
+          window.parent.postMessage({ type: 'aurora-ai-logout' }, '*');
+        } catch (_) {}
+        showLogin();
+        loginError.textContent = 'Session ended. Return to Aurora and open AI Assistant again.';
+        return;
+      }
       location.reload();
     }
     async function loginWithCredentials(email, password) {
@@ -1513,12 +1666,31 @@
     function showLogin() {
       loginOverlay.classList.add('visible');
       loginError.textContent = '';
+      if (isEmbedded) {
+        loginError.textContent = 'Aurora session missing. Open AI Assistant from the Aurora navbar.';
+        loginSubmit.disabled = true;
+        return;
+      }
       const savedEmail = localStorage.getItem('user_email');
       if (savedEmail) loginEmail.value = savedEmail;
       setTimeout(() => (savedEmail ? loginPassword : loginEmail).focus(), 50);
     }
     function hideLogin() {
       loginOverlay.classList.remove('visible');
+    }
+
+    if (isEmbedded) {
+      document.body.classList.add('embedded-in-aurora');
+      const logoutBtn = document.getElementById('logout-btn');
+      if (logoutBtn) logoutBtn.style.display = 'none';
+      const welcome = document.querySelector('.welcome');
+      if (welcome) {
+        welcome.innerHTML = `
+          <h2>How can I help?</h2>
+          Ask about campaigns, orders, inventory, profitability, or restock planning.<br>
+          Try: “Which campaigns have high ACOS?” or “What should I reorder?”
+        `;
+      }
     }
 
     loginForm.addEventListener('submit', async (e) => {

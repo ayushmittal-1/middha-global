@@ -20,7 +20,8 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
 MONGO_URI = os.getenv("MONGO_URI", "")
 JWT_SECRET = os.getenv("JWT_SECRET", "")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "")
+# Aurora's mongoose connection uses the `test` database when the URI has no path.
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "test")
 
 _client: Optional[AsyncIOMotorClient] = None
 
@@ -35,9 +36,7 @@ def _db() -> AsyncIOMotorDatabase:
         raise RuntimeError("MONGO_URI is not configured")
     if _client is None:
         _client = AsyncIOMotorClient(MONGO_URI)
-    if MONGO_DB_NAME:
-        return _client[MONGO_DB_NAME]
-    return _client.get_default_database()
+    return _client[MONGO_DB_NAME or "test"]
 
 
 def _verify_token(token: str) -> dict:

@@ -1254,6 +1254,16 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
       {"type": "error",       "content": "..."}
     The caller is responsible for sending a final {"type": "done"} after iteration.
     """
+    if not (GROQ_API_KEY or "").strip():
+        yield {
+            "type": "error",
+            "content": (
+                "GROQ_API_KEY is not configured. Add it to aiModel/.env, then restart "
+                "the AI service (uvicorn on port 8000)."
+            ),
+        }
+        return
+
     # Ensure session exists in DB; auto-title from first user message
     await create_session(session_id)
     history = await get_messages(session_id)
