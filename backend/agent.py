@@ -883,11 +883,26 @@ async def compute_profitability_data(
     missing_cogs: list[dict] = []
     fee_errors: list[str] = []
 
-    # Product Fees API is 1 req/s sustained (2 burst). Track the last actual
-    # (uncached) call so we pace at ~1.1s spacing without adding latency for
-    # cache hits or SKUs missing an ASIN.
-    last_fees_call_ts = 0.0
-    fees_min_spacing = 1.1
+    # Batch fetch fees for every SKU with an ASIN + price in one shot — one
+    # HTTP call per 20 ASINs vs one per SKU. Amazon caps the batch endpoint
+    # at 0.5 req/s but 20/call = ~10x the throughput of the singleton.
+    fees_by_asin: dict[str, dict] = {}
+    batch_items = [
+        (sku_data[sku]["asin"], sku_data[sku]["revenue"] / sku_data[sku]["units"])
+        for sku in skus
+        if sku_data[sku]["asin"] and sku_data[sku]["units"]
+        and sku_data[sku]["revenue"] > 0
+    ]
+    if batch_items:
+        try:
+            fees_by_asin = await amazon_sp.get_fees_estimates_batch(
+                batch_items, is_fba=True,
+            )
+        except Exception as e:
+            # Whole batch stack tripped — degrade to zero fees for all SKUs
+            # rather than blowing up the whole endpoint. Row-level errors
+            # still surface via `fee_errors`.
+            fee_errors.append(f"batch fees fetch failed: {str(e)[:200]}")
 
     for sku in skus:
         d = sku_data[sku]
@@ -899,17 +914,15 @@ async def compute_profitability_data(
         # Amazon fees per unit at the SKU's average selling price
         referral = fba = fuel = 0.0
         if asin and avg_price > 0:
-            elapsed = time.time() - last_fees_call_ts
-            if last_fees_call_ts and elapsed < fees_min_spacing:
-                await asyncio.sleep(fees_min_spacing - elapsed)
-            try:
-                est = await amazon_sp.get_fees_estimate(asin, avg_price, is_fba=True)
-                referral = est["referral"]
-                fba = est["fba"]
-                fuel = est["fuel_surcharge"]
-            except Exception as e:
-                fee_errors.append(f"{sku} ({asin}): {str(e)[:120]}")
-            last_fees_call_ts = time.time()
+            est = fees_by_asin.get(asin)
+            if est:
+                referral = est.get("referral", 0.0)
+                fba = est.get("fba", 0.0)
+                fuel = est.get("fuel_surcharge", 0.0)
+                if est.get("error"):
+                    fee_errors.append(f"{sku} ({asin}): {str(est['error'])[:120]}")
+            else:
+                fee_errors.append(f"{sku} ({asin}): no estimate returned")
         elif not asin:
             fee_errors.append(f"{sku}: no ASIN found in order items")
 

@@ -411,6 +411,43 @@ async def get_order_items(order_id: str) -> dict:
 # ── Product Fees API (v0) ────────────────────────────────────────────────────
 
 
+def _parse_fees_result(result: dict) -> dict:
+    """Normalize one FeesEstimateResult into the shape callers expect
+    (referral / fba / fuel_surcharge / total etc.). Same logic whether
+    the result came from the singleton or batch endpoint."""
+    estimate = (result.get("FeesEstimate") or {})
+    detail_list = (estimate.get("FeeDetailList") or [])
+    total = (estimate.get("TotalFeesEstimate") or {}).get("Amount") or 0
+    out = {
+        "referral": 0.0,
+        "fba": 0.0,
+        "fuel_surcharge": 0.0,
+        "variable_closing": 0.0,
+        "total": float(total),
+        "breakdown": [],
+        "status": (result.get("Status") or "").lower(),
+        "error": result.get("Error"),
+    }
+    for d in detail_list:
+        ftype = (d.get("FeeType") or "").lower()
+        amount = float(((d.get("FinalFee") or d.get("FeeAmount") or {}).get("Amount")) or 0)
+        out["breakdown"].append({"type": d.get("FeeType"), "amount": amount})
+        if "referralfee" in ftype:
+            out["referral"] += amount
+        elif "fbafees" in ftype or "fulfillmentfees" in ftype:
+            out["fba"] += amount
+        elif "fuelsurcharge" in ftype:
+            out["fuel_surcharge"] += amount
+        elif "variableclosingfee" in ftype:
+            out["variable_closing"] += amount
+    # If Amazon didn't break out a fuel surcharge separately (some categories
+    # bundle it into FBA), derive it per the PDF formula so the breakdown is
+    # always populated.
+    if out["fba"] > 0 and out["fuel_surcharge"] == 0:
+        out["fuel_surcharge"] = round(out["fba"] * 0.035, 4)
+    return out
+
+
 async def get_fees_estimate(
     asin: str,
     price: float,
@@ -449,44 +486,174 @@ async def get_fees_estimate(
     resp = await _sp_request("POST", f"/products/fees/v0/items/{asin}/feesEstimate", body=body)
     payload = resp.get("payload") or {}
     result = payload.get("FeesEstimateResult") or {}
-    estimate = (result.get("FeesEstimate") or {})
-    detail_list = (estimate.get("FeeDetailList") or [])
-    total = (estimate.get("TotalFeesEstimate") or {}).get("Amount") or 0
-
-    out = {
-        "referral": 0.0,
-        "fba": 0.0,
-        "fuel_surcharge": 0.0,
-        "variable_closing": 0.0,
-        "total": float(total),
-        "breakdown": [],
-        "status": (result.get("Status") or "").lower(),
-        "error": result.get("Error"),
-    }
-    for d in detail_list:
-        ftype = (d.get("FeeType") or "").lower()
-        amount = float(((d.get("FinalFee") or d.get("FeeAmount") or {}).get("Amount")) or 0)
-        out["breakdown"].append({"type": d.get("FeeType"), "amount": amount})
-        if "referralfee" in ftype:
-            out["referral"] += amount
-        elif "fbafees" in ftype or "fulfillmentfees" in ftype:
-            out["fba"] += amount
-        elif "fuelsurcharge" in ftype:
-            out["fuel_surcharge"] += amount
-        elif "variableclosingfee" in ftype:
-            out["variable_closing"] += amount
-    # If Amazon didn't break out a fuel surcharge separately (some categories
-    # bundle it into FBA), derive it per the PDF formula so the breakdown is
-    # always populated.
-    if out["fba"] > 0 and out["fuel_surcharge"] == 0:
-        out["fuel_surcharge"] = round(out["fba"] * 0.035, 4)
-        # Don't double-count: leave fba as-is. The "total" Amazon returned
-        # is authoritative; fuel_surcharge here is the explanatory split.
+    out = _parse_fees_result(result)
     # Only cache successful estimates — Amazon returns Status="ClientError"
     # for un-listable ASINs; don't pin those in-memory in case the listing
     # comes back live within the TTL.
     if (out.get("status") or "").lower() == "success" or out["total"] > 0:
         _FEES_ESTIMATE_CACHE[cache_key] = (now_ts, out)
+    return out
+
+
+# Amazon caps the batch endpoint at 20 requests per call.
+_FEES_BATCH_MAX = 20
+# Batch endpoint is 0.5 req/s sustained (2 burst) — 20 ASINs per call means
+# ~10x the throughput of the singleton (1 req/s × 1 ASIN). Pace batches at
+# 2.1s spacing so we stay under the sustained limit.
+_FEES_BATCH_MIN_SPACING_S = 2.1
+_last_fees_batch_ts = 0.0
+
+
+async def get_fees_estimates_batch(
+    items: list[tuple[str, float]],
+    *,
+    is_fba: bool = True,
+    marketplace: str | None = None,
+    currency: str = "USD",
+) -> dict[str, dict]:
+    """Batch variant of get_fees_estimate — one HTTP call per 20 ASINs via
+    /products/fees/v0/feesEstimate. Cache-aware: skips ASINs already in
+    `_FEES_ESTIMATE_CACHE`, so a partial re-request only hits Amazon for
+    the misses.
+
+    Returns a {asin: normalized_estimate_dict} map. ASINs whose batch
+    request errored (unlisted, price out of range, etc.) get a zero-fee
+    dict with `status`/`error` populated so the caller can distinguish
+    "no fees found" from "not queried".
+
+    `items` is a list of (asin, price) tuples. Duplicate ASINs are
+    de-duplicated by (asin, rounded price) — same as the singleton cache
+    key — since Amazon's fee estimate depends on price."""
+    global _last_fees_batch_ts
+    if not items:
+        return {}
+    user = require_user()
+    marketplace_id = resolve_marketplace(user, marketplace, multiple=False)
+    now_ts = time.time()
+    out: dict[str, dict] = {}
+    # De-dupe by (asin, rounded price) so a repeated ASIN doesn't waste
+    # a slot in the 20-item batch.
+    seen: set[tuple[str, float]] = set()
+    to_fetch: list[tuple[str, float]] = []
+    for asin, price in items:
+        if not asin or price is None or price <= 0:
+            continue
+        pr = round(float(price), 2)
+        key = (asin, pr)
+        if key in seen:
+            continue
+        seen.add(key)
+        cache_key = (asin, pr, bool(is_fba), marketplace_id, currency)
+        cached = _FEES_ESTIMATE_CACHE.get(cache_key)
+        if cached and now_ts - cached[0] < _FEES_ESTIMATE_TTL_S:
+            out[asin] = cached[1]
+        else:
+            to_fetch.append((asin, pr))
+
+    if not to_fetch:
+        return out
+
+    for i in range(0, len(to_fetch), _FEES_BATCH_MAX):
+        chunk = to_fetch[i : i + _FEES_BATCH_MAX]
+        # Pace against the sustained batch limit (0.5/s = 2s spacing);
+        # module-level `_last_fees_batch_ts` keeps concurrent callers
+        # honest across requests.
+        elapsed = time.time() - _last_fees_batch_ts
+        if _last_fees_batch_ts and elapsed < _FEES_BATCH_MIN_SPACING_S:
+            await asyncio.sleep(_FEES_BATCH_MIN_SPACING_S - elapsed)
+
+        # Body is an array of FeesEstimateByIdRequest per the SP-API docs.
+        # `Identifier` echoes back on the response so we can match ASINs
+        # even if Amazon changes the response order.
+        body = [
+            {
+                "FeesEstimateRequest": {
+                    "MarketplaceId": marketplace_id,
+                    "IsAmazonFulfilled": bool(is_fba),
+                    "PriceToEstimateFees": {
+                        "ListingPrice": {"Amount": pr, "CurrencyCode": currency},
+                    },
+                    "Identifier": f"est-{asin}-{pr}",
+                },
+                "IdType": "ASIN",
+                "IdValue": asin,
+            }
+            for asin, pr in chunk
+        ]
+        try:
+            resp = await _sp_request(
+                "POST", "/products/fees/v0/feesEstimate", body=body,
+            )
+        except Exception as e:
+            # Whole batch failed — fall back to the singleton loop for
+            # this chunk so one broken ASIN doesn't lose all 20 estimates.
+            print(f"[sp-api] batch feesEstimate failed ({e}); falling back to per-ASIN")
+            for asin, pr in chunk:
+                try:
+                    out[asin] = await get_fees_estimate(
+                        asin, pr, is_fba=is_fba,
+                        marketplace=marketplace, currency=currency,
+                    )
+                except Exception as e2:
+                    out[asin] = {
+                        "referral": 0.0, "fba": 0.0, "fuel_surcharge": 0.0,
+                        "total": 0.0, "status": "error", "error": str(e2)[:200],
+                        "breakdown": [],
+                    }
+            _last_fees_batch_ts = time.time()
+            continue
+
+        _last_fees_batch_ts = time.time()
+        # SP-API's batch feesEstimate returns the result list in one of
+        # three shapes depending on marketplace / API era:
+        #   1. bare JSON array of FeesEstimateResult (observed on NA)
+        #   2. {"payload": [ ... ]} (older wrapping)
+        #   3. {"payload": {"FeesEstimateResultList": [ ... ]}} (docs)
+        # Normalize to a list before matching.
+        if isinstance(resp, list):
+            results = resp
+        elif isinstance(resp, dict):
+            payload = resp.get("payload")
+            if isinstance(payload, list):
+                results = payload
+            elif isinstance(payload, dict):
+                results = payload.get("FeesEstimateResultList") or []
+            else:
+                results = resp.get("FeesEstimateResultList") or []
+        else:
+            results = []
+        if isinstance(results, dict):
+            # Occasionally a single-item batch returns as an object; wrap.
+            results = [results]
+        # Match by echoed SellerInputIdentifier (`Identifier`) since order
+        # is not guaranteed. Fall back to positional if the field is missing.
+        by_ident: dict[str, dict] = {}
+        for r in results:
+            ident_obj = r.get("FeesEstimateIdentifier") or {}
+            ident = ident_obj.get("SellerInputIdentifier")
+            if ident:
+                by_ident[ident] = r
+
+        for idx, (asin, pr) in enumerate(chunk):
+            ident = f"est-{asin}-{pr}"
+            r = by_ident.get(ident)
+            if r is None and idx < len(results):
+                r = results[idx]
+            if r is None:
+                out[asin] = {
+                    "referral": 0.0, "fba": 0.0, "fuel_surcharge": 0.0,
+                    "total": 0.0, "status": "error",
+                    "error": "no result returned in batch",
+                    "breakdown": [],
+                }
+                continue
+            parsed = _parse_fees_result(r)
+            out[asin] = parsed
+            if (parsed.get("status") or "").lower() == "success" or parsed["total"] > 0:
+                _FEES_ESTIMATE_CACHE[
+                    (asin, pr, bool(is_fba), marketplace_id, currency)
+                ] = (time.time(), parsed)
+
     return out
 
 
