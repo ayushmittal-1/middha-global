@@ -13,6 +13,7 @@ import hmac
 import io
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlencode, urlparse
 
@@ -20,6 +21,14 @@ import httpx
 
 from amazon_ads import get_sp_access_token
 from auth import require_user
+
+# In-memory cache for Product Fees API estimates. Amazon caps this endpoint
+# at 1 req/s (2 burst); the profitability endpoint calls it once per SKU,
+# which alone can trip 429s and definitely does on repeated "Apply" clicks.
+# Estimates depend only on (ASIN, price, is_fba, marketplace), and Amazon's
+# fee schedules don't change intra-day, so a 30-min per-process cache is safe.
+_FEES_ESTIMATE_CACHE: dict[tuple, tuple[float, dict]] = {}
+_FEES_ESTIMATE_TTL_S = 30 * 60
 
 # ── App-level config (stays in env) ──────────────────────────────────────────
 
@@ -260,8 +269,15 @@ async def _sp_request(
     path: str,
     params: dict | None = None,
     body: dict | None = None,
+    *,
+    max_429_retries: int = 5,
 ) -> dict | list | str:
-    """Make a signed SP-API request on behalf of the current authenticated user."""
+    """Make a signed SP-API request on behalf of the current authenticated user.
+
+    Retries 429 (QuotaExceeded) with exponential backoff so a single throttled
+    call doesn't fail the whole endpoint. Honors `x-amzn-RateLimit-Limit`
+    (requests/sec) when present to pick a wait floor; otherwise falls back to
+    exponential backoff starting at 1.5s."""
     user = require_user()
     access_token = await get_sp_access_token(user)
     sp_base, sp_region = _sp_base_and_region(user)
@@ -273,33 +289,54 @@ async def _sp_request(
 
     body_str = json.dumps(body) if body else ""
 
-    # Only include headers that should be SigV4-signed
-    headers = {
-        "content-type": "application/json",
-    }
-    _sigv4_headers(method, url, headers, sp_region, body=body_str)
-
-    # Add non-signed headers after signing
-    headers["x-amz-access-token"] = access_token
-    headers["user-agent"] = "MiddhaGlobal/1.0 (Language=Python)"
-
     print(f"[sp-api] -> {method} {path} params={params}")
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.request(
-            method,
-            url,
-            headers=headers,
-            content=body_str if body_str else None,
-        )
-        if resp.is_error:
-            print(f"[sp-api] <- FAILED {resp.status_code}: {resp.text[:500]}")
-            resp.raise_for_status()
-        print(f"[sp-api] <- OK {resp.status_code}")
-        try:
-            return resp.json()
-        except Exception:
-            return resp.text
+    attempt = 0
+    while True:
+        # Re-sign every attempt: SigV4 signatures include a per-request
+        # timestamp, so reusing headers across retries fails auth if we wait
+        # more than 15 minutes (and is technically incorrect anyway).
+        headers = {"content-type": "application/json"}
+        _sigv4_headers(method, url, headers, sp_region, body=body_str)
+        headers["x-amz-access-token"] = access_token
+        headers["user-agent"] = "MiddhaGlobal/1.0 (Language=Python)"
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.request(
+                method,
+                url,
+                headers=headers,
+                content=body_str if body_str else None,
+            )
+            if resp.status_code == 429 and attempt < max_429_retries:
+                # Prefer the advertised rate: `x-amzn-RateLimit-Limit` is
+                # req/s, so 1/rate is the minimum spacing. Multiply by
+                # (attempt+1) for exponential backoff on repeated hits.
+                rate_hdr = resp.headers.get("x-amzn-RateLimit-Limit")
+                try:
+                    rate = float(rate_hdr) if rate_hdr else 0.0
+                except ValueError:
+                    rate = 0.0
+                base = (1.0 / rate) if rate > 0 else 1.5
+                wait = base * (2 ** attempt)
+                # Cap the wait so a burst of retries doesn't stall for minutes.
+                wait = min(wait, 30.0)
+                attempt += 1
+                print(
+                    f"[sp-api] <- 429 QuotaExceeded on {path}; "
+                    f"retry {attempt}/{max_429_retries} in {wait:.1f}s "
+                    f"(rate={rate_hdr})"
+                )
+                await asyncio.sleep(wait)
+                continue
+            if resp.is_error:
+                print(f"[sp-api] <- FAILED {resp.status_code}: {resp.text[:500]}")
+                resp.raise_for_status()
+            print(f"[sp-api] <- OK {resp.status_code}")
+            try:
+                return resp.json()
+            except Exception:
+                return resp.text
 
 
 # ── Orders API (v0) ─────────────────────────────────────────────────────────
@@ -393,12 +430,18 @@ async def get_fees_estimate(
     """
     user = require_user()
     marketplace_id = resolve_marketplace(user, marketplace, multiple=False)
+    price_r = round(price, 2)
+    cache_key = (asin, price_r, bool(is_fba), marketplace_id, currency)
+    now_ts = time.time()
+    cached = _FEES_ESTIMATE_CACHE.get(cache_key)
+    if cached and now_ts - cached[0] < _FEES_ESTIMATE_TTL_S:
+        return cached[1]
     body = {
         "FeesEstimateRequest": {
             "MarketplaceId": marketplace_id,
             "IsAmazonFulfilled": bool(is_fba),
             "PriceToEstimateFees": {
-                "ListingPrice": {"Amount": round(price, 2), "CurrencyCode": currency},
+                "ListingPrice": {"Amount": price_r, "CurrencyCode": currency},
             },
             "Identifier": f"est-{asin}",
         }
@@ -439,6 +482,11 @@ async def get_fees_estimate(
         out["fuel_surcharge"] = round(out["fba"] * 0.035, 4)
         # Don't double-count: leave fba as-is. The "total" Amazon returned
         # is authoritative; fuel_surcharge here is the explanatory split.
+    # Only cache successful estimates — Amazon returns Status="ClientError"
+    # for un-listable ASINs; don't pin those in-memory in case the listing
+    # comes back live within the TTL.
+    if (out.get("status") or "").lower() == "success" or out["total"] > 0:
+        _FEES_ESTIMATE_CACHE[cache_key] = (now_ts, out)
     return out
 
 

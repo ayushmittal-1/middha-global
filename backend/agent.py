@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import json
 import os
+import time
 from collections import defaultdict
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta, timezone
@@ -882,6 +883,12 @@ async def compute_profitability_data(
     missing_cogs: list[dict] = []
     fee_errors: list[str] = []
 
+    # Product Fees API is 1 req/s sustained (2 burst). Track the last actual
+    # (uncached) call so we pace at ~1.1s spacing without adding latency for
+    # cache hits or SKUs missing an ASIN.
+    last_fees_call_ts = 0.0
+    fees_min_spacing = 1.1
+
     for sku in skus:
         d = sku_data[sku]
         units = d["units"]
@@ -892,6 +899,9 @@ async def compute_profitability_data(
         # Amazon fees per unit at the SKU's average selling price
         referral = fba = fuel = 0.0
         if asin and avg_price > 0:
+            elapsed = time.time() - last_fees_call_ts
+            if last_fees_call_ts and elapsed < fees_min_spacing:
+                await asyncio.sleep(fees_min_spacing - elapsed)
             try:
                 est = await amazon_sp.get_fees_estimate(asin, avg_price, is_fba=True)
                 referral = est["referral"]
@@ -899,6 +909,7 @@ async def compute_profitability_data(
                 fuel = est["fuel_surcharge"]
             except Exception as e:
                 fee_errors.append(f"{sku} ({asin}): {str(e)[:120]}")
+            last_fees_call_ts = time.time()
         elif not asin:
             fee_errors.append(f"{sku}: no ASIN found in order items")
 
