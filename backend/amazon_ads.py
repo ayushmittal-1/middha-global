@@ -91,12 +91,27 @@ async def exchange_auth_code(code: str, redirect_uri: str) -> dict:
 
 
 async def _get_access_token(user: dict, refresh_field: str) -> str:
+    from token_encryption import decrypt_token, is_encrypted
+
     refresh = user.get(refresh_field)
     if not refresh:
         raise RuntimeError(
             f"User {user.get('email')} has no {refresh_field}. "
             "Complete the Amazon OAuth flow in Aurora first."
         )
+    # Aurora's Node backend stores these tokens AES-256-GCM encrypted with
+    # the `enc:v1:` prefix (auroraBackend/src/models/User.js). Decrypt
+    # transparently — otherwise we'd send the ciphertext to LWA and get
+    # `invalid_grant`. Plaintext tokens (legacy or dev-seeded) pass through.
+    if is_encrypted(refresh):
+        try:
+            refresh = decrypt_token(refresh)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to decrypt {refresh_field} for {user.get('email')}: "
+                f"{e}. Check TOKEN_ENCRYPTION_KEY / SELLER_APP_ENCRYPTION_KEY "
+                "matches the Node backend."
+            )
     # Refresh tokens are app-scoped — Ads tokens MUST be exchanged with the
     # Ads LWA client_id/secret; SP-API tokens with the SP-API ones. Mixing
     # them up gives a generic 400 from /auth/o2/token.
@@ -119,10 +134,30 @@ async def _get_access_token(user: dict, refresh_field: str) -> str:
             "client_secret": client_secret,
         })
         if resp.is_error:
+            # Amazon prefixes the body with a long `error_index` correlation
+            # ID (~280 chars) — a 300-char truncation eats the actual
+            # `error` / `error_description` we need. Log the whole body,
+            # and try to surface the diagnostic error code in the exception
+            # message so callers (and the FE via /profitability's `error`
+            # field) can see `invalid_grant` / `invalid_client` etc.
+            body_text = resp.text
             print(
                 f"[lwa] refresh FAILED for {refresh_field} "
-                f"status={resp.status_code} body={resp.text[:300]}"
+                f"status={resp.status_code} client_id={client_id[:35]}... "
+                f"body={body_text[:1500]}"
             )
+            err_code = err_desc = ""
+            try:
+                j = resp.json()
+                err_code = j.get("error") or ""
+                err_desc = j.get("error_description") or ""
+            except Exception:
+                pass
+            if err_code or err_desc:
+                raise RuntimeError(
+                    f"LWA refresh failed ({refresh_field}): "
+                    f"{err_code}: {err_desc}"
+                )
         resp.raise_for_status()
         return resp.json()["access_token"]
 
