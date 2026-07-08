@@ -30,6 +30,13 @@ from auth import require_user
 _FEES_ESTIMATE_CACHE: dict[tuple, tuple[float, dict]] = {}
 _FEES_ESTIMATE_TTL_S = 30 * 60
 
+# In-memory cache for paginated getOrders. Orders API is 1 req/min sustained
+# — the tightest limit we hit. A completed date window's orders don't change,
+# so re-clicks (or the LLM tool + FE hitting profitability back-to-back)
+# should reuse the last result instead of re-paging.
+_ORDERS_CACHE: dict[tuple, tuple[float, dict]] = {}
+_ORDERS_CACHE_TTL_S = 5 * 60
+
 # ── App-level config (stays in env) ──────────────────────────────────────────
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
@@ -310,17 +317,20 @@ async def _sp_request(
             )
             if resp.status_code == 429 and attempt < max_429_retries:
                 # Prefer the advertised rate: `x-amzn-RateLimit-Limit` is
-                # req/s, so 1/rate is the minimum spacing. Multiply by
-                # (attempt+1) for exponential backoff on repeated hits.
+                # req/s, so 1/rate is the minimum spacing (60s for the
+                # Orders API's 0.0167/s bucket, 2s for Order Items' 0.5/s,
+                # etc.). Exponential growth on repeated hits, but cap
+                # per-attempt at `max(90s, 1.5x rate window)` so we
+                # actually wait long enough for the tight buckets to
+                # refill instead of burning the retry budget on 30s waits.
                 rate_hdr = resp.headers.get("x-amzn-RateLimit-Limit")
                 try:
                     rate = float(rate_hdr) if rate_hdr else 0.0
                 except ValueError:
                     rate = 0.0
                 base = (1.0 / rate) if rate > 0 else 1.5
-                wait = base * (2 ** attempt)
-                # Cap the wait so a burst of retries doesn't stall for minutes.
-                wait = min(wait, 30.0)
+                per_attempt_cap = max(90.0, base * 1.5)
+                wait = min(base * (2 ** attempt), per_attempt_cap)
                 attempt += 1
                 print(
                     f"[sp-api] <- 429 QuotaExceeded on {path}; "
@@ -374,10 +384,34 @@ async def get_orders(
     if not paginate:
         return await _sp_request("GET", "/orders/v0/orders", params=base_params)
 
+    # In-memory cache for paginated getOrders. Orders API is 0.0167 req/s
+    # (1/min) — brutal on multi-page catalogs. A user re-clicking Apply on
+    # the same window shouldn't repay that cost. Cache is per-process,
+    # 5 min TTL, keyed by the query params that define the window.
+    user_id = str(user.get("_id") or user.get("id") or "")
+    cache_key = (
+        user_id, base_params["MarketplaceIds"],
+        base_params.get("CreatedAfter"), base_params.get("CreatedBefore"),
+        base_params.get("OrderStatuses"),
+    )
+    now_ts = time.time()
+    cached = _ORDERS_CACHE.get(cache_key)
+    if cached and now_ts - cached[0] < _ORDERS_CACHE_TTL_S:
+        print(f"[sp-api] getOrders cache HIT ({len(cached[1].get('payload',{}).get('Orders',[]))} orders)")
+        return cached[1]
+
     merged: dict = {}
     orders: list = []
     page_params = dict(base_params)
+    page_num = 0
     while True:
+        # Pace pagination pages so we don't exhaust the 20-burst bucket in
+        # one shot on a heavy catalog. 3s spacing = ~7 pages before we
+        # start biting into the sustained rate; retries in _sp_request
+        # cover the tail.
+        if page_num > 0:
+            await asyncio.sleep(3.0)
+        page_num += 1
         resp = await _sp_request("GET", "/orders/v0/orders", params=page_params)
         if not merged:
             merged = resp
@@ -395,6 +429,7 @@ async def get_orders(
         merged["payload"] = {}
     merged["payload"]["Orders"] = orders
     merged["payload"].pop("NextToken", None)
+    _ORDERS_CACHE[cache_key] = (now_ts, merged)
     return merged
 
 
