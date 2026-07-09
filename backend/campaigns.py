@@ -21,9 +21,29 @@ def _user_key() -> str:
 
 
 async def fetch_all_campaigns(user: dict | None = None) -> None:
-    """Fetch all campaigns from Aurora API with pagination using the current
-    user's JWT — same token that authenticated this request."""
+    """Load campaigns for the authenticated user — Aurora Mongo first when
+    AURORA_DATA_SOURCE=db, otherwise Aurora REST API."""
     user = user or require_user()
+    from aurora_data import aurora_db_enabled, fetch_campaigns
+
+    if aurora_db_enabled():
+        all_campaigns = await fetch_campaigns(user)
+        if not all_campaigns:
+            print(f"No campaigns in Aurora DB for {user.get('email')} — trying Aurora API")
+            all_campaigns = await _fetch_campaigns_from_api(user)
+    else:
+        all_campaigns = await _fetch_campaigns_from_api(user)
+
+    key = str(user["_id"])
+    _user_campaigns[key] = all_campaigns
+    _user_summary[key] = _build_summary(all_campaigns)
+    print(
+        f"Loaded {len(all_campaigns)} campaigns for user {user.get('email')} "
+        f"({'aurora_db' if aurora_db_enabled() else 'aurora_api'})"
+    )
+
+
+async def _fetch_campaigns_from_api(user: dict) -> list[dict]:
     token = user.get("_token")
     if not token:
         raise RuntimeError("Authenticated user has no Bearer token attached")
@@ -59,24 +79,13 @@ async def fetch_all_campaigns(user: dict | None = None) -> None:
                 break
             page += 1
 
-    # Merge in any test / manual campaigns we own — Aurora doesn't touch
-    # `middhaAdCampaigns`, so entries here survive across Aurora syncs
-    # AND preserve custom fields like `skus` that Aurora's schema strips.
     extras = await _load_middha_campaigns(user["_id"])
     if extras:
         seen = {c.get("campaignId") for c in all_campaigns}
         for e in extras:
-            if e.get("campaignId") in seen:
-                continue  # a matching Aurora doc wins for real campaigns
-            all_campaigns.append(e)
-
-    key = str(user["_id"])
-    _user_campaigns[key] = all_campaigns
-    _user_summary[key] = _build_summary(all_campaigns)
-    print(
-        f"Loaded {len(all_campaigns)} campaigns for user {user.get('email')} "
-        f"(+{len(extras)} from {MIDDHA_CAMPAIGN_COLLECTION})"
-    )
+            if e.get("campaignId") not in seen:
+                all_campaigns.append(e)
+    return all_campaigns
 
 
 async def _load_middha_campaigns(user_id) -> list[dict]:

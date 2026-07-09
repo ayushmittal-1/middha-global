@@ -18,6 +18,8 @@ from bson import ObjectId
 from fastapi import Depends, Header, HTTPException, WebSocket, status
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
+from token_encryption import hydrate_user_tokens
+
 MONGO_URI = os.getenv("MONGO_URI", "")
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 # Aurora's mongoose connection uses the `test` database when the URI has no path.
@@ -60,7 +62,7 @@ async def _load_user(user_id: Optional[str]) -> dict:
     user = await _db().users.find_one({"_id": oid}, {"password": 0})
     if not user:
         raise HTTPException(status_code=401, detail="Not authorized, user not found")
-    return user
+    return hydrate_user_tokens(user)
 
 
 async def protect(authorization: Optional[str] = Header(default=None)) -> dict:
@@ -147,7 +149,7 @@ async def authenticate_credentials(email: str, password: str) -> dict:
     if not ok:
         raise HTTPException(status_code=401, detail="Invalid credentials")
     user.pop("password", None)
-    return user
+    return hydrate_user_tokens(user)
 
 
 def require_user() -> dict:

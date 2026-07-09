@@ -76,5 +76,23 @@ def decrypt_token(value: Optional[str]) -> Optional[str]:
     tag = bytes.fromhex(tag_hex)
     ct = bytes.fromhex(ct_hex)
     # Python's AESGCM expects ciphertext || tag concatenated.
-    plaintext = AESGCM(key).decrypt(iv, ct + tag, None)
+    try:
+        plaintext = AESGCM(key).decrypt(iv, ct + tag, None)
+    except Exception as e:
+        raise ValueError(
+            f"decryption failed ({type(e).__name__}): "
+            "TOKEN_ENCRYPTION_KEY does not match the Node backend"
+        ) from e
     return plaintext.decode("utf-8")
+
+
+TOKEN_FIELDS = ("amazonRefreshToken", "amazonAdsRefreshToken")
+
+
+def hydrate_user_tokens(user: dict) -> dict:
+    """Decrypt encrypted Amazon tokens on a user document in-place."""
+    for field in TOKEN_FIELDS:
+        value = user.get(field)
+        if value and is_encrypted(value):
+            user[field] = decrypt_token(value)
+    return user

@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).parent.parent / ".env")
+load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
 from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +34,7 @@ from database import (
 )
 from forecasting.ingest import (
     backfill_user,
+    ensure_sales_history,
     ingest_user_incremental,
     run_nightly_ingest,
 )
@@ -42,6 +43,9 @@ from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime, timedelta, timezone
 
 import amazon_sp
+import aurora_data
+import data_resolver
+from aurora_data import aurora_db_enabled
 from agent import compute_profitability_data
 from campaigns import analyze_performance_data
 from amazon_ads import (
@@ -297,12 +301,23 @@ async def forecasting_ingest(
 
 @app.post("/forecasting/refresh")
 async def forecasting_refresh(user: dict = Depends(protect)):
-    """Refit forecasts + reorder math for every SKU with history. Reads
-    from salesDaily/inventorySnapshot (no SP-API calls)."""
+    """Ingest sales history when missing, then refit forecasts + reorder math.
+
+    Reads Aurora Mongo orders first (SP-API fallback only when DB has no
+    history). No redundant Amazon calls when salesDaily is already populated.
+    """
     from bson import ObjectId as _OID
     from forecasting.model import refresh_forecasts_for_user
     current_user.set(user)
-    return await refresh_forecasts_for_user(_OID(str(user["_id"])))
+    ingest = await ensure_sales_history(user)
+    refresh = await refresh_forecasts_for_user(_OID(str(user["_id"])))
+    out = {**refresh, "ingest": ingest}
+    if refresh.get("skus", 0) == 0:
+        out["hint"] = (
+            "No SKU sales history found. Sync orders in Aurora first, or "
+            "ensure Amazon SP-API is connected so ingest can pull reports."
+        )
+    return out
 
 
 @app.get("/forecasting/settings")
@@ -416,11 +431,14 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
 
 # ── Amazon SP-API data endpoints (for FE tables) ───────────────────────────
 
+ORDERS_SOURCE = os.getenv("AURORA_DATA_SOURCE") or os.getenv("AURORA_ORDERS_SOURCE", "db")
+ORDERS_SOURCE = ORDERS_SOURCE.strip().lower()
+
 
 @app.get("/amazon/marketplaces")
 async def amazon_marketplaces(user: dict = Depends(protect)):
     """Marketplaces the user is registered in. Feeds the Orders tab selector."""
-    return {"marketplaces": amazon_sp.list_marketplaces()}
+    return {"marketplaces": data_resolver.list_marketplaces_resolved(user)}
 
 
 @app.get("/amazon/orders")
@@ -447,6 +465,17 @@ async def amazon_orders(
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
     created_before = end
     statuses = [s.strip() for s in status.split(",") if s.strip()] if status else None
+
+    if ORDERS_SOURCE == "db":
+        return await data_resolver.list_orders_resolved(
+            user,
+            created_after=created_after,
+            created_before=created_before,
+            statuses=statuses,
+            marketplace=marketplace,
+            buyer_email=buyer_email,
+            paginate=True,
+        )
 
     try:
         data = await amazon_sp.get_orders(
@@ -490,6 +519,8 @@ async def amazon_orders(
 @app.get("/amazon/orders/{order_id}/items")
 async def amazon_order_items(order_id: str, user: dict = Depends(protect)):
     """Line items for a single order — used to expand a row in the FE table."""
+    if ORDERS_SOURCE == "db":
+        return await data_resolver.get_order_items_resolved(user, order_id)
     data = await amazon_sp.get_order_items(order_id)
     return {"items": (data.get("payload") or {}).get("OrderItems") or []}
 
