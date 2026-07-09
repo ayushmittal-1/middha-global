@@ -14,6 +14,10 @@ from keywords import fetch_amazon_keywords, suggest_negative_keywords
 from meta_ads import search_meta_ads
 from database import create_session, get_messages, save_message, update_session_title, get_cogs, get_forecast_cache
 import amazon_sp
+import aurora_data
+from aurora_data import aurora_db_enabled
+import data_resolver
+from auth import require_user
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -471,13 +475,16 @@ async def _get_orders(days_back: int | str = 7, status: str | None = None, marke
     statuses = [status] if status in valid_statuses else None
     created_after = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
-        data = await amazon_sp.get_orders(
-            created_after=created_after, statuses=statuses, marketplace=marketplace,
+        data = await data_resolver.list_orders_resolved(
+            require_user(),
+            created_after=created_after,
+            statuses=statuses,
+            marketplace=marketplace,
+            paginate=False,
         )
+        orders = data.get("orders") or []
     except Exception as e:
         return f"Error fetching orders: {e}"
-
-    orders = data.get("payload", {}).get("Orders", [])
     if not orders:
         return f"No orders found in the last {days_back} days."
     lines = []
@@ -501,10 +508,11 @@ async def _get_inventory(skus=None, marketplace=None) -> str:
     if skus is not None and not skus:
         skus = None
     try:
-        data = await amazon_sp.get_inventory_summaries(skus=skus, marketplace=marketplace)
+        summaries, _src = await data_resolver.fetch_inventory_resolved(
+            require_user(), skus=skus, marketplace=marketplace,
+        )
     except Exception as e:
         return f"Error fetching inventory: {e}"
-    summaries = data.get("payload", {}).get("inventorySummaries", [])
     if not summaries:
         return "No FBA inventory found." + (" (filtered by SKUs: " + ", ".join(skus) + ")" if skus else "")
     lines = []
@@ -538,10 +546,10 @@ async def _get_order_items(order_id=None) -> str:
             "find which orders contain it, then call get_order_items on those order ids."
         )
     try:
-        data = await amazon_sp.get_order_items(order_id)
+        data = await data_resolver.get_order_items_resolved(require_user(), order_id)
+        items = data.get("items") or []
     except Exception as e:
         return f"Error fetching order items: {e}"
-    items = data.get("payload", {}).get("OrderItems", [])
     if not items:
         return f"No items found for order {order_id}."
     lines = []
@@ -582,6 +590,27 @@ async def _get_cogs(skus=None) -> str:
         if missing:
             out += f"\nMissing COGS for: {', '.join(missing)} (user must upload)."
     return out
+
+
+def _sp_report_warning(report_label: str, err: Exception) -> str:
+    """User-facing message for SP-API report failures (no raw stack traces)."""
+    text = f"{err!r}"
+    if "403" in text or "Forbidden" in text:
+        return (
+            f"{report_label} report unavailable — Amazon denied access (403). "
+            "Your SP-API app may need the Reports role enabled in Seller Central, "
+            "or this report type isn't enabled for your account. "
+            "Using settlement-window estimates instead."
+        )
+    short = str(err).replace("\n", " ")
+    if len(short) > 160:
+        short = short[:157] + "..."
+    return f"{report_label} report failed ({type(err).__name__}: {short})"
+
+
+def _is_sp_access_denied(err: Exception) -> bool:
+    text = f"{err!r}"
+    return "403" in text or "Forbidden" in text
 
 
 async def compute_profitability_data(
@@ -663,92 +692,182 @@ async def compute_profitability_data(
     created_before = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     window_days = max((end_dt - start_dt).total_seconds() / 86400.0, 0.5)
 
-    try:
-        orders_resp = await amazon_sp.get_orders(
-            created_after=created_after,
-            created_before=created_before,
-            paginate=paginate,
-        )
-    except Exception as e:
-        # Only bail out completely if this is likely an auth or config
-        # failure. For 429s especially, log-and-retry-later is better UX
-        # than a hard error — the FE can prompt the user to try again.
-        msg = str(e)
-        return {"error": f"Error fetching orders: {msg}",
-                "error_kind": "rate_limited" if "429" in msg else "orders_fetch_failed"}
-    orders = orders_resp.get("payload", {}).get("Orders", [])
-    # get_orders may hand back partial results when pagination halts mid-way
-    # (heavily rate-limited windows). Surface the reason so the FE can warn.
-    partial_warning: str | None = orders_resp.get("_partial")
-    if not orders:
-        return {
-            "orders_count": 0, "skus_count": 0, "rows": [], "totals": None,
-            "missing_cogs": [], "na_price_rows": [], "fetch_errors": [],
-            "days_back": round(window_days, 2), "window_days": round(window_days, 2),
-            "start": start_dt.date().isoformat(), "end": end_dt.date().isoformat(),
-            "created_after": created_after, "created_before": created_before,
-            "caveats": [], "warnings": [],
-        }
-
-    order_ids = [o.get("AmazonOrderId") for o in orders if o.get("AmazonOrderId")]
-
-    # SP-API GetOrderItems is 0.5 req/s sustained — pace sequentially with
-    # exponential backoff on 429 so a busy quota doesn't drop every order.
-    items_results: list[tuple[str, dict]] = []
-    pending = list(order_ids)
-    attempt = 1
-    while pending and attempt <= 4:
-        base_sleep = 2.1 * attempt
-        failed: list[str] = []
-        for oid in pending:
-            try:
-                resp = await amazon_sp.get_order_items(oid)
-                items_results.append((oid, resp))
-            except Exception as e:
-                msg = str(e)
-                if "429" in msg or "QuotaExceeded" in msg:
-                    failed.append(oid)
-                    await asyncio.sleep(base_sleep * 2)
-                else:
-                    items_results.append((oid, {"_error": msg}))
-                    continue
-            await asyncio.sleep(base_sleep)
-        pending = failed
-        attempt += 1
-        if pending:
-            await asyncio.sleep(20)
-    # Anything still pending after the retry loop = permanent failure
-    for oid in pending:
-        items_results.append((oid, {"_error": "rate limited after 4 retries"}))
-
-    sku_data: dict[str, dict] = defaultdict(
-        lambda: {"units": 0, "revenue": 0.0, "asin": None}
-    )
+    use_db = aurora_db_enabled()
+    partial_warning: str | None = None
     na_price_rows: list[dict] = []
     fetch_errors: list[str] = []
+    orders_count = 0
+    sku_data: dict[str, dict] = {}
 
-    for oid, items_resp in items_results:
-        if "_error" in items_resp:
-            fetch_errors.append(f"{oid}: {items_resp['_error']}")
-            continue
-        for it in items_resp.get("payload", {}).get("OrderItems", []):
-            sku = it.get("SellerSKU")
-            if not sku:
-                continue
-            qty = int(it.get("QuantityOrdered", 0) or 0)
-            price = it.get("ItemPrice") or {}
-            amount_raw = price.get("Amount")
+    if use_db:
+        user = require_user()
+        db_orders = await aurora_data.fetch_orders_with_items(
+            user,
+            created_after=created_after,
+            created_before=created_before,
+        )
+        if not db_orders:
+            # Window empty in DB — try live SP-API (unsynced recent orders).
             try:
-                amount = float(amount_raw) if amount_raw is not None else None
-            except (TypeError, ValueError):
-                amount = None
-            if amount is None:
-                na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
+                orders_resp = await amazon_sp.get_orders(
+                    created_after=created_after,
+                    created_before=created_before,
+                    paginate=paginate,
+                )
+            except Exception as e:
+                msg = str(e)
+                return {"error": f"Error fetching orders: {msg}",
+                        "error_kind": "rate_limited" if "429" in msg else "orders_fetch_failed"}
+            orders = orders_resp.get("payload", {}).get("Orders", [])
+            partial_warning = orders_resp.get("_partial")
+            orders_count = len(orders)
+            if not orders:
+                return {
+                    "orders_count": 0, "skus_count": 0, "rows": [], "totals": None,
+                    "missing_cogs": [], "na_price_rows": [], "fetch_errors": [],
+                    "days_back": round(window_days, 2), "window_days": round(window_days, 2),
+                    "start": start_dt.date().isoformat(), "end": end_dt.date().isoformat(),
+                    "created_after": created_after, "created_before": created_before,
+                    "caveats": [], "warnings": [],
+                }
+            order_ids = [o.get("AmazonOrderId") for o in orders if o.get("AmazonOrderId")]
+            items_results: list[tuple[str, dict]] = []
+            pending = list(order_ids)
+            attempt = 1
+            while pending and attempt <= 4:
+                base_sleep = 2.1 * attempt
+                failed: list[str] = []
+                for oid in pending:
+                    try:
+                        resp = await amazon_sp.get_order_items(oid)
+                        items_results.append((oid, resp))
+                    except Exception as e:
+                        msg = str(e)
+                        if "429" in msg or "QuotaExceeded" in msg:
+                            failed.append(oid)
+                            await asyncio.sleep(base_sleep * 2)
+                        else:
+                            items_results.append((oid, {"_error": msg}))
+                        continue
+                    await asyncio.sleep(base_sleep)
+                pending = failed
+                attempt += 1
+                if pending:
+                    await asyncio.sleep(20)
+            for oid in pending:
+                items_results.append((oid, {"_error": "rate limited after 4 retries"}))
+            sku_data = defaultdict(
+                lambda: {"units": 0, "revenue": 0.0, "asin": None},
+            )
+            for oid, items_resp in items_results:
+                if "_error" in items_resp:
+                    fetch_errors.append(f"{oid}: {items_resp['_error']}")
+                    continue
+                for it in items_resp.get("payload", {}).get("OrderItems", []):
+                    sku = it.get("SellerSKU")
+                    if not sku:
+                        continue
+                    qty = int(it.get("QuantityOrdered", 0) or 0)
+                    price = it.get("ItemPrice") or {}
+                    amount_raw = price.get("Amount")
+                    try:
+                        amount = float(amount_raw) if amount_raw is not None else None
+                    except (TypeError, ValueError):
+                        amount = None
+                    if amount is None:
+                        na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
+                        continue
+                    sku_data[sku]["units"] += qty
+                    sku_data[sku]["revenue"] += amount
+                    if not sku_data[sku]["asin"] and it.get("ASIN"):
+                        sku_data[sku]["asin"] = it["ASIN"]
+        else:
+            db_orders, item_errors = await data_resolver.supplement_order_items_from_sp_api(
+                db_orders,
+            )
+            fetch_errors.extend(item_errors)
+            sku_data, na_price_rows, orders_count = (
+                aurora_data.aggregate_sku_metrics_from_orders(db_orders)
+            )
+    else:
+        try:
+            orders_resp = await amazon_sp.get_orders(
+                created_after=created_after,
+                created_before=created_before,
+                paginate=paginate,
+            )
+        except Exception as e:
+            msg = str(e)
+            return {"error": f"Error fetching orders: {msg}",
+                    "error_kind": "rate_limited" if "429" in msg else "orders_fetch_failed"}
+        orders = orders_resp.get("payload", {}).get("Orders", [])
+        partial_warning = orders_resp.get("_partial")
+        orders_count = len(orders)
+        if not orders:
+            return {
+                "orders_count": 0, "skus_count": 0, "rows": [], "totals": None,
+                "missing_cogs": [], "na_price_rows": [], "fetch_errors": [],
+                "days_back": round(window_days, 2), "window_days": round(window_days, 2),
+                "start": start_dt.date().isoformat(), "end": end_dt.date().isoformat(),
+                "created_after": created_after, "created_before": created_before,
+                "caveats": [], "warnings": [],
+            }
+
+        order_ids = [o.get("AmazonOrderId") for o in orders if o.get("AmazonOrderId")]
+
+        # SP-API GetOrderItems is 0.5 req/s sustained — pace sequentially with
+        # exponential backoff on 429 so a busy quota doesn't drop every order.
+        items_results: list[tuple[str, dict]] = []
+        pending = list(order_ids)
+        attempt = 1
+        while pending and attempt <= 4:
+            base_sleep = 2.1 * attempt
+            failed: list[str] = []
+            for oid in pending:
+                try:
+                    resp = await amazon_sp.get_order_items(oid)
+                    items_results.append((oid, resp))
+                except Exception as e:
+                    msg = str(e)
+                    if "429" in msg or "QuotaExceeded" in msg:
+                        failed.append(oid)
+                        await asyncio.sleep(base_sleep * 2)
+                    else:
+                        items_results.append((oid, {"_error": msg}))
+                        continue
+                await asyncio.sleep(base_sleep)
+            pending = failed
+            attempt += 1
+            if pending:
+                await asyncio.sleep(20)
+        for oid in pending:
+            items_results.append((oid, {"_error": "rate limited after 4 retries"}))
+
+        sku_data = defaultdict(
+            lambda: {"units": 0, "revenue": 0.0, "asin": None},
+        )
+        for oid, items_resp in items_results:
+            if "_error" in items_resp:
+                fetch_errors.append(f"{oid}: {items_resp['_error']}")
                 continue
-            sku_data[sku]["units"] += qty
-            sku_data[sku]["revenue"] += amount
-            if not sku_data[sku]["asin"] and it.get("ASIN"):
-                sku_data[sku]["asin"] = it["ASIN"]
+            for it in items_resp.get("payload", {}).get("OrderItems", []):
+                sku = it.get("SellerSKU")
+                if not sku:
+                    continue
+                qty = int(it.get("QuantityOrdered", 0) or 0)
+                price = it.get("ItemPrice") or {}
+                amount_raw = price.get("Amount")
+                try:
+                    amount = float(amount_raw) if amount_raw is not None else None
+                except (TypeError, ValueError):
+                    amount = None
+                if amount is None:
+                    na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
+                    continue
+                sku_data[sku]["units"] += qty
+                sku_data[sku]["revenue"] += amount
+                if not sku_data[sku]["asin"] and it.get("ASIN"):
+                    sku_data[sku]["asin"] = it["ASIN"]
 
     skus = sorted(sku_data.keys())
     cogs_map: dict = {}
@@ -759,7 +878,7 @@ async def compute_profitability_data(
         except Exception as e:
             return {"error": f"Error reading COGS: {e}"}
 
-    # ── Storage allocation (cached 24h) — keyed by ASIN, not SKU ──────────
+    # ── Storage / finances / placement / aged — not in Aurora DB; SP-API ───
     warnings: list[str] = []
     if partial_warning:
         warnings.append(
@@ -768,6 +887,15 @@ async def compute_profitability_data(
         )
     storage_per_asin_monthly: dict = {}
     storage_cached_at: str | None = None
+    product_fee_fallback: dict[str, dict] = {}
+    fin_by_sku: dict[str, dict] = {}
+    unattributed_fees = amazon_sp._empty_fee_bucket()
+    placement_avg_per_unit: dict[str, float] | None = {}
+    placement_unresolved_per_unit = 0.0
+    aged_monthly_per_sku: dict[str, float] | None = {}
+    fees_by_asin: dict[str, dict] = {}
+    fee_errors_pre: list[str] = []
+
     storage_meta = await get_storage_cache(max_age_hours=24)
     if storage_meta:
         storage_per_asin_monthly = storage_meta.get("per_sku_monthly") or {}
@@ -778,9 +906,93 @@ async def compute_profitability_data(
             await put_storage_cache(storage_per_asin_monthly, months)
             storage_cached_at = datetime.now(timezone.utc).isoformat()
         except Exception as e:
-            warnings.append(f"Storage report fetch failed ({e}); storage fees set to 0.")
+            warnings.append(_sp_report_warning("Storage", e))
 
-    # ── Ad allocation ────────────────────────────────────────────────────
+    try:
+        fin = await amazon_sp.get_financial_events(
+            posted_after=created_after, paginate=True,
+        )
+        fin_by_sku = fin.get("by_sku") or {}
+        unattributed_fees = fin.get("unattributed") or unattributed_fees
+    except Exception as e:
+        warnings.append(_sp_report_warning("Finances", e))
+
+    total_units_window = sum(d["units"] for d in sku_data.values())
+    unattr_per_unit = {
+        k: (unattributed_fees.get(k, 0.0) / total_units_window
+            if total_units_window > 0 else 0.0)
+        for k in ("return_processing", "low_inventory", "inbound_placement",
+                  "aged_inventory", "removal")
+    }
+
+    placement_cache_meta = await get_placement_fee_cache(max_age_hours=24)
+    try:
+        if placement_cache_meta:
+            placement_per_sku = placement_cache_meta.get("per_sku") or {}
+        else:
+            placement_per_sku, months = (
+                await amazon_sp.fetch_inbound_placement_fees_per_sku(months_back=12)
+            )
+            await put_placement_fee_cache(placement_per_sku, months)
+        for sku, b in placement_per_sku.items():
+            u = int(b.get("units_received") or 0)
+            if u > 0:
+                placement_avg_per_unit[sku] = float(b.get("fee_total") or 0) / u
+    except Exception as e:
+        warnings.append(_sp_report_warning("Inbound placement", e))
+        if _is_sp_access_denied(e):
+            await put_placement_fee_cache({}, [])
+        placement_avg_per_unit = None
+
+    aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
+    try:
+        if aged_cache_meta:
+            aged_per_sku = aged_cache_meta.get("per_sku") or {}
+        else:
+            aged_per_sku = await amazon_sp.fetch_aged_inventory_fees_per_sku()
+            await put_aged_inventory_cache(aged_per_sku)
+        for sku, b in aged_per_sku.items():
+            fee = float(b.get("monthly_fee") or 0)
+            if fee > 0:
+                aged_monthly_per_sku[sku] = fee
+    except Exception as e:
+        warnings.append(_sp_report_warning("Aged inventory", e))
+        if _is_sp_access_denied(e):
+            await put_aged_inventory_cache({})
+        aged_monthly_per_sku = None
+
+    if use_db:
+        product_fee_fallback = await aurora_data.product_fee_estimates_by_sku(
+            require_user(), skus,
+        )
+        fee_skus = data_resolver.skus_needing_fees_api(sku_data, product_fee_fallback)
+        batch_items = [
+            (sku_data[sku]["asin"], sku_data[sku]["revenue"] / sku_data[sku]["units"])
+            for sku in fee_skus
+            if sku_data[sku]["asin"] and sku_data[sku]["units"]
+            and sku_data[sku]["revenue"] > 0
+        ]
+    else:
+        batch_items = [
+            (sku_data[sku]["asin"], sku_data[sku]["revenue"] / sku_data[sku]["units"])
+            for sku in skus
+            if sku_data[sku]["asin"] and sku_data[sku]["units"]
+            and sku_data[sku]["revenue"] > 0
+        ]
+
+    if batch_items:
+        try:
+            fees_by_asin = await amazon_sp.get_fees_estimates_batch(
+                batch_items, is_fba=True,
+            )
+        except Exception as e:
+            fee_errors_pre = [f"batch fees fetch failed: {str(e)[:200]}"]
+        else:
+            fee_errors_pre = []
+    else:
+        fee_errors_pre = []
+
+    # ── Ad allocation (Aurora `ads` collection when DB mode) ─────────────
     # Per-SKU when a campaign lists its SKUs (Aurora Ad.skus[]); campaigns
     # without a SKU list fall into `unattributed` and get spread uniformly
     # per unit (legacy behavior).
@@ -799,123 +1011,12 @@ async def compute_profitability_data(
         ad_unattributed / total_units_window if total_units_window > 0 else 0.0
     )
 
-    # ── Finances API — return processing, low inventory, inbound placement,
-    # aged inventory surcharge, removal fees. Per-SKU where Amazon
-    # attributes; otherwise the totals land in `unattributed_fees` and
-    # get spread uniformly per unit (same treatment as ads).
-    fin_by_sku: dict[str, dict] = {}
-    unattributed_fees = amazon_sp._empty_fee_bucket()
-    try:
-        fin = await amazon_sp.get_financial_events(
-            posted_after=created_after, paginate=True,
-        )
-        fin_by_sku = fin.get("by_sku") or {}
-        unattributed_fees = fin.get("unattributed") or unattributed_fees
-    except Exception as e:
-        warnings.append(
-            f"Finances API fetch failed ({e}); return / low-inv / placement "
-            "/ aged / removal fees set to 0."
-        )
-
-    # Fees Amazon posted without a SellerSKU get spread across units — same
-    # allocation model we use for ads. Removals often lack SKU attribution
-    # (aggregated adjustments), so this matters.
-    unattr_per_unit = {
-        k: (unattributed_fees.get(k, 0.0) / total_units_window
-            if total_units_window > 0 else 0.0)
-        for k in ("return_processing", "low_inventory", "inbound_placement",
-                  "aged_inventory", "removal")
-    }
-
-    # ── Inbound placement fees: pulled from Amazon's Inbound Placement
-    # Service Fee report (GET_FBA_INBOUND_PLACEMENT_FEES_CHARGES_DATA) so
-    # we get the exact per-SKU × per-unit rate Amazon charged. Cached 24 h.
-    # Fees are booked at inbound receipt (not per sale), so we compute a
-    # lifetime weighted per-unit rate: fee_total / units_received across
-    # the report window, then bill units_sold_in_window × avg_per_unit.
-    # Supersedes the placement piece of `fin_by_sku` / `unattr_per_unit`.
-    placement_avg_per_unit: dict[str, float] | None = {}
-    placement_cache_meta = await get_placement_fee_cache(max_age_hours=24)
-    try:
-        if placement_cache_meta:
-            placement_per_sku = placement_cache_meta.get("per_sku") or {}
-        else:
-            placement_per_sku, months = (
-                await amazon_sp.fetch_inbound_placement_fees_per_sku(
-                    months_back=12
-                )
-            )
-            await put_placement_fee_cache(placement_per_sku, months)
-        for sku, b in placement_per_sku.items():
-            u = int(b.get("units_received") or 0)
-            if u > 0:
-                placement_avg_per_unit[sku] = float(b.get("fee_total") or 0) / u
-    except Exception as e:
-        import traceback as _tb
-        _tb.print_exc()
-        warnings.append(
-            f"Inbound placement resolution failed "
-            f"({type(e).__name__}: {e!r}); placement fees will fall "
-            "back to the in-window unattributed spread."
-        )
-        placement_avg_per_unit = None  # sentinel: use fallback below
-    placement_unresolved_per_unit = 0.0  # report is authoritative — no residual
-
-    # ── Aged inventory fees: Amazon's Inventory Planning report lists
-    # per-SKU `estimated-ais-<bucket>-days` — projected monthly aged
-    # inventory surcharge, already segmented by age bucket. We sum the
-    # buckets to a per-SKU monthly total and amortize over the sales
-    # window (× months_in_window), same shape as storage. Cached 24 h.
-    # Works on Draft SP-API apps (unlike LONGTERM_STORAGE_FEE_CHARGES).
-    aged_monthly_per_sku: dict[str, float] | None = {}
-    aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
-    try:
-        if aged_cache_meta:
-            aged_per_sku = aged_cache_meta.get("per_sku") or {}
-        else:
-            aged_per_sku = await amazon_sp.fetch_aged_inventory_fees_per_sku()
-            await put_aged_inventory_cache(aged_per_sku)
-        for sku, b in aged_per_sku.items():
-            fee = float(b.get("monthly_fee") or 0)
-            if fee > 0:
-                aged_monthly_per_sku[sku] = fee
-    except Exception as e:
-        import traceback as _tb
-        _tb.print_exc()
-        warnings.append(
-            f"Aged inventory resolution failed "
-            f"({type(e).__name__}: {e!r}); aged fees will fall back "
-            "to the in-window unattributed spread."
-        )
-        aged_monthly_per_sku = None  # sentinel: use fallback below
-
-    # ── Per-SKU enrichment: Fees API → referral, FBA, fuel ────────────────
+    # ── Per-SKU enrichment ────────────────────────────────────────────────
     months_in_window = max(window_days / 30.0, 0.01)
     rows: list[dict] = []
     totals = defaultdict(float)
     missing_cogs: list[dict] = []
-    fee_errors: list[str] = []
-
-    # Batch fetch fees for every SKU with an ASIN + price in one shot — one
-    # HTTP call per 20 ASINs vs one per SKU. Amazon caps the batch endpoint
-    # at 0.5 req/s but 20/call = ~10x the throughput of the singleton.
-    fees_by_asin: dict[str, dict] = {}
-    batch_items = [
-        (sku_data[sku]["asin"], sku_data[sku]["revenue"] / sku_data[sku]["units"])
-        for sku in skus
-        if sku_data[sku]["asin"] and sku_data[sku]["units"]
-        and sku_data[sku]["revenue"] > 0
-    ]
-    if batch_items:
-        try:
-            fees_by_asin = await amazon_sp.get_fees_estimates_batch(
-                batch_items, is_fba=True,
-            )
-        except Exception as e:
-            # Whole batch stack tripped — degrade to zero fees for all SKUs
-            # rather than blowing up the whole endpoint. Row-level errors
-            # still surface via `fee_errors`.
-            fee_errors.append(f"batch fees fetch failed: {str(e)[:200]}")
+    fee_errors: list[str] = list(fee_errors_pre)
 
     for sku in skus:
         d = sku_data[sku]
@@ -924,24 +1025,33 @@ async def compute_profitability_data(
         avg_price = revenue / units if units else 0.0
         asin = d["asin"]
 
-        # Amazon fees per unit at the SKU's average selling price
-        referral = fba = fuel = 0.0
-        if asin and avg_price > 0:
+        # Referral/FBA: DB line items → products.fees → Fees API fallback
+        referral_total = round(float(d.get("referral_total") or 0), 2)
+        fba_total = round(float(d.get("fba_total") or 0), 2)
+        fuel_total = 0.0
+        if referral_total == 0 and fba_total == 0 and sku in product_fee_fallback:
+            pf = product_fee_fallback[sku]
+            referral_total = round(pf.get("referral_per_unit", 0) * units, 2)
+            fba_total = round(pf.get("fba_per_unit", 0) * units, 2)
+            if not asin and pf.get("asin"):
+                asin = pf["asin"]
+        if referral_total == 0 and fba_total == 0 and asin and avg_price > 0:
             est = fees_by_asin.get(asin)
             if est:
-                referral = est.get("referral", 0.0)
-                fba = est.get("fba", 0.0)
-                fuel = est.get("fuel_surcharge", 0.0)
+                referral_total = round(float(est.get("referral", 0.0)) * units, 2)
+                fba_total = round(float(est.get("fba", 0.0)) * units, 2)
+                fuel_total = round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
                 if est.get("error"):
                     fee_errors.append(f"{sku} ({asin}): {str(est['error'])[:120]}")
+            elif use_db:
+                fee_errors.append(f"{sku} ({asin}): no fee data in DB or Fees API")
             else:
                 fee_errors.append(f"{sku} ({asin}): no estimate returned")
-        elif not asin:
+        elif not asin and avg_price > 0:
             fee_errors.append(f"{sku}: no ASIN found in order items")
+        if fuel_total == 0 and (referral_total > 0 or fba_total > 0):
+            fuel_total = round(fba_total * 0.035, 2)
 
-        referral_total = round(referral * units, 2)
-        fba_total = round(fba * units, 2)
-        fuel_total = round(fuel * units, 2)
         amazon_fees = round(referral_total + fba_total + fuel_total, 2)
 
         # Storage allocation: monthly per-ASIN × months in window
@@ -1077,7 +1187,7 @@ async def compute_profitability_data(
         "end": end_dt.date().isoformat(),
         "created_after": created_after,
         "created_before": created_before,
-        "orders_count": len(orders),
+        "orders_count": orders_count,
         "skus_count": len(skus),
         "rows": rows,
         "totals": totals_out,
@@ -1350,7 +1460,7 @@ TOOL_FUNCTIONS = {
 
 
 def _format_marketplaces() -> str:
-    rows = amazon_sp.list_marketplaces()
+    rows = data_resolver.list_marketplaces_resolved(require_user())
     if not rows:
         return "No marketplaces registered on this account."
     lines = ["The user is registered in the following marketplaces:"]

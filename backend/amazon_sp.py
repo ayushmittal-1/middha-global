@@ -220,7 +220,8 @@ def _sigv4_headers(
     access_key = AWS_ACCESS_KEY_ID or os.getenv("AWS_ACCESS_KEY_ID", "")
     secret_key = AWS_SECRET_ACCESS_KEY or os.getenv("AWS_SECRET_ACCESS_KEY", "")
     if not access_key or not secret_key:
-        raise RuntimeError("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set for SP-API")
+        # Aurora's amazon-sp-api npm client uses LWA access token only.
+        return headers
 
     parsed = urlparse(url)
     host = parsed.hostname
@@ -305,6 +306,10 @@ async def _sp_request(
         # more than 15 minutes (and is technically incorrect anyway).
         headers = {"content-type": "application/json"}
         _sigv4_headers(method, url, headers, sp_region, body=body_str)
+        if "x-amz-date" not in headers:
+            headers["x-amz-date"] = datetime.now(timezone.utc).strftime("%Y%m%dT%H:%M%SZ")
+        if "host" not in headers:
+            headers["host"] = urlparse(url).hostname or ""
         headers["x-amz-access-token"] = access_token
         headers["user-agent"] = "MiddhaGlobal/1.0 (Language=Python)"
 

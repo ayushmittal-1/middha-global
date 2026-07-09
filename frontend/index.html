@@ -500,56 +500,136 @@
 
     #restock-table-wrap {
       background: #fff;
-      border-radius: 10px;
-      border: 1px solid #e0e0e0;
-      overflow-y: auto;
+      border-radius: 12px;
+      border: 1px solid #e2e8f0;
+      overflow: auto;
       max-height: calc(100vh - 280px);
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
     }
     table.restock {
       width: 100%;
-      border-collapse: collapse;
+      border-collapse: separate;
+      border-spacing: 0;
       font-size: 13px;
+      min-width: 1100px;
     }
     table.restock thead th {
-      background: #f8f9fb;
-      color: #444;
+      background: #f1f5f9;
+      color: #334155;
       text-align: left;
-      padding: 10px 12px;
+      padding: 12px 14px;
       font-weight: 600;
       font-size: 11px;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
-      border-bottom: 1px solid #e0e0e0;
+      letter-spacing: 0.04em;
+      border-bottom: 2px solid #e2e8f0;
       position: sticky;
       top: 0;
-      z-index: 1;
+      z-index: 2;
+      white-space: nowrap;
+    }
+    table.restock thead th:first-child {
+      left: 0;
+      z-index: 3;
     }
     table.restock tbody tr {
-      border-bottom: 1px solid #f0f0f0;
+      border-bottom: 1px solid #f1f5f9;
       cursor: pointer;
-      transition: background 0.1s;
+      transition: background 0.12s ease;
     }
-    table.restock tbody tr:hover { background: #f8f9fb; }
+    table.restock tbody tr:nth-child(even) { background: #fafbfc; }
+    table.restock tbody tr:hover { background: #eef4ff; }
     table.restock tbody tr:last-child { border-bottom: none; }
     table.restock td {
-      padding: 11px 12px;
-      color: #222;
+      padding: 12px 14px;
+      color: #0f172a;
       vertical-align: middle;
+      line-height: 1.45;
     }
-    table.restock .num { text-align: right; font-variant-numeric: tabular-nums; }
+    table.restock td.sku-cell {
+      max-width: 240px;
+      min-width: 180px;
+      position: sticky;
+      left: 0;
+      z-index: 1;
+      background: inherit;
+      border-right: 1px solid #f1f5f9;
+    }
+    table.restock tbody tr:nth-child(even) td.sku-cell { background: #fafbfc; }
+    table.restock tbody tr:hover td.sku-cell { background: #eef4ff; }
+    table.restock .sku-name {
+      display: block;
+      font-weight: 600;
+      color: #0f172a;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    table.restock .num {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #1e293b;
+      white-space: nowrap;
+    }
+    table.restock .num-strong {
+      font-weight: 700;
+      color: #1d4ed8;
+    }
+    table.restock .date-cell {
+      color: #475569;
+      white-space: nowrap;
+      font-size: 12px;
+    }
+    table.restock .next-arrival {
+      font-size: 12px;
+      color: #334155;
+    }
+    table.restock .next-arrival strong { color: #0f172a; }
+    table.restock .next-arrival-none { color: #94a3b8; }
+    table.restock .next-arrival-more {
+      font-size: 11px;
+      color: #64748b;
+      margin-left: 4px;
+    }
     .urgency-pill {
       display: inline-block;
-      padding: 2px 8px;
+      padding: 4px 10px;
       border-radius: 999px;
       font-size: 12px;
       font-weight: 600;
       font-variant-numeric: tabular-nums;
+      white-space: nowrap;
     }
-    .urgency-red    { background: #ffe2e2; color: #b71c1c; }
-    .urgency-orange { background: #ffe9d0; color: #b35200; }
-    .urgency-amber  { background: #fff5cf; color: #8a6d00; }
-    .urgency-green  { background: #d8f3df; color: #1b5e20; }
-    .urgency-grey   { background: #ececf0; color: #555; }
+    .urgency-red    { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+    .urgency-orange { background: #ffedd5; color: #9a3412; border: 1px solid #fed7aa; }
+    .urgency-amber  { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; }
+    .urgency-green  { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+    .urgency-grey   { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }
+
+    .restock-loading {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      background: linear-gradient(135deg, #eff6ff, #f8fafc);
+      border: 1px solid #bfdbfe;
+      border-radius: 10px;
+      color: #1e40af;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .restock-loading.visible { display: flex; }
+    .restock-loading-spinner {
+      width: 16px;
+      height: 16px;
+      border: 2px solid #93c5fd;
+      border-top-color: #1d4ed8;
+      border-radius: 50%;
+      animation: restock-spin 0.7s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes restock-spin { to { transform: rotate(360deg); } }
 
     /* Orders tab — reuses .restock table styles */
     #orders-view {
@@ -777,15 +857,33 @@
       z-index: 1;
     }
     #profit-table-wrap tfoot td {
-      background: #f8f9fb;
-      padding: 11px 12px;
+      background: #f1f5f9;
+      color: #0f172a;
+      padding: 13px 14px;
       font-weight: 700;
       font-variant-numeric: tabular-nums;
-      border-top: 2px solid #e0e0e0;
+      border-top: 2px solid #cbd5e1;
+      position: sticky;
+      bottom: 0;
+      z-index: 2;
+      box-shadow: 0 -2px 8px rgba(15, 23, 42, 0.06);
+    }
+    table.restock.profit tbody td { color: #0f172a; }
+    table.restock.profit tbody td.num {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    #profit-table-wrap tfoot .profit-totals-label {
+      font-weight: 700;
+      color: #0f172a;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-size: 11px;
     }
     .margin-good { color: #1b5e20; }
     .margin-warn { color: #b35200; }
     .margin-bad  { color: #b71c1c; }
+    .profit-warning { color: #b45309; font-weight: 500; }
+    body.embedded-in-aurora .profit-warning { color: #fcd34d; }
     #campaigns-empty, #profit-empty {
       padding: 32px;
       text-align: center;
@@ -796,13 +894,16 @@
     }
 
     #restock-empty {
-      padding: 32px;
+      padding: 40px 24px;
       text-align: center;
-      color: #888;
-      background: #fff;
-      border: 1px dashed #d0d0d0;
-      border-radius: 10px;
+      color: #64748b;
+      background: #f8fafc;
+      border: 1px dashed #cbd5e1;
+      border-radius: 12px;
+      font-size: 14px;
+      line-height: 1.6;
     }
+    #restock-empty strong { color: #0f172a; }
 
     /* SKU drill-down side panel */
     #sku-drawer {
@@ -1030,11 +1131,157 @@
     }
     body.embedded-in-aurora #send-btn:hover { background: #1570d4; }
     body.embedded-in-aurora #send-btn:disabled { background: #334155; color: #94a3b8; }
-    body.embedded-in-aurora table,
-    body.embedded-in-aurora th,
-    body.embedded-in-aurora td {
+
+    /* Data tabs — dark cards so table text stays readable in Aurora embed */
+    body.embedded-in-aurora #restock-table-wrap,
+    body.embedded-in-aurora #orders-table-wrap,
+    body.embedded-in-aurora #campaigns-table-wrap,
+    body.embedded-in-aurora #profit-table-wrap {
+      background: #1e293b;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+    }
+    body.embedded-in-aurora table.restock thead th {
+      background: #0f172a;
+      color: #94a3b8;
+      border-bottom-color: rgba(255, 255, 255, 0.1);
+    }
+    body.embedded-in-aurora table.restock tbody tr {
+      border-bottom-color: rgba(255, 255, 255, 0.06);
+    }
+    body.embedded-in-aurora table.restock tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.02); }
+    body.embedded-in-aurora table.restock tbody tr:hover { background: rgba(30, 139, 255, 0.1); }
+    body.embedded-in-aurora table.restock td {
+      color: #f1f5f9;
+      border-color: rgba(255, 255, 255, 0.06);
+    }
+    body.embedded-in-aurora table.restock td.sku-cell {
+      border-right-color: rgba(255, 255, 255, 0.08);
+      background: #1e293b;
+    }
+    body.embedded-in-aurora table.restock tbody tr:nth-child(even) td.sku-cell { background: #1a2332; }
+    body.embedded-in-aurora table.restock tbody tr:hover td.sku-cell { background: #1e3a5f; }
+    body.embedded-in-aurora table.restock .sku-name { color: #f8fafc; }
+    body.embedded-in-aurora table.restock .num { color: #e2e8f0; }
+    body.embedded-in-aurora table.restock .num-strong { color: #93c5fd; }
+    body.embedded-in-aurora table.restock .date-cell { color: #cbd5e1; }
+    body.embedded-in-aurora table.restock .next-arrival { color: #cbd5e1; }
+    body.embedded-in-aurora table.restock .next-arrival strong { color: #f8fafc; }
+    body.embedded-in-aurora table.restock .next-arrival-none { color: #64748b; }
+    body.embedded-in-aurora .urgency-red    { background: rgba(239, 68, 68, 0.18); color: #fca5a5; border-color: rgba(239, 68, 68, 0.35); }
+    body.embedded-in-aurora .urgency-orange { background: rgba(249, 115, 22, 0.18); color: #fdba74; border-color: rgba(249, 115, 22, 0.35); }
+    body.embedded-in-aurora .urgency-amber  { background: rgba(234, 179, 8, 0.18); color: #fde047; border-color: rgba(234, 179, 8, 0.35); }
+    body.embedded-in-aurora .urgency-green  { background: rgba(34, 197, 94, 0.18); color: #86efac; border-color: rgba(34, 197, 94, 0.35); }
+    body.embedded-in-aurora .urgency-grey   { background: rgba(148, 163, 184, 0.15); color: #cbd5e1; border-color: rgba(148, 163, 184, 0.3); }
+
+    body.embedded-in-aurora #profit-table-wrap tfoot td {
+      background: #0f172a;
+      color: #f8fafc;
+      border-top: 2px solid rgba(30, 139, 255, 0.4);
+      box-shadow: 0 -6px 16px rgba(0, 0, 0, 0.35);
+    }
+    body.embedded-in-aurora #profit-table-wrap tfoot .profit-totals-label {
+      color: #93c5fd;
+    }
+    body.embedded-in-aurora #profit-table-wrap tfoot .num { color: #f1f5f9; }
+    body.embedded-in-aurora table.restock.profit tbody td { color: #f1f5f9; }
+    body.embedded-in-aurora .margin-good { color: #86efac !important; }
+    body.embedded-in-aurora .margin-warn { color: #fdba74 !important; }
+    body.embedded-in-aurora .margin-bad  { color: #fca5a5 !important; }
+    body.embedded-in-aurora .kpi-card {
+      background: #1e293b;
+      border-color: rgba(255, 255, 255, 0.1);
+    }
+    body.embedded-in-aurora .kpi-card .label { color: #94a3b8; }
+    body.embedded-in-aurora .kpi-card .value { color: #f8fafc; }
+    body.embedded-in-aurora #profit-caveats,
+    body.embedded-in-aurora #campaigns-recs {
+      background: rgba(234, 179, 8, 0.1);
+      border-color: rgba(234, 179, 8, 0.35);
+      color: #fde68a;
+    }
+    body.embedded-in-aurora #profit-caveats strong { color: #fef3c7; }
+    body.embedded-in-aurora #profit-caveats code {
+      background: rgba(0, 0, 0, 0.25);
+      color: #fef3c7;
+      padding: 1px 4px;
+      border-radius: 4px;
+    }
+
+    body.embedded-in-aurora #restock-toolbar h2,
+    body.embedded-in-aurora #orders-toolbar h2,
+    body.embedded-in-aurora #campaigns-toolbar h2,
+    body.embedded-in-aurora #profit-toolbar h2 { color: #f8fafc; }
+    body.embedded-in-aurora #restock-stamp,
+    body.embedded-in-aurora #orders-stamp,
+    body.embedded-in-aurora #campaigns-stamp,
+    body.embedded-in-aurora #profit-stamp { color: #94a3b8; }
+    body.embedded-in-aurora #restock-count {
+      background: rgba(30, 139, 255, 0.15);
+      color: #93c5fd;
+      border: 1px solid rgba(30, 139, 255, 0.25);
+    }
+    body.embedded-in-aurora #restock-show-no-demand-label { color: #cbd5e1; }
+    body.embedded-in-aurora #restock-toolbar button,
+    body.embedded-in-aurora #orders-toolbar #orders-refresh,
+    body.embedded-in-aurora #campaigns-refresh,
+    body.embedded-in-aurora #profit-refresh {
+      background: #1e8bff;
+      color: #fff;
+      border: none;
+    }
+    body.embedded-in-aurora #restock-toolbar button.secondary {
+      background: #1e293b;
       color: #e2e8f0;
-      border-color: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
+    body.embedded-in-aurora #restock-settings {
+      background: #1e293b;
+      border-color: rgba(255, 255, 255, 0.1);
+      color: #e2e8f0;
+    }
+    body.embedded-in-aurora #restock-settings label { color: #94a3b8; }
+    body.embedded-in-aurora #restock-settings input {
+      background: #0f172a;
+      border-color: rgba(255, 255, 255, 0.12);
+      color: #f8fafc;
+    }
+    body.embedded-in-aurora #restock-empty,
+    body.embedded-in-aurora #orders-empty,
+    body.embedded-in-aurora #campaigns-empty,
+    body.embedded-in-aurora #profit-empty {
+      background: #1e293b;
+      border-color: rgba(255, 255, 255, 0.12);
+      color: #94a3b8;
+    }
+    body.embedded-in-aurora #restock-empty strong { color: #e2e8f0; }
+    body.embedded-in-aurora .restock-loading {
+      background: rgba(30, 139, 255, 0.12);
+      border-color: rgba(30, 139, 255, 0.35);
+      color: #93c5fd;
+    }
+    body.embedded-in-aurora .restock-loading-spinner {
+      border-color: rgba(147, 197, 253, 0.35);
+      border-top-color: #93c5fd;
+    }
+    body.embedded-in-aurora #sku-drawer {
+      background: #1e293b;
+      box-shadow: -12px 0 40px rgba(0, 0, 0, 0.5);
+    }
+    body.embedded-in-aurora #sku-drawer .drawer-body {
+      background: #1e293b;
+      color: #e2e8f0;
+    }
+    body.embedded-in-aurora #orders-toolbar label,
+    body.embedded-in-aurora #profit-toolbar label {
+      color: #94a3b8;
+    }
+    body.embedded-in-aurora #orders-toolbar select,
+    body.embedded-in-aurora #orders-toolbar input,
+    body.embedded-in-aurora #profit-toolbar input {
+      background: #1e293b;
+      border-color: rgba(255, 255, 255, 0.12);
+      color: #f8fafc;
     }
   </style>
 </head>
@@ -1127,6 +1374,11 @@
         <button id="setting-save">Save</button>
       </div>
 
+      <div id="restock-loading" class="restock-loading" aria-live="polite">
+        <span class="restock-loading-spinner" aria-hidden="true"></span>
+        <span id="restock-loading-text">Loading sales history and fitting forecasts…</span>
+      </div>
+
       <div id="restock-table-wrap">
         <table class="restock">
           <thead>
@@ -1148,7 +1400,9 @@
         </table>
       </div>
       <div id="restock-empty" style="display:none;">
-        No forecasts yet. Click <strong>Refresh forecasts</strong> once your SP-API data has been ingested.
+        No forecasts yet. Click <strong>Refresh forecasts</strong> to load sales history from Aurora
+        (or Amazon if not synced yet) and generate restock recommendations.
+        <span id="restock-empty-hint"></span>
       </div>
     </div>
 
@@ -1761,6 +2015,10 @@
     const restockViewEl = document.getElementById('restock-view');
     const restockBodyEl = document.getElementById('restock-body');
     const restockEmptyEl = document.getElementById('restock-empty');
+    const restockEmptyHintEl = document.getElementById('restock-empty-hint');
+    const restockLoadingEl = document.getElementById('restock-loading');
+    const restockLoadingTextEl = document.getElementById('restock-loading-text');
+    const restockTableWrapEl = document.getElementById('restock-table-wrap');
     const restockStampEl = document.getElementById('restock-stamp');
     const restockCountEl = document.getElementById('restock-count');
     const restockShowNoDemandEl = document.getElementById('restock-show-no-demand');
@@ -1883,6 +2141,38 @@
       return `${d.toFixed(1)} d`;
     }
 
+    function fmtRestockDate(iso) {
+      if (!iso || iso === '—') return '—';
+      try {
+        const d = new Date(iso.includes('T') ? iso : `${iso}T12:00:00`);
+        if (Number.isNaN(d.getTime())) return iso;
+        return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+      } catch (_) {
+        return iso;
+      }
+    }
+
+    function fmtRestockNum(n, decimals = 0) {
+      if (n === null || n === undefined) return '—';
+      return Number(n).toLocaleString(undefined, {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals,
+      });
+    }
+
+    function truncateSku(sku, maxLen = 44) {
+      const s = String(sku || '');
+      if (s.length <= maxLen) return s;
+      return `${s.slice(0, maxLen - 1)}…`;
+    }
+
+    function setRestockLoading(on, message) {
+      restockLoadingEl.classList.toggle('visible', on);
+      if (message) restockLoadingTextEl.textContent = message;
+      restockRefreshBtn.disabled = on;
+      restockSettingsToggle.disabled = on;
+    }
+
     function isNoDemand(row) {
       // A row is "no demand" when the model has no signal AND there's no
       // action to take: undefined days of cover and a zero PO suggestion.
@@ -1919,17 +2209,19 @@
         const airTip = `Dispatch by this date — ${row.air_transit_days ?? 10}d air transit to Amazon FC`;
         const oceanTip = `Dispatch by this date — ${row.ocean_transit_days ?? 45}d ocean transit to Amazon FC`;
         tr.innerHTML = `
-          <td><strong>${escapeHtml(row.sku)}</strong></td>
-          <td class="num">${row.on_hand ?? 0}</td>
-          <td class="num" title="${inboundTip}">${row.inbound ?? 0}</td>
+          <td class="sku-cell" title="${escapeHtml(row.sku)}">
+            <span class="sku-name">${escapeHtml(truncateSku(row.sku))}</span>
+          </td>
+          <td class="num">${fmtRestockNum(row.on_hand ?? 0)}</td>
+          <td class="num" title="${inboundTip}">${fmtRestockNum(row.inbound ?? 0)}</td>
           <td title="${inboundTip}">${nextArrivalCell}</td>
-          <td class="num">${(row.avg_daily_demand ?? 0).toFixed(2)}</td>
-          <td class="num">${row.next_30_day_forecast ?? 0}</td>
+          <td class="num">${fmtRestockNum(row.avg_daily_demand ?? 0, 2)}</td>
+          <td class="num">${fmtRestockNum(row.next_30_day_forecast ?? 0, 1)}</td>
           <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>
-          <td>${row.stockout_date ?? '—'}</td>
-          <td title="${airTip}">${row.reorder_by_date_air ?? '—'}</td>
-          <td title="${oceanTip}">${row.reorder_by_date_ocean ?? row.reorder_by_date_sea ?? '—'}</td>
-          <td class="num"><strong>${row.recommended_po_qty ?? 0}</strong></td>
+          <td class="date-cell">${fmtRestockDate(row.stockout_date)}</td>
+          <td class="date-cell" title="${airTip}">${fmtRestockDate(row.reorder_by_date_air)}</td>
+          <td class="date-cell" title="${oceanTip}">${fmtRestockDate(row.reorder_by_date_ocean ?? row.reorder_by_date_sea)}</td>
+          <td class="num num-strong">${fmtRestockNum(row.recommended_po_qty ?? 0)}</td>
         `;
         tr.addEventListener('click', () => openSkuDrawer(row.sku));
         restockBodyEl.appendChild(tr);
@@ -1947,9 +2239,11 @@
         restockCache = data.rows || [];
         if (restockCache.length === 0) {
           restockEmptyEl.style.display = 'block';
+          if (restockTableWrapEl) restockTableWrapEl.style.display = 'none';
           restockStampEl.textContent = '';
           return;
         }
+        if (restockTableWrapEl) restockTableWrapEl.style.display = '';
         let latest = '';
         for (const row of restockCache) {
           if (row.generated_at && row.generated_at > latest) latest = row.generated_at;
@@ -1967,19 +2261,25 @@
     restockShowNoDemandEl.addEventListener('change', renderRestockRows);
 
     restockRefreshBtn.addEventListener('click', async () => {
-      restockRefreshBtn.disabled = true;
       const orig = restockRefreshBtn.textContent;
-      restockRefreshBtn.textContent = 'Refreshing…';
+      setRestockLoading(true, 'Loading sales history from Aurora (first run may take a few minutes)…');
       try {
         const r = await fetch('/forecasting/refresh', {
           method: 'POST', headers: authHeaders(),
         });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || data.detail || `HTTP ${r.status}`);
+        setRestockLoading(true, 'Fitting forecasts for each SKU…');
         await loadRestock();
+        if ((data.skus || 0) === 0 && data.hint) {
+          restockEmptyHintEl.textContent = ' ' + data.hint;
+        } else {
+          restockEmptyHintEl.textContent = '';
+        }
       } catch (err) {
         alert(`Refresh failed: ${err}`);
       } finally {
-        restockRefreshBtn.disabled = false;
+        setRestockLoading(false);
         restockRefreshBtn.textContent = orig;
       }
     });
@@ -2280,8 +2580,8 @@
           }).join('');
           if (t) {
             profitFootEl.innerHTML = `
-              <tr>
-                <td>Totals</td>
+              <tr class="profit-totals-row">
+                <td class="profit-totals-label">Totals</td>
                 <td class="num">${t.units}</td>
                 <td class="num">—</td>
                 <td class="num">${money(t.revenue)}</td>
@@ -2304,7 +2604,7 @@
 
         const caveats = [];
         for (const w of data.warnings || []) {
-          caveats.push(`<span style="color:#b71c1c;">${escapeHtml(w)}</span>`);
+          caveats.push(`<span class="profit-warning">${escapeHtml(w)}</span>`);
         }
         for (const m of data.missing_cogs || []) {
           caveats.push(`COGS missing for <code>${escapeHtml(m.sku)}</code> (${m.units} units, $${m.revenue.toLocaleString()} revenue) — net overstated until uploaded.`);

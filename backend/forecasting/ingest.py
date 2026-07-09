@@ -131,30 +131,60 @@ def _aggregate_orders_tsv(text: str) -> list[dict]:
 
 
 async def _snapshot_inventory_today(user_id: ObjectId) -> int:
-    """Write today's FBA inventory snapshot for every SKU the user has.
-    Also returns a map of SKU → fulfillable that the caller can use for
-    stockout flagging."""
+    """Write today's FBA inventory snapshot for every SKU the user has."""
+    from aurora_data import aurora_db_enabled, inventory_snapshot_rows_from_products
+    from auth import _db as auth_db
+    import data_resolver
+
+    today = _day_floor(datetime.now(timezone.utc))
     try:
-        data = await amazon_sp.get_inventory_summaries(skus=None)
+        if aurora_db_enabled():
+            user = await auth_db().users.find_one({"_id": user_id})
+            if user:
+                summaries, _src = await data_resolver.fetch_inventory_resolved(user, skus=None)
+                rows = []
+                for s in summaries:
+                    sku = (s.get("sellerSku") or s.get("sku") or "").strip()
+                    if not sku:
+                        continue
+                    inv = s.get("inventoryDetails") or s.get("inventory") or {}
+                    rows.append({
+                        "sku": sku,
+                        "date": today,
+                        "fulfillable": int(inv.get("fulfillableQuantity") or inv.get("fulfillable") or 0),
+                        "inbound_working": int(inv.get("inboundWorkingQuantity") or inv.get("inbound_working") or 0),
+                        "inbound_shipped": int(inv.get("inboundShippedQuantity") or inv.get("inbound_shipped") or 0),
+                        "reserved": int(
+                            (inv.get("reservedQuantity") or {}).get("totalReservedQuantity")
+                            or inv.get("reserved") or 0
+                        ),
+                        "unfulfillable": int(
+                            (inv.get("unfulfillableQuantity") or {}).get("totalUnfulfillableQuantity")
+                            or inv.get("unfulfillable") or 0
+                        ),
+                    })
+            else:
+                rows = await inventory_snapshot_rows_from_products(user_id)
+        else:
+            data = await amazon_sp.get_inventory_summaries(skus=None)
+            rows = []
+            for s in data.get("payload", {}).get("inventorySummaries", []):
+                sku = (s.get("sellerSku") or "").strip()
+                if not sku:
+                    continue
+                inv = s.get("inventoryDetails") or {}
+                rows.append({
+                    "sku": sku,
+                    "date": today,
+                    "fulfillable": int(inv.get("fulfillableQuantity") or 0),
+                    "inbound_working": int(inv.get("inboundWorkingQuantity") or 0),
+                    "inbound_shipped": int(inv.get("inboundShippedQuantity") or 0),
+                    "reserved": int((inv.get("reservedQuantity") or {}).get("totalReservedQuantity") or 0),
+                    "unfulfillable": int((inv.get("unfulfillableQuantity") or {}).get("totalUnfulfillableQuantity") or 0),
+                })
     except Exception as e:
         log.warning("inventory snapshot failed: %s", e)
         return 0
-    today = _day_floor(datetime.now(timezone.utc))
-    rows: list[dict] = []
-    for s in data.get("payload", {}).get("inventorySummaries", []):
-        sku = (s.get("sellerSku") or "").strip()
-        if not sku:
-            continue
-        inv = s.get("inventoryDetails") or {}
-        rows.append({
-            "sku": sku,
-            "date": today,
-            "fulfillable": int(inv.get("fulfillableQuantity") or 0),
-            "inbound_working": int((inv.get("inboundWorkingQuantity") or 0)),
-            "inbound_shipped": int((inv.get("inboundShippedQuantity") or 0)),
-            "reserved": int((inv.get("reservedQuantity") or {}).get("totalReservedQuantity") or 0),
-            "unfulfillable": int((inv.get("unfulfillableQuantity") or {}).get("totalUnfulfillableQuantity") or 0),
-        })
     return await upsert_inventory_snapshot(user_id, rows)
 
 
@@ -181,27 +211,41 @@ async def _pull_orders_range(
     end: datetime,
     stockout_map: dict[str, int] | None = None,
 ) -> int:
-    """Request the orders report for [start, end), parse it, aggregate to
-    (sku, date), and upsert. Returns the number of rows written."""
+    """Aggregate orders for [start, end) and upsert salesDaily rows."""
+    from aurora_data import aurora_db_enabled, aggregate_sales_daily_from_orders
+
     log.info("orders ingest: %s → %s", start.date(), end.date())
-    resp = await amazon_sp.create_report(
-        ORDERS_REPORT,
-        start_date=start.isoformat(),
-        end_date=end.isoformat(),
-    )
-    report_id = resp.get("reportId")
-    if not report_id:
-        log.error("create_report returned no reportId: %s", resp)
-        return 0
-    text = await amazon_sp.download_report_raw(report_id)
-    rows = _aggregate_orders_tsv(text)
+    if aurora_db_enabled():
+        rows = await aggregate_sales_daily_from_orders(user_id, start, end)
+        if not rows:
+            log.info("orders ingest: DB empty — falling back to SP-API report")
+            resp = await amazon_sp.create_report(
+                ORDERS_REPORT,
+                start_date=start.isoformat(),
+                end_date=end.isoformat(),
+            )
+            report_id = resp.get("reportId")
+            if not report_id:
+                log.error("create_report returned no reportId: %s", resp)
+                return 0
+            text = await amazon_sp.download_report_raw(report_id)
+            rows = _aggregate_orders_tsv(text)
+    else:
+        resp = await amazon_sp.create_report(
+            ORDERS_REPORT,
+            start_date=start.isoformat(),
+            end_date=end.isoformat(),
+        )
+        report_id = resp.get("reportId")
+        if not report_id:
+            log.error("create_report returned no reportId: %s", resp)
+            return 0
+        text = await amazon_sp.download_report_raw(report_id)
+        rows = _aggregate_orders_tsv(text)
 
     today = _day_floor(datetime.now(timezone.utc))
     if stockout_map:
         for r in rows:
-            # We only have *today's* fulfillable count, so we can only
-            # stockout-correct rows from today. Historical stockouts will
-            # be detected forward-going as we accumulate snapshots.
             if r["date"] == today and stockout_map.get(r["sku"], 1) == 0:
                 r["stockout_corrected"] = True
 
@@ -211,12 +255,19 @@ async def _pull_orders_range(
 # ── Public entry points ────────────────────────────────────────────────────
 
 
-async def backfill_user(user: dict, days_back: int = 540) -> dict:
+async def backfill_user(
+    user: dict,
+    days_back: int = 540,
+    *,
+    include_ads: bool = True,
+) -> dict:
     """Initial pull for a freshly-connected user. ~18 months by default.
 
-    The orders report has a max window of 30 days per request, so we
-    chunk into 30-day windows.
+    In DB mode, aggregates all Aurora orders in one Mongo pass. When that
+    yields nothing, falls back to chunked SP-API order reports (30-day windows).
     """
+    from aurora_data import aurora_db_enabled, aggregate_sales_daily_from_orders
+
     user_id = ObjectId(str(user["_id"]))
     current_user.set(user)
     end = _day_floor(datetime.now(timezone.utc)) + timedelta(days=1)
@@ -226,23 +277,43 @@ async def backfill_user(user: dict, days_back: int = 540) -> dict:
     stockout_map = await _latest_fulfillable_map(user_id)
 
     sales_written = 0
-    cursor = earliest
-    while cursor < end:
-        window_end = min(cursor + timedelta(days=30), end)
+    if aurora_db_enabled():
         try:
-            sales_written += await _pull_orders_range(
-                user_id, cursor, window_end, stockout_map
-            )
+            rows = await aggregate_sales_daily_from_orders(user_id, earliest, end)
+            if rows:
+                today = _day_floor(datetime.now(timezone.utc))
+                if stockout_map:
+                    for r in rows:
+                        if r["date"] == today and stockout_map.get(r["sku"], 1) == 0:
+                            r["stockout_corrected"] = True
+                sales_written = await upsert_sales_daily(user_id, rows)
+                log.info(
+                    "backfill from Aurora DB: user=%s rows=%d",
+                    user_id, sales_written,
+                )
         except Exception as e:
-            log.error("backfill window %s–%s failed: %s", cursor.date(), window_end.date(), e)
-        cursor = window_end
+            log.error("Aurora DB backfill failed for user=%s: %s", user_id, e)
 
-    try:
-        from forecasting.ads_ingest import pull_ads_backfill
-        ads_written = await pull_ads_backfill(user, days_back=days_back)
-    except Exception as e:
-        log.warning("ads backfill failed for user=%s: %s", user_id, e)
-        ads_written = 0
+    if sales_written == 0:
+        cursor = earliest
+        while cursor < end:
+            window_end = min(cursor + timedelta(days=30), end)
+            try:
+                sales_written += await _pull_orders_range(
+                    user_id, cursor, window_end, stockout_map
+                )
+            except Exception as e:
+                log.error("backfill window %s–%s failed: %s", cursor.date(), window_end.date(), e)
+            cursor = window_end
+
+    ads_written = 0
+    if include_ads:
+        try:
+            from forecasting.ads_ingest import pull_ads_backfill
+            ads_written = await pull_ads_backfill(user, days_back=days_back)
+        except Exception as e:
+            log.warning("ads backfill failed for user=%s: %s", user_id, e)
+            ads_written = 0
 
     try:
         stockout_flagged = await mark_stockouts_for_user(user_id)
@@ -306,6 +377,37 @@ async def ingest_user_incremental(user: dict) -> dict:
         "traffic_rows": traffic_written,
         "ads_rows": ads_written,
         "stockouts_flagged": stockout_flagged,
+    }
+
+
+async def ensure_sales_history(user: dict, days_back: int = 180) -> dict:
+    """Populate salesDaily from Aurora DB (SP-API fallback) when empty.
+
+    Called before the first forecast refresh so the Restock tab works
+    without a separate manual ingest step.
+    """
+    from database import _sales_daily
+
+    user_id = ObjectId(str(user["_id"]))
+    current_user.set(user)
+    sales_count = await _sales_daily().count_documents({"userId": user_id})
+    if sales_count > 0:
+        inv = await _snapshot_inventory_today(user_id)
+        return {
+            "skipped": True,
+            "reason": "salesDaily already populated",
+            "sales_daily_rows": sales_count,
+            "inventory_rows": inv,
+        }
+
+    log.info("ensure_sales_history: backfilling user=%s days_back=%d", user_id, days_back)
+    backfill = await backfill_user(user, days_back=days_back, include_ads=False)
+    sales_after = await _sales_daily().count_documents({"userId": user_id})
+    return {
+        "skipped": False,
+        "days_back": days_back,
+        "sales_daily_rows": sales_after,
+        **backfill,
     }
 
 
