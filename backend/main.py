@@ -448,14 +448,27 @@ async def amazon_orders(
     created_before = end
     statuses = [s.strip() for s in status.split(",") if s.strip()] if status else None
 
-    data = await amazon_sp.get_orders(
-        created_after=created_after,
-        created_before=created_before,
-        statuses=statuses,
-        max_results=100,
-        marketplace=marketplace,
-        paginate=True,
-    )
+    try:
+        data = await amazon_sp.get_orders(
+            created_after=created_after,
+            created_before=created_before,
+            statuses=statuses,
+            max_results=100,
+            marketplace=marketplace,
+            paginate=True,
+        )
+    except Exception as e:
+        # Return a JSON error the FE can render, not FastAPI's bare 500.
+        # 429s are especially common on multi-marketplace sellers because
+        # Orders API is 1 req/min sustained and burst is shared LWA-wide.
+        msg = str(e)
+        return {
+            "error": f"Failed to fetch orders: {msg}",
+            "error_kind": "rate_limited" if "429" in msg else "orders_fetch_failed",
+            "count": 0, "orders": [],
+            "created_after": created_after,
+            "created_before": created_before,
+        }
     orders = (data.get("payload") or {}).get("Orders") or []
     if buyer_email:
         needle = buyer_email.lower()
@@ -463,12 +476,15 @@ async def amazon_orders(
             o for o in orders
             if needle in (o.get("BuyerInfo", {}).get("BuyerEmail") or "").lower()
         ]
-    return {
+    out = {
         "count": len(orders),
         "created_after": created_after,
         "created_before": created_before,
         "orders": orders,
     }
+    if data.get("_partial"):
+        out["partial_warning"] = data["_partial"]
+    return out
 
 
 @app.get("/amazon/orders/{order_id}/items")

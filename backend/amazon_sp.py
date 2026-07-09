@@ -35,7 +35,7 @@ _FEES_ESTIMATE_TTL_S = 30 * 60
 # so re-clicks (or the LLM tool + FE hitting profitability back-to-back)
 # should reuse the last result instead of re-paging.
 _ORDERS_CACHE: dict[tuple, tuple[float, dict]] = {}
-_ORDERS_CACHE_TTL_S = 5 * 60
+_ORDERS_CACHE_TTL_S = 30 * 60
 
 # ── App-level config (stays in env) ──────────────────────────────────────────
 
@@ -277,7 +277,7 @@ async def _sp_request(
     params: dict | None = None,
     body: dict | None = None,
     *,
-    max_429_retries: int = 5,
+    max_429_retries: int = 8,
 ) -> dict | list | str:
     """Make a signed SP-API request on behalf of the current authenticated user.
 
@@ -387,7 +387,7 @@ async def get_orders(
     # In-memory cache for paginated getOrders. Orders API is 0.0167 req/s
     # (1/min) — brutal on multi-page catalogs. A user re-clicking Apply on
     # the same window shouldn't repay that cost. Cache is per-process,
-    # 5 min TTL, keyed by the query params that define the window.
+    # 30 min TTL, keyed by the query params that define the window.
     user_id = str(user.get("_id") or user.get("id") or "")
     cache_key = (
         user_id, base_params["MarketplaceIds"],
@@ -404,6 +404,7 @@ async def get_orders(
     orders: list = []
     page_params = dict(base_params)
     page_num = 0
+    truncated_reason: str | None = None
     while True:
         # Pace pagination pages so we don't exhaust the 20-burst bucket in
         # one shot on a heavy catalog. 3s spacing = ~7 pages before we
@@ -412,7 +413,22 @@ async def get_orders(
         if page_num > 0:
             await asyncio.sleep(3.0)
         page_num += 1
-        resp = await _sp_request("GET", "/orders/v0/orders", params=page_params)
+        try:
+            resp = await _sp_request("GET", "/orders/v0/orders", params=page_params)
+        except Exception as e:
+            # If we've collected AT LEAST one page, degrade to partial
+            # results instead of losing all of it. Fresh call from a new
+            # process would just restart from page 1 on the same depleted
+            # bucket and fail the same way — better to hand back what we
+            # have plus a warning the FE can surface.
+            if orders:
+                truncated_reason = (
+                    f"pagination halted at page {page_num} after "
+                    f"{len(orders)} order(s): {str(e)[:200]}"
+                )
+                print(f"[sp-api] getOrders {truncated_reason}")
+                break
+            raise
         if not merged:
             merged = resp
         payload = resp.get("payload") or {}
@@ -429,7 +445,12 @@ async def get_orders(
         merged["payload"] = {}
     merged["payload"]["Orders"] = orders
     merged["payload"].pop("NextToken", None)
-    _ORDERS_CACHE[cache_key] = (now_ts, merged)
+    if truncated_reason:
+        merged["_partial"] = truncated_reason
+    # Only cache complete results; caching a partial page count would let
+    # a bad-luck 429 poison the window for 30 minutes.
+    if not truncated_reason:
+        _ORDERS_CACHE[cache_key] = (now_ts, merged)
     return merged
 
 

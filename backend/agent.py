@@ -670,8 +670,16 @@ async def compute_profitability_data(
             paginate=paginate,
         )
     except Exception as e:
-        return {"error": f"Error fetching orders: {e}"}
+        # Only bail out completely if this is likely an auth or config
+        # failure. For 429s especially, log-and-retry-later is better UX
+        # than a hard error — the FE can prompt the user to try again.
+        msg = str(e)
+        return {"error": f"Error fetching orders: {msg}",
+                "error_kind": "rate_limited" if "429" in msg else "orders_fetch_failed"}
     orders = orders_resp.get("payload", {}).get("Orders", [])
+    # get_orders may hand back partial results when pagination halts mid-way
+    # (heavily rate-limited windows). Surface the reason so the FE can warn.
+    partial_warning: str | None = orders_resp.get("_partial")
     if not orders:
         return {
             "orders_count": 0, "skus_count": 0, "rows": [], "totals": None,
@@ -753,6 +761,11 @@ async def compute_profitability_data(
 
     # ── Storage allocation (cached 24h) — keyed by ASIN, not SKU ──────────
     warnings: list[str] = []
+    if partial_warning:
+        warnings.append(
+            "Amazon Orders API rate-limited us mid-fetch — showing partial results. "
+            "Re-open this tab in a minute to see the full window."
+        )
     storage_per_asin_monthly: dict = {}
     storage_cached_at: str | None = None
     storage_meta = await get_storage_cache(max_age_hours=24)
