@@ -72,6 +72,14 @@ def _aged_inventory_cache():
     return _db().agedInventoryFeeCache
 
 
+def _product_settings():
+    return _db().productSettings
+
+
+def _purchase_orders():
+    return _db().purchaseOrders
+
+
 def _user_oid() -> ObjectId:
     user = require_user()
     return ObjectId(str(user["_id"]))
@@ -102,6 +110,13 @@ async def init_db():
     await _aged_inventory_cache().create_index(
         [("userId", 1)], unique=True
     )
+    await _product_settings().create_index(
+        [("userId", 1), ("sku", 1)], unique=True
+    )
+    await _purchase_orders().create_index(
+        [("userId", 1), ("poId", 1)], unique=True
+    )
+    await _purchase_orders().create_index([("userId", 1), ("sku", 1), ("status", 1)])
 
 
 # ── Conversations ────────────────────────────────────────────────────────
@@ -488,7 +503,7 @@ async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
     """
     cursor = _db().products.find(
         {"sellerId": user_id},
-        {"sku": 1, "inventory": 1, "lastSynced": 1, "_id": 0},
+        {"sku": 1, "asin": 1, "inventory": 1, "lastSynced": 1, "_id": 0},
     )
     out: dict[str, dict] = {}
     async for p in cursor:
@@ -498,6 +513,7 @@ async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
         inv = p.get("inventory") or {}
         out[sku] = {
             "sku": sku,
+            "asin": (p.get("asin") or "").strip() or None,
             "date": p.get("lastSynced"),
             "fulfillable": int(inv.get("fulfillableQuantity") or 0),
             "inbound_shipped": int(inv.get("inboundShippedQuantity") or 0),
@@ -658,3 +674,172 @@ async def update_forecast_settings(patch: dict) -> dict:
         upsert=True,
     )
     return await get_forecast_settings_for_user(user_id)
+
+
+# ── Per-SKU product settings (Actions modal) ─────────────────────────────
+
+DEFAULT_PRODUCT_SETTINGS: dict = {
+    # Manufacturing & logistics tab
+    "manufacturing_time_days": 35,
+    "use_prep_center": False,
+    "shipping_to_prep_days": 0,
+    "shipping_to_fba_days": None,     # None → falls back to global AIR_TRANSIT_DAYS
+    "fba_buffer_days": 0,
+    "target_stock_days": None,        # None → falls back to global target_cover_days
+    # Forecast tab
+    "velocity_weights": None,         # {"d3":..., "d7":..., "d30":..., "d60":..., "d180":...} or None
+    # Shipping to FBA tab (packing template — pure storage)
+    "packing": None,
+    # Purchase order tab (supplier — pure storage)
+    "supplier": None,
+    # Free-text comment (surfaces in restock table)
+    "comment": "",
+}
+
+
+def _merge_settings(doc: dict | None) -> dict:
+    """Overlay stored fields on the defaults so the caller always gets the
+    full shape (missing keys → defaults)."""
+    doc = doc or {}
+    merged = {**DEFAULT_PRODUCT_SETTINGS}
+    for k in DEFAULT_PRODUCT_SETTINGS:
+        if k in doc and doc[k] is not None:
+            merged[k] = doc[k]
+    return merged
+
+
+async def get_product_settings_for_user(user_id: ObjectId, sku: str) -> dict:
+    doc = await _product_settings().find_one(
+        {"userId": user_id, "sku": (sku or "").strip()},
+        {"_id": 0, "userId": 0},
+    )
+    return _merge_settings(doc)
+
+
+async def get_product_settings(sku: str) -> dict:
+    return await get_product_settings_for_user(_user_oid(), sku)
+
+
+async def all_product_settings_for_user(user_id: ObjectId) -> dict[str, dict]:
+    """Bulk-load settings for every SKU that has a saved row. Returned map
+    is keyed by sku and holds only the stored (non-default) subset — callers
+    that need defaults should merge on top."""
+    out: dict[str, dict] = {}
+    cursor = _product_settings().find(
+        {"userId": user_id}, {"_id": 0, "userId": 0},
+    )
+    async for r in cursor:
+        sku = (r.get("sku") or "").strip()
+        if not sku:
+            continue
+        out[sku] = _merge_settings(r)
+    return out
+
+
+_SETTINGS_ALLOWED = set(DEFAULT_PRODUCT_SETTINGS.keys())
+
+
+async def upsert_product_settings(sku: str, patch: dict) -> dict:
+    user_id = _user_oid()
+    sku = (sku or "").strip()
+    if not sku:
+        raise ValueError("sku required")
+    allowed = {k: v for k, v in patch.items() if k in _SETTINGS_ALLOWED}
+    allowed["updatedAt"] = datetime.now(timezone.utc)
+    await _product_settings().update_one(
+        {"userId": user_id, "sku": sku},
+        {"$set": allowed, "$setOnInsert": {"userId": user_id, "sku": sku}},
+        upsert=True,
+    )
+    return await get_product_settings_for_user(user_id, sku)
+
+
+# ── Purchase orders (drives the "Ordered" column) ────────────────────────
+
+async def list_purchase_orders(status: str | None = None) -> list[dict]:
+    query: dict = {"userId": _user_oid()}
+    if status:
+        query["status"] = status
+    cursor = _purchase_orders().find(query, {"_id": 0, "userId": 0}).sort("createdAt", -1)
+    rows = await cursor.to_list(length=None)
+    for r in rows:
+        for k in ("orderDate", "expectedDate", "createdAt", "updatedAt"):
+            v = r.get(k)
+            if isinstance(v, datetime):
+                r[k] = v.isoformat()
+    return rows
+
+
+async def open_ordered_qty_by_sku(user_id: ObjectId) -> dict[str, int]:
+    """Sum of outstanding (qty_ordered − qty_received) across all open POs,
+    keyed by SKU. Drives the "Ordered" column in the restock table."""
+    pipeline = [
+        {"$match": {"userId": user_id, "status": "open"}},
+        {"$group": {
+            "_id": "$sku",
+            "outstanding": {"$sum": {"$subtract": [
+                {"$ifNull": ["$qtyOrdered", 0]},
+                {"$ifNull": ["$qtyReceived", 0]},
+            ]}},
+        }},
+    ]
+    out: dict[str, int] = {}
+    async for r in _purchase_orders().aggregate(pipeline):
+        sku = (r.get("_id") or "").strip()
+        if sku:
+            out[sku] = int(max(0, r.get("outstanding", 0)))
+    return out
+
+
+async def upsert_purchase_order(patch: dict) -> dict:
+    """Create or update a PO. If `poId` is present the record is updated in
+    place; otherwise a new poId is minted."""
+    import uuid as _uuid
+    user_id = _user_oid()
+    po_id = (patch.get("poId") or _uuid.uuid4().hex).strip()
+    now = datetime.now(timezone.utc)
+
+    set_payload: dict = {"updatedAt": now}
+    for src, dst in [
+        ("sku", "sku"),
+        ("qty_ordered", "qtyOrdered"),
+        ("qty_received", "qtyReceived"),
+        ("status", "status"),          # 'open' | 'received' | 'cancelled'
+        ("supplier", "supplier"),
+        ("notes", "notes"),
+    ]:
+        if src in patch:
+            set_payload[dst] = patch[src]
+    # ISO strings from the FE → datetime for Mongo
+    for src, dst in [("order_date", "orderDate"), ("expected_date", "expectedDate")]:
+        if src in patch and patch[src]:
+            try:
+                set_payload[dst] = datetime.fromisoformat(patch[src].replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                pass
+
+    set_payload.setdefault("status", "open")
+
+    await _purchase_orders().update_one(
+        {"userId": user_id, "poId": po_id},
+        {
+            "$set": set_payload,
+            "$setOnInsert": {"userId": user_id, "poId": po_id, "createdAt": now},
+        },
+        upsert=True,
+    )
+    doc = await _purchase_orders().find_one(
+        {"userId": user_id, "poId": po_id}, {"_id": 0, "userId": 0},
+    )
+    for k in ("orderDate", "expectedDate", "createdAt", "updatedAt"):
+        v = (doc or {}).get(k)
+        if isinstance(v, datetime):
+            doc[k] = v.isoformat()
+    return doc or {}
+
+
+async def delete_purchase_order(po_id: str) -> int:
+    r = await _purchase_orders().delete_one(
+        {"userId": _user_oid(), "poId": (po_id or "").strip()},
+    )
+    return r.deleted_count

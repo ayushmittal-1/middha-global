@@ -146,6 +146,7 @@ def compute_reorder(
     settings: dict,
     shipments: list[dict] | None = None,
     today: datetime | None = None,
+    product_settings: dict | None = None,
 ) -> dict:
     """All reorder fields the dashboard / drawer / agent surface.
 
@@ -159,6 +160,9 @@ def compute_reorder(
     shipments : per-SKU active inbound shipments, each
         {shipment_id, eta, qty_outstanding, mode, carrier_name, status}.
         Empty list = no shipments in-flight for this SKU.
+    product_settings : per-SKU overrides from the Actions modal — controls
+        lead-time components (manufacturing, prep, FBA transit, buffer) and
+        can override the org-wide `target_cover_days`.
     """
     if today is None:
         today = datetime.now(timezone.utc)
@@ -166,18 +170,45 @@ def compute_reorder(
     # the frontend's day-granularity display.
     today = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
 
+    ps = product_settings or {}
+
+    # ── Per-SKU lead-time build-up ───────────────────────────────────────
+    # Air transit gets the seller's real supply chain: manufacturing time
+    # → shipping to prep center (only if they use one) → shipping to FBA
+    # → FBA buffer. Falls back to our regional default when nothing set.
+    fba_transit = ps.get("shipping_to_fba_days")
+    fba_transit = int(fba_transit) if fba_transit is not None else AIR_TRANSIT_DAYS
+    mfg_time = int(ps.get("manufacturing_time_days") or 0)
+    to_prep = int(ps.get("shipping_to_prep_days") or 0) if ps.get("use_prep_center") else 0
+    buffer = int(ps.get("fba_buffer_days") or 0)
+    air_lead_days = mfg_time + to_prep + fba_transit + buffer
+    ocean_lead_days = mfg_time + to_prep + OCEAN_TRANSIT_DAYS + buffer
+
     moq = int(settings.get("moq", 1))
-    target_cover = int(settings.get("target_cover_days", 90))
+    target_cover = int(
+        ps.get("target_stock_days") or settings.get("target_cover_days", 90)
+    )
     service_level = float(settings.get("service_level", 0.95))
 
     shipments = shipments or []
 
-    on_hand = int((inv_snapshot or {}).get("fulfillable", 0))
+    inv = inv_snapshot or {}
+    on_hand = int(inv.get("fulfillable", 0))
+    reserved = int(inv.get("reserved", 0))
+    # Amazon-side "sent to FBA" — units checked in / in-transit at Amazon,
+    # distinct from our own shipments-collection `inbound` sum.
+    sent_to_fba = int(inv.get("inbound_shipped", 0))
+    inbound_working = int(inv.get("inbound_working", 0))
+    unfulfillable = int(inv.get("unfulfillable", 0))
     inbound_outstanding = sum(int(s.get("qty_outstanding", 0)) for s in shipments)
 
     horizon_p50 = [float(r.get("p50", 0)) for r in forecast]
     empty_response = {
         "on_hand": on_hand,
+        "reserved": reserved,
+        "sent_to_fba": sent_to_fba,
+        "inbound_working": inbound_working,
+        "unfulfillable": unfulfillable,
         "inbound": inbound_outstanding,
         "avg_daily_demand": 0.0,
         "safety_stock": 0,
@@ -188,8 +219,8 @@ def compute_reorder(
         "reorder_by_date_air": None,
         "reorder_by_date_ocean": None,
         "reorder_by_date_sea": None,  # legacy alias
-        "air_transit_days": AIR_TRANSIT_DAYS,
-        "ocean_transit_days": OCEAN_TRANSIT_DAYS,
+        "air_transit_days": air_lead_days,
+        "ocean_transit_days": ocean_lead_days,
         "recommended_po_qty": 0,
         "service_level": service_level,
         "moq": moq,
@@ -229,8 +260,8 @@ def compute_reorder(
             latest = today
         return latest.date().isoformat()
 
-    reorder_by_date_air = _ship_by(AIR_TRANSIT_DAYS)
-    reorder_by_date_ocean = _ship_by(OCEAN_TRANSIT_DAYS)
+    reorder_by_date_air = _ship_by(air_lead_days)
+    reorder_by_date_ocean = _ship_by(ocean_lead_days)
 
     # Recommend enough to hit target_cover days after the ocean shipment
     # arrives, net of what's already inbound. Rough model — good enough
@@ -250,12 +281,16 @@ def compute_reorder(
 
     return {
         "on_hand": on_hand,
+        "reserved": reserved,
+        "sent_to_fba": sent_to_fba,
+        "inbound_working": inbound_working,
+        "unfulfillable": unfulfillable,
         "inbound": inbound_outstanding,
         "avg_daily_demand": round(avg_daily_overall, 2),
         # Safety stock kept in the response for backwards compat, but the
         # sim uses pure depletion so we report zero here.
         "safety_stock": 0,
-        "reorder_point": int(math.ceil(avg_daily_overall * AIR_TRANSIT_DAYS)),
+        "reorder_point": int(math.ceil(avg_daily_overall * air_lead_days)),
         "days_of_cover": round(days_of_cover, 1) if days_of_cover is not None else None,
         "stockout_date": stockout_date,
         # Legacy field — some agent code still reads it. Point at the
@@ -264,8 +299,8 @@ def compute_reorder(
         "reorder_by_date_air": reorder_by_date_air,
         "reorder_by_date_ocean": reorder_by_date_ocean,
         "reorder_by_date_sea": reorder_by_date_ocean,  # legacy alias
-        "air_transit_days": AIR_TRANSIT_DAYS,
-        "ocean_transit_days": OCEAN_TRANSIT_DAYS,
+        "air_transit_days": air_lead_days,
+        "ocean_transit_days": ocean_lead_days,
         "recommended_po_qty": recommended_po_qty,
         "service_level": service_level,
         "moq": moq,

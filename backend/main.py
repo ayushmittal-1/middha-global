@@ -1,3 +1,4 @@
+from ast import List
 import csv
 import io
 import json
@@ -31,6 +32,13 @@ from database import (
     get_forecast_cache,
     get_sales_daily,
     active_inbound_shipments_for_user,
+    get_product_settings,
+    upsert_product_settings,
+    all_product_settings_for_user,
+    list_purchase_orders,
+    upsert_purchase_order,
+    delete_purchase_order,
+    open_ordered_qty_by_sku,
 )
 from forecasting.ingest import (
     backfill_user,
@@ -337,18 +345,77 @@ async def update_forecasting_settings_endpoint(
 async def forecasting_restock(user: dict = Depends(protect)):
     """The Restock dashboard's data source. One row per SKU with the
     forecast headline, reorder math, and method used."""
+    from bson import ObjectId as _OID
+    user_id = _OID(str(user["_id"]))
+
     cached = await get_forecast_cache()
+
+    # Side joins for the derived columns.
+    cogs_rows = await get_cogs()
+    cogs_by_sku: dict[str, dict] = {r["sku"]: r for r in cogs_rows}
+    settings_by_sku = await all_product_settings_for_user(user_id)
+    ordered_by_sku = await open_ordered_qty_by_sku(user_id)
+
+    today = datetime.now(timezone.utc).date()
+
     rows = []
     for c in cached:
+        sku = c["sku"]
         reorder = c.get("reorder") or {}
         forecast = c.get("forecast") or []
         next30 = sum(float(r.get("p50", 0)) for r in forecast[:30])
+
+        # Stock value = (on_hand + reserved + inbound + sent_to_fba) × unit landed cost.
+        cogs = cogs_by_sku.get(sku) or {}
+        unit_cost = float(cogs.get("unit_cost") or 0)
+        unit_ship = float(cogs.get("inbound_shipping_per_unit") or 0)
+        landed_cost = unit_cost + unit_ship
+        stock_units = (
+            int(reorder.get("on_hand", 0))
+            + int(reorder.get("reserved", 0))
+            + int(reorder.get("sent_to_fba", 0))
+            + int(reorder.get("inbound_working", 0))
+        )
+        stock_value = round(stock_units * landed_cost, 2) if landed_cost > 0 else 0.0
+
+        # Missed profit estimate — count stockout-corrected days in the
+        # trailing 90-day history and value them at avg_daily_demand × margin.
+        # Margin here is a coarse proxy: (recent_avg_price − landed_cost).
+        # We don't have per-SKU price in this endpoint, so we skip pricing
+        # and just report the *unit* opportunity loss (velocity × oos_days)
+        # unless we can compute a real margin.
+        drivers = c.get("drivers") or {}
+        stockout_days = int(drivers.get("stockout_days_90d") or 0)
+        velocity = float(reorder.get("avg_daily_demand") or 0)
+        missed_units = round(stockout_days * velocity, 1)
+        # Placeholder — until price feeds in here we can only price the
+        # loss at landed cost margin ≈ 25% (rough). Better than nothing.
+        missed_profit_est = round(missed_units * landed_cost * 0.25, 2) if landed_cost > 0 else 0.0
+
+        # Days until next-order deadline (based on air ship-by date).
+        days_until_next_order = None
+        rba = reorder.get("reorder_by_date_air")
+        if rba:
+            try:
+                d = datetime.fromisoformat(rba).date()
+                days_until_next_order = (d - today).days
+            except ValueError:
+                pass
+
+        ps = settings_by_sku.get(sku) or {}
+
         rows.append({
-            "sku": c["sku"],
+            "sku": sku,
+            "asin": c.get("asin"),
             "method": c.get("method"),
             "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
             "on_hand": reorder.get("on_hand", 0),
+            "reserved": reorder.get("reserved", 0),
+            "sent_to_fba": reorder.get("sent_to_fba", 0),
+            "inbound_working": reorder.get("inbound_working", 0),
+            "unfulfillable": reorder.get("unfulfillable", 0),
             "inbound": reorder.get("inbound", 0),
+            "ordered": int(ordered_by_sku.get(sku) or 0),
             "avg_daily_demand": reorder.get("avg_daily_demand", 0),
             "next_30_day_forecast": round(next30, 1),
             "days_of_cover": reorder.get("days_of_cover"),
@@ -357,13 +424,19 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "reorder_by_date_air": reorder.get("reorder_by_date_air"),
             "reorder_by_date_ocean": reorder.get("reorder_by_date_ocean"),
             "reorder_by_date_sea": reorder.get("reorder_by_date_sea"),  # legacy alias
+            "days_until_next_order": days_until_next_order,
             "air_transit_days": reorder.get("air_transit_days"),
             "ocean_transit_days": reorder.get("ocean_transit_days"),
             "inbound_shipments_count": reorder.get("inbound_shipments_count", 0),
             "next_shipment_eta": reorder.get("next_shipment_eta"),
             "next_shipment_qty": reorder.get("next_shipment_qty"),
             "recommended_po_qty": reorder.get("recommended_po_qty", 0),
-            "drivers": c.get("drivers"),
+            "unit_cost": unit_cost,
+            "landed_cost": round(landed_cost, 4),
+            "stock_value": stock_value,
+            "missed_profit_est": missed_profit_est,
+            "comment": ps.get("comment") or "",
+            "drivers": drivers,
         })
     # Sort: stockouts first (None or low days_of_cover), then ascending.
     def _sort_key(r):
@@ -418,6 +491,7 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
 
     return {
         "sku": sku,
+        "asin": c.get("asin"),
         "method": c.get("method"),
         "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
         "horizon_days": c.get("horizon_days"),
@@ -427,6 +501,61 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
         "history": history,
         "inbound_shipments": shipments,
     }
+
+
+# ── Per-SKU product settings (Actions modal) ──────────────────────────────
+
+@app.get("/product-settings/{sku}")
+async def get_product_settings_endpoint(sku: str, user: dict = Depends(protect)):
+    """Full settings for one SKU + the computed velocity-windows table the
+    Forecast tab renders."""
+    from forecasting.model import compute_velocity_windows
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    settings = await get_product_settings(sku)
+    since = _dt.now(_tz.utc) - _td(days=200)
+    rows = await get_sales_daily(sku=sku, since=since)
+    windows = compute_velocity_windows(rows, _dt.now(_tz.utc))
+    return {"sku": sku, "settings": settings, "velocity_windows": windows}
+
+
+@app.put("/product-settings/{sku}")
+async def put_product_settings_endpoint(
+    sku: str, patch: dict, user: dict = Depends(protect),
+):
+    settings = await upsert_product_settings(sku, patch)
+    return {"sku": sku, "settings": settings}
+
+
+# ── Purchase orders (drives the "Ordered" column) ────────────────────────
+
+@app.get("/purchase-orders")
+async def list_purchase_orders_endpoint(
+    status: str | None = None, user: dict = Depends(protect),
+):
+    return {"rows": await list_purchase_orders(status=status)}
+
+
+@app.post("/purchase-orders")
+async def create_purchase_order_endpoint(
+    body: dict, user: dict = Depends(protect),
+):
+    return await upsert_purchase_order(body)
+
+
+@app.patch("/purchase-orders/{po_id}")
+async def update_purchase_order_endpoint(
+    po_id: str, body: dict, user: dict = Depends(protect),
+):
+    body["poId"] = po_id
+    return await upsert_purchase_order(body)
+
+
+@app.delete("/purchase-orders/{po_id}")
+async def delete_purchase_order_endpoint(
+    po_id: str, user: dict = Depends(protect),
+):
+    n = await delete_purchase_order(po_id)
+    return {"deleted": n}
 
 
 # ── Amazon SP-API data endpoints (for FE tables) ───────────────────────────
@@ -746,16 +875,16 @@ async def select_profile(profile_id: str, user: dict = Depends(protect)):
 # ==========================================
 # NEW ROUTE: AMAZON BRAND ANALYTICS
 # ==========================================
-from fastapi import HTTPException
-
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List
 
 class BrandAnalyticsRequest(BaseModel):
-    keywords: list[str]
+    keywords: List[str]
     start_date: str
     end_date: str
     period: str = "WEEK"
     marketplace: str | None = None
-
 
 @app.post("/brand-analytics/keyword-matches")
 async def get_keyword_matches(request: BrandAnalyticsRequest, user: dict = Depends(protect)):
@@ -768,19 +897,22 @@ async def get_keyword_matches(request: BrandAnalyticsRequest, user: dict = Depen
             start_date=request.start_date,
             end_date=request.end_date,
             period=request.period,
-            marketplace=request.marketplace,
+            marketplace=request.marketplace
         )
-        return {"status": "success", "data": results}
+
+        return {
+            "status": "success",
+            "data": results
+        }
 
     except Exception as e:
         import traceback
         print(traceback.format_exc())
+
         raise HTTPException(
             status_code=500,
-            detail=f"Error retrieving brand analytics: {str(e)}",
+            detail=f"Error retrieving brand analytics: {str(e)}"
         )
-
-
 # Serve frontend static files
 frontend_dir = Path(__file__).parent.parent / "frontend"
 app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")

@@ -28,6 +28,7 @@ from bson import ObjectId
 from database import (
     _forecast_cache,
     active_inbound_shipments_for_user,
+    all_product_settings_for_user,
     get_forecast_settings_for_user,
     get_sales_daily_for_user,
     latest_inventory_for_user,
@@ -39,6 +40,82 @@ log = logging.getLogger("forecasting.model")
 
 MIN_HISTORY_DAYS = 60
 DEFAULT_HORIZON = 90
+
+# Lookback windows shown in the Actions modal's Forecast tab.
+VELOCITY_WINDOWS = (3, 7, 30, 60, 180)
+
+
+def compute_velocity_windows(
+    rows: list[dict], today: datetime | None = None
+) -> list[dict]:
+    """Per-window sales velocity table (mirrors SellerBoard's Forecast tab).
+
+    For each lookback window (3/7/30/60/180 days ending yesterday):
+      - `units_sold`   = sum of units_ordered in the window
+      - `days_in_stock` = count of days where NOT stockout_corrected
+      - `velocity`     = units_sold / days_in_stock (0 when no stock days)
+
+    Out-of-stock days are ignored in the denominator so a temporary
+    stockout doesn't drag the velocity number down.
+    """
+    if today is None:
+        today = datetime.now(timezone.utc)
+    end = datetime(today.year, today.month, today.day, tzinfo=timezone.utc) - timedelta(days=1)
+
+    normalised: list[tuple[datetime, int, bool]] = []
+    for r in rows or []:
+        d = r.get("date")
+        if isinstance(d, datetime):
+            d = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+        else:
+            continue
+        units = int(r.get("units_ordered") or 0)
+        oos = bool(r.get("stockout_corrected", False))
+        normalised.append((d, units, oos))
+
+    out = []
+    for w in VELOCITY_WINDOWS:
+        start = end - timedelta(days=w - 1)
+        units_sold = 0
+        days_in_stock = 0
+        seen: set[datetime] = set()
+        for d, units, oos in normalised:
+            if start <= d <= end:
+                units_sold += units
+                if not oos:
+                    seen.add(d)
+        days_in_stock = len(seen)
+        velocity = (units_sold / days_in_stock) if days_in_stock > 0 else 0.0
+        out.append({
+            "period_days": w,
+            "days_in_stock": days_in_stock,
+            "units_sold": units_sold,
+            "velocity": round(velocity, 2),
+        })
+    return out
+
+
+def weighted_velocity(windows: list[dict], weights: dict | None) -> float | None:
+    """Weighted average across the lookback windows.
+
+    `weights` is a `{d3, d7, d30, d60, d180}` dict (any missing key = 0).
+    Returns None when no positive weights are provided — signals the caller
+    to skip the blend.
+    """
+    if not weights:
+        return None
+    key_map = {3: "d3", 7: "d7", 30: "d30", 60: "d60", 180: "d180"}
+    num = 0.0
+    denom = 0.0
+    for w in windows:
+        wt = float(weights.get(key_map.get(w["period_days"], ""), 0) or 0)
+        if wt <= 0:
+            continue
+        num += wt * float(w["velocity"])
+        denom += wt
+    if denom <= 0:
+        return None
+    return round(num / denom, 4)
 
 
 def _is_real_sku(sku: str) -> bool:
@@ -292,6 +369,9 @@ async def refresh_forecasts_for_user(
     settings = await get_forecast_settings_for_user(user_id)
     # Pulled once; each SKU's shipments feed the stockout timeline sim.
     shipments_by_sku = await active_inbound_shipments_for_user(user_id)
+    # Per-SKU overrides from the Actions modal (lead-time, target cover,
+    # velocity weights). Empty dict if the user hasn't opened the modal yet.
+    product_settings_by_sku = await all_product_settings_for_user(user_id)
 
     written = 0
     methods: dict[str, int] = {}
@@ -301,12 +381,43 @@ async def refresh_forecasts_for_user(
         except Exception as e:
             log.exception("forecast failed for sku=%s: %s", sku, e)
             continue
+
+        ps = product_settings_by_sku.get(sku) or {}
+
+        # ── Weighted-velocity blend ─────────────────────────────────
+        # If the seller has assigned weights across the 3/7/30/60/180
+        # lookback windows, rescale Prophet's p50/p90 so the *level*
+        # matches their opinion while preserving seasonality/DOW shape.
+        windows = compute_velocity_windows(rows, today)
+        w_vel = weighted_velocity(windows, ps.get("velocity_weights"))
+        blend_scale: float | None = None
+        if w_vel is not None:
+            model_recent = float((result.get("drivers") or {}).get("recent_avg") or 0.0)
+            if model_recent > 0:
+                blend_scale = w_vel / model_recent
+                for r in result.get("forecast") or []:
+                    r["p50"] = round(float(r.get("p50", 0)) * blend_scale, 2)
+                    r["p90"] = round(float(r.get("p90", 0)) * blend_scale, 2)
+            elif w_vel > 0:
+                # Model saw no recent demand but the user says X/day —
+                # emit a flat forecast at that level so the reorder math
+                # has something to work with.
+                for r in result.get("forecast") or []:
+                    r["p50"] = round(w_vel, 2)
+                    r["p90"] = round(w_vel * 1.5, 2)
+
         result["sku"] = sku
+        result["asin"] = (inv_map.get(sku) or {}).get("asin")
         result["horizon_days"] = horizon
+        result["velocity_windows"] = windows
+        result["weighted_velocity"] = w_vel
+        if blend_scale is not None:
+            result.setdefault("drivers", {})["blend_scale"] = round(blend_scale, 3)
         result["reorder"] = compute_reorder(
             result["forecast"], inv_map.get(sku), result["drivers"], settings,
             shipments=shipments_by_sku.get(sku, []),
             today=today,
+            product_settings=ps,
         )
         await upsert_forecast_cache(user_id, sku, result)
         methods[result["method"]] = methods.get(result["method"], 0) + 1

@@ -905,6 +905,123 @@
     }
     #restock-empty strong { color: #0f172a; }
 
+    /* ── Actions button + Product Settings modal ─────────────────── */
+    table.restock .actions-cell { text-align: center; padding: 4px; }
+    .actions-btn {
+      background: transparent;
+      border: 1px solid #e0e4ea;
+      border-radius: 6px;
+      width: 30px; height: 26px;
+      font-size: 18px; line-height: 1;
+      color: #64748b;
+      cursor: pointer;
+    }
+    .actions-btn:hover { background: #eef4ff; color: #1e293b; border-color: #93c5fd; }
+    table.restock .comment-cell { max-width: 160px; color: #475569; }
+
+    #settings-modal-overlay {
+      position: fixed; inset: 0;
+      background: rgba(15, 23, 42, 0.55);
+      display: none; z-index: 950;
+    }
+    #settings-modal-overlay.visible { display: flex; align-items: center; justify-content: center; }
+    #settings-modal {
+      background: #fff;
+      width: 780px; max-width: 92vw; max-height: 88vh;
+      border-radius: 8px;
+      box-shadow: 0 24px 48px rgba(0,0,0,0.24);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    #settings-modal header {
+      background: #3b82f6;
+      color: #fff;
+      padding: 14px 20px;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    #settings-modal header h3 { margin: 0; font-size: 17px; font-weight: 600; }
+    #settings-modal header button {
+      background: transparent; border: none; color: #fff;
+      font-size: 22px; cursor: pointer;
+    }
+    #settings-tabs {
+      display: flex; border-bottom: 1px solid #e5e7eb;
+      padding: 0 20px;
+    }
+    #settings-tabs button {
+      background: transparent; border: none;
+      padding: 12px 16px;
+      color: #64748b; font-size: 14px; cursor: pointer;
+      border-bottom: 2px solid transparent;
+    }
+    #settings-tabs button.active {
+      color: #3b82f6; border-bottom-color: #3b82f6; font-weight: 600;
+    }
+    #settings-body {
+      flex: 1; overflow-y: auto;
+      padding: 20px 24px;
+    }
+    #settings-body .settings-row {
+      display: grid;
+      grid-template-columns: 1fr 260px;
+      gap: 16px;
+      align-items: center;
+      padding: 12px 0;
+      border-bottom: 1px solid #f1f5f9;
+    }
+    #settings-body .settings-row:last-child { border-bottom: none; }
+    #settings-body .settings-row label { color: #334155; font-size: 14px; }
+    #settings-body .settings-row input[type="number"],
+    #settings-body .settings-row input[type="text"],
+    #settings-body .settings-row select,
+    #settings-body .settings-row textarea {
+      width: 100%; padding: 8px 10px;
+      border: 1px solid #cbd5e1; border-radius: 6px;
+      font-size: 14px;
+    }
+    #settings-body .settings-row input[type="checkbox"] { transform: scale(1.15); }
+    #settings-body .velocity-table {
+      width: 100%; border-collapse: collapse;
+      margin-top: 8px;
+    }
+    #settings-body .velocity-table th, #settings-body .velocity-table td {
+      padding: 8px 10px; text-align: left;
+      border-bottom: 1px solid #f1f5f9; font-size: 13px;
+    }
+    #settings-body .velocity-table th { color: #64748b; font-weight: 500; }
+    #settings-body .velocity-table tbody tr:nth-child(even) { background: #f8fafc; }
+    #settings-body .velocity-table input {
+      width: 80px; padding: 5px 8px;
+      border: 1px solid #cbd5e1; border-radius: 6px;
+      font-size: 13px;
+    }
+    #settings-body .weighted-summary {
+      margin-top: 12px; padding: 10px 12px;
+      background: #eff6ff; border-radius: 6px;
+      color: #1e40af; font-size: 13px;
+    }
+    #settings-body .weighted-summary strong { font-size: 15px; }
+    #settings-footer {
+      display: flex; justify-content: flex-end; gap: 10px;
+      padding: 12px 20px;
+      border-top: 1px solid #e5e7eb;
+    }
+    #settings-footer button {
+      padding: 8px 20px; border-radius: 6px;
+      font-size: 14px; cursor: pointer;
+      border: 1px solid #cbd5e1; background: #fff; color: #334155;
+    }
+    #settings-footer button.primary {
+      background: #3b82f6; color: #fff; border-color: #3b82f6;
+    }
+    #settings-footer button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    #settings-body h4 {
+      margin: 0 0 12px 0; font-size: 14px; color: #334155;
+    }
+    #settings-body .field-hint {
+      font-size: 12px; color: #94a3b8; margin-top: 4px;
+    }
+
     /* SKU drill-down side panel */
     #sku-drawer {
       position: fixed;
@@ -1384,7 +1501,12 @@
           <thead>
             <tr>
               <th>SKU</th>
+              <th title="Amazon Standard Identification Number">ASIN</th>
               <th class="num">On hand</th>
+              <th class="num" title="Units set aside by Amazon for pending customer orders / FC transfers / processing — not sellable right now">Reserved</th>
+              <th class="num" title="Units Amazon has received into the network but not yet checked into the destination FC (inboundShippedQuantity)">Sent to FBA</th>
+              <th class="num" title="Units on an inbound shipment plan you've created but not yet shipped (inboundWorkingQuantity)">Inbound working</th>
+              <th class="num" title="Damaged or customer-returned units currently unsellable">Unfulfillable</th>
               <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th>
               <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next arrival</th>
               <th class="num" title="Forecasted average orders per day (drives the stockout timeline and ship-by dates)">Orders/day</th>
@@ -1393,7 +1515,13 @@
               <th title="Projected stockout date given on-hand + inbound shipments − daily demand">Stockout on</th>
               <th title="Latest date to dispatch a shipment via air freight (~10d transit to Amazon FC)">Ship by (Air)</th>
               <th title="Latest date to dispatch a shipment via ocean freight (~45d transit to Amazon FC)">Ship by (Ocean)</th>
+              <th class="num" title="Days until you need to dispatch by air (delta from today to Ship by Air). Negative = you're late.">Days until next order</th>
               <th class="num">Suggested qty</th>
+              <th class="num" title="Units on your open purchase orders that haven't arrived at your warehouse / prep center yet">Ordered</th>
+              <th class="num" title="(On hand + Reserved + Sent to FBA + Inbound working) × landed cost from your COGS">Stock value</th>
+              <th class="num" title="Rough estimate of profit lost during stockout days over the last 90d, using ~25% margin on landed cost">Missed profit (est.)</th>
+              <th title="Free-text notes for this SKU (set via the Actions menu)">Comment</th>
+              <th title="Per-SKU manufacturing / forecast / packing / supplier settings">Actions</th>
             </tr>
           </thead>
           <tbody id="restock-body"></tbody>
@@ -1559,6 +1687,27 @@
       </div>
       <div id="cogs-empty" style="display:none; padding:20px; color:#888;">
         No COGS rows yet. Add one above or upload a CSV from the sidebar.
+      </div>
+    </div>
+  </div>
+
+  <!-- Product Settings modal (opened by the ⋯ action in each restock row) -->
+  <div id="settings-modal-overlay">
+    <div id="settings-modal">
+      <header>
+        <h3 id="settings-modal-title">Product Settings</h3>
+        <button id="settings-close-btn" title="Close">&times;</button>
+      </header>
+      <div id="settings-tabs">
+        <button class="active" data-tab="mfg">Manufacturing &amp; logistics</button>
+        <button data-tab="forecast">Forecast</button>
+        <button data-tab="shipping">Shipping to FBA</button>
+        <button data-tab="po">Purchase order</button>
+      </div>
+      <div id="settings-body"></div>
+      <div id="settings-footer">
+        <button id="settings-cancel-btn">Cancel</button>
+        <button id="settings-save-btn" class="primary">Apply</button>
       </div>
     </div>
   </div>
@@ -2141,6 +2290,12 @@
       return `${d.toFixed(1)} d`;
     }
 
+    function fmtDaysUntil(d) {
+      if (d === null || d === undefined) return '—';
+      if (d === 0) return 'today';
+      return d > 0 ? `${d}d` : `${d}d (late)`;
+    }
+
     function fmtRestockDate(iso) {
       if (!iso || iso === '—') return '—';
       try {
@@ -2212,7 +2367,12 @@
           <td class="sku-cell" title="${escapeHtml(row.sku)}">
             <span class="sku-name">${escapeHtml(truncateSku(row.sku))}</span>
           </td>
+          <td title="${escapeHtml(row.asin || '')}">${escapeHtml(row.asin || '—')}</td>
           <td class="num">${fmtRestockNum(row.on_hand ?? 0)}</td>
+          <td class="num">${fmtRestockNum(row.reserved ?? 0)}</td>
+          <td class="num">${fmtRestockNum(row.sent_to_fba ?? 0)}</td>
+          <td class="num">${fmtRestockNum(row.inbound_working ?? 0)}</td>
+          <td class="num">${fmtRestockNum(row.unfulfillable ?? 0)}</td>
           <td class="num" title="${inboundTip}">${fmtRestockNum(row.inbound ?? 0)}</td>
           <td title="${inboundTip}">${nextArrivalCell}</td>
           <td class="num">${fmtRestockNum(row.avg_daily_demand ?? 0, 2)}</td>
@@ -2221,9 +2381,24 @@
           <td class="date-cell">${fmtRestockDate(row.stockout_date)}</td>
           <td class="date-cell" title="${airTip}">${fmtRestockDate(row.reorder_by_date_air)}</td>
           <td class="date-cell" title="${oceanTip}">${fmtRestockDate(row.reorder_by_date_ocean ?? row.reorder_by_date_sea)}</td>
+          <td class="num">${fmtDaysUntil(row.days_until_next_order)}</td>
           <td class="num num-strong">${fmtRestockNum(row.recommended_po_qty ?? 0)}</td>
+          <td class="num">${fmtRestockNum(row.ordered ?? 0)}</td>
+          <td class="num">${row.stock_value > 0 ? '$' + fmtRestockNum(row.stock_value, 2) : '—'}</td>
+          <td class="num">${row.missed_profit_est > 0 ? '$' + fmtRestockNum(row.missed_profit_est, 2) : '$0.00'}</td>
+          <td class="comment-cell" title="${escapeHtml(row.comment || '')}">${escapeHtml(row.comment ? (row.comment.length > 30 ? row.comment.slice(0, 30) + '…' : row.comment) : '—')}</td>
+          <td class="actions-cell"><button class="actions-btn" data-sku="${escapeHtml(row.sku)}" title="Product settings">⋯</button></td>
         `;
-        tr.addEventListener('click', () => openSkuDrawer(row.sku));
+        // Row click opens the forecast drawer; the Actions button opens
+        // the settings modal instead (stopPropagation so it doesn't do both).
+        tr.addEventListener('click', (ev) => {
+          if (ev.target.closest('.actions-btn')) return;
+          openSkuDrawer(row.sku);
+        });
+        tr.querySelector('.actions-btn').addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          openProductSettingsModal(row.sku);
+        });
         restockBodyEl.appendChild(tr);
       }
     }
@@ -2774,6 +2949,276 @@
     document.getElementById('sku-drawer-close').addEventListener('click', closeDrawer);
     drawerOverlay.addEventListener('click', closeDrawer);
 
+    // ── Product Settings modal ────────────────────────────────────
+    const settingsOverlay = document.getElementById('settings-modal-overlay');
+    const settingsBody = document.getElementById('settings-body');
+    const settingsTitle = document.getElementById('settings-modal-title');
+    const settingsTabsEl = document.getElementById('settings-tabs');
+    const settingsSaveBtn = document.getElementById('settings-save-btn');
+    let settingsState = { sku: null, tab: 'mfg', settings: {}, windows: [] };
+
+    function closeSettingsModal() {
+      settingsOverlay.classList.remove('visible');
+      settingsState = { sku: null, tab: 'mfg', settings: {}, windows: [] };
+    }
+    document.getElementById('settings-close-btn').addEventListener('click', closeSettingsModal);
+    document.getElementById('settings-cancel-btn').addEventListener('click', closeSettingsModal);
+    settingsOverlay.addEventListener('click', (ev) => {
+      if (ev.target === settingsOverlay) closeSettingsModal();
+    });
+
+    settingsTabsEl.querySelectorAll('button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        settingsState.tab = btn.dataset.tab;
+        settingsTabsEl.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === btn));
+        renderSettingsTab();
+      });
+    });
+
+    async function openProductSettingsModal(sku) {
+      settingsState.sku = sku;
+      settingsState.tab = 'mfg';
+      settingsTitle.textContent = `Product Settings — ${sku}`;
+      settingsTabsEl.querySelectorAll('button').forEach(b =>
+        b.classList.toggle('active', b.dataset.tab === 'mfg'));
+      settingsBody.innerHTML = '<div style="padding:20px;color:#64748b;">Loading…</div>';
+      settingsOverlay.classList.add('visible');
+      try {
+        const r = await fetch(`/product-settings/${encodeURIComponent(sku)}`, { headers: authHeaders() });
+        const data = await r.json();
+        settingsState.settings = data.settings || {};
+        settingsState.windows = data.velocity_windows || [];
+        renderSettingsTab();
+      } catch (e) {
+        settingsBody.innerHTML = `<div style="padding:20px;color:#dc2626;">Error loading settings: ${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    function renderSettingsTab() {
+      const s = settingsState.settings;
+      const tab = settingsState.tab;
+      if (tab === 'mfg') {
+        settingsBody.innerHTML = `
+          <div class="settings-row">
+            <label>Manufacturing time (days)</label>
+            <input type="number" min="0" data-field="manufacturing_time_days" value="${s.manufacturing_time_days ?? 35}">
+          </div>
+          <div class="settings-row">
+            <label><input type="checkbox" data-field="use_prep_center" ${s.use_prep_center ? 'checked' : ''}> I use a Prep Center</label>
+            <div class="field-hint">Adds shipping-to-prep days to the lead-time build-up</div>
+          </div>
+          <div class="settings-row">
+            <label>Shipping to Prep Center (days)</label>
+            <input type="number" min="0" data-field="shipping_to_prep_days" value="${s.shipping_to_prep_days ?? 0}">
+          </div>
+          <div class="settings-row">
+            <label>Shipping to FBA (days)</label>
+            <input type="number" min="0" data-field="shipping_to_fba_days" value="${s.shipping_to_fba_days ?? ''}" placeholder="default: 10 (air)">
+          </div>
+          <div class="settings-row">
+            <label>FBA buffer (days)</label>
+            <input type="number" min="0" data-field="fba_buffer_days" value="${s.fba_buffer_days ?? 0}">
+          </div>
+          <div class="settings-row">
+            <label>Target stock range after new order (days)</label>
+            <input type="number" min="1" data-field="target_stock_days" value="${s.target_stock_days ?? ''}" placeholder="default: uses global setting">
+          </div>
+          <div class="settings-row">
+            <label>Comment</label>
+            <textarea rows="2" data-field="comment" placeholder="Freeform notes (surfaces in the Comment column)">${escapeHtml(s.comment || '')}</textarea>
+          </div>
+        `;
+      } else if (tab === 'forecast') {
+        const weights = s.velocity_weights || {};
+        const rows = settingsState.windows.map(w => {
+          const wKey = 'd' + w.period_days;
+          return `
+            <tr>
+              <td>${w.period_days}</td>
+              <td>${w.days_in_stock}</td>
+              <td>${w.units_sold.toLocaleString()}</td>
+              <td>${w.velocity.toFixed(2)}</td>
+              <td><input type="number" min="0" max="1" step="0.05" data-weight="${wKey}" value="${weights[wKey] ?? 0}"></td>
+            </tr>`;
+        }).join('');
+        settingsBody.innerHTML = `
+          <h4>Adjusted sales velocity parameters</h4>
+          <table class="velocity-table">
+            <thead>
+              <tr><th>Period (days)</th><th>Days in stock</th><th>Units sold</th><th>Velocity</th><th>Weight</th></tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+          <div class="weighted-summary">
+            Weighted velocity (units per day): <strong id="weighted-velocity-display">—</strong>
+            <div class="field-hint" style="color:#3730a3;">Out-of-stock days are ignored when calculating sales velocity. Weights are normalized — leave all at 0 to fall back to the Prophet forecast.</div>
+          </div>
+        `;
+        settingsBody.querySelectorAll('input[data-weight]').forEach(inp => {
+          inp.addEventListener('input', updateWeightedVelocity);
+        });
+        updateWeightedVelocity();
+      } else if (tab === 'shipping') {
+        const p = s.packing || {};
+        settingsBody.innerHTML = `
+          <div class="settings-row">
+            <label>Packing template name</label>
+            <input type="text" data-packing="template_name" value="${escapeHtml(p.template_name || '')}">
+          </div>
+          <div class="settings-row">
+            <label>Units per box</label>
+            <input type="number" min="1" data-packing="units_per_box" value="${p.units_per_box ?? ''}">
+          </div>
+          <div class="settings-row">
+            <label>Box length (in)</label>
+            <input type="number" min="0" step="0.1" data-packing="box_length_in" value="${p.box_length_in ?? ''}">
+          </div>
+          <div class="settings-row">
+            <label>Box width (in)</label>
+            <input type="number" min="0" step="0.1" data-packing="box_width_in" value="${p.box_width_in ?? ''}">
+          </div>
+          <div class="settings-row">
+            <label>Box height (in)</label>
+            <input type="number" min="0" step="0.1" data-packing="box_height_in" value="${p.box_height_in ?? ''}">
+          </div>
+          <div class="settings-row">
+            <label>Box weight (lb)</label>
+            <input type="number" min="0" step="0.1" data-packing="box_weight_lb" value="${p.box_weight_lb ?? ''}">
+          </div>
+          <div class="settings-row">
+            <label>Measurement system</label>
+            <select data-packing="measurement_system">
+              <option value="imperial" ${(p.measurement_system || 'imperial') === 'imperial' ? 'selected' : ''}>Imperial</option>
+              <option value="metric" ${p.measurement_system === 'metric' ? 'selected' : ''}>Metric</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label>Prep by</label>
+            <select data-packing="prep_by">
+              <option value="">Select option</option>
+              <option value="seller" ${p.prep_by === 'seller' ? 'selected' : ''}>Seller</option>
+              <option value="amazon" ${p.prep_by === 'amazon' ? 'selected' : ''}>Amazon</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label>Who labels units</label>
+            <select data-packing="labeled_by">
+              <option value="">Select option</option>
+              <option value="seller" ${p.labeled_by === 'seller' ? 'selected' : ''}>Seller</option>
+              <option value="amazon" ${p.labeled_by === 'amazon' ? 'selected' : ''}>Amazon</option>
+            </select>
+          </div>
+        `;
+      } else if (tab === 'po') {
+        const sup = s.supplier || {};
+        settingsBody.innerHTML = `
+          <div class="settings-row">
+            <label>Supplier color</label>
+            <input type="text" data-supplier="color" value="${escapeHtml(sup.color || '')}">
+          </div>
+          <div class="settings-row">
+            <label>Supplier size</label>
+            <input type="text" data-supplier="size" value="${escapeHtml(sup.size || '')}">
+          </div>
+          <div class="settings-row">
+            <label>Supplier item number</label>
+            <input type="text" data-supplier="item_number" value="${escapeHtml(sup.item_number || '')}">
+          </div>
+          <div class="settings-row">
+            <label>Supplier multipack size</label>
+            <input type="number" min="1" data-supplier="multipack_size" value="${sup.multipack_size ?? ''}">
+          </div>
+          <div class="settings-row">
+            <label>Supplier SKU/MPN</label>
+            <input type="text" data-supplier="sku_mpn" value="${escapeHtml(sup.sku_mpn || '')}">
+          </div>
+        `;
+      }
+    }
+
+    function updateWeightedVelocity() {
+      const inputs = settingsBody.querySelectorAll('input[data-weight]');
+      let num = 0, denom = 0;
+      settingsState.windows.forEach((w, i) => {
+        const wt = parseFloat(inputs[i]?.value || 0);
+        if (wt > 0) { num += wt * w.velocity; denom += wt; }
+      });
+      const el = document.getElementById('weighted-velocity-display');
+      if (el) el.textContent = denom > 0 ? (num / denom).toFixed(2) : '—';
+    }
+
+    // Snapshot whatever's currently in the DOM for the *active* tab into
+    // settingsState.settings — called on tab-switch and on save so users
+    // can flip between tabs without losing edits.
+    function captureCurrentTab() {
+      const s = settingsState.settings;
+      const tab = settingsState.tab;
+      if (tab === 'mfg') {
+        settingsBody.querySelectorAll('[data-field]').forEach(el => {
+          const key = el.dataset.field;
+          if (el.type === 'checkbox') s[key] = el.checked;
+          else if (el.type === 'number') s[key] = el.value === '' ? null : parseFloat(el.value);
+          else s[key] = el.value;
+        });
+      } else if (tab === 'forecast') {
+        const weights = {};
+        let any = false;
+        settingsBody.querySelectorAll('input[data-weight]').forEach(el => {
+          const v = parseFloat(el.value || 0);
+          weights[el.dataset.weight] = v;
+          if (v > 0) any = true;
+        });
+        s.velocity_weights = any ? weights : null;
+      } else if (tab === 'shipping') {
+        const p = { ...(s.packing || {}) };
+        settingsBody.querySelectorAll('[data-packing]').forEach(el => {
+          const key = el.dataset.packing;
+          if (el.type === 'number') p[key] = el.value === '' ? null : parseFloat(el.value);
+          else p[key] = el.value;
+        });
+        s.packing = p;
+      } else if (tab === 'po') {
+        const sup = { ...(s.supplier || {}) };
+        settingsBody.querySelectorAll('[data-supplier]').forEach(el => {
+          const key = el.dataset.supplier;
+          if (el.type === 'number') sup[key] = el.value === '' ? null : parseFloat(el.value);
+          else sup[key] = el.value;
+        });
+        s.supplier = sup;
+      }
+    }
+
+    // Wrap the tab-switch handler so we snapshot before rendering the new tab
+    // (attached above; re-bind here to intercept)
+    settingsTabsEl.querySelectorAll('button').forEach(btn => {
+      btn.addEventListener('click', () => captureCurrentTab(), true);
+    });
+
+    settingsSaveBtn.addEventListener('click', async () => {
+      captureCurrentTab();
+      settingsSaveBtn.disabled = true;
+      settingsSaveBtn.textContent = 'Saving…';
+      try {
+        const r = await fetch(`/product-settings/${encodeURIComponent(settingsState.sku)}`, {
+          method: 'PUT',
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify(settingsState.settings),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        closeSettingsModal();
+        // Reload the restock table so the new comment / weighted-velocity
+        // impact shows up. The user still needs to hit "Refresh forecasts"
+        // for the forecast math to re-run — the settings edit alone doesn't
+        // rebuild the cache.
+        if (typeof loadRestock === 'function') loadRestock();
+      } catch (e) {
+        alert(`Failed to save settings: ${e.message}`);
+      } finally {
+        settingsSaveBtn.disabled = false;
+        settingsSaveBtn.textContent = 'Apply';
+      }
+    });
+
     async function openSkuDrawer(sku) {
       drawerTitle.textContent = sku;
       drawerKV.innerHTML = '<div>Loading…</div>';
@@ -2812,8 +3257,13 @@
         ` : `<div class="sku-shipments-empty">No in-flight inbound shipments for this SKU.</div>`;
         drawerKV.innerHTML = `
           <div><span>Method</span><span>${escapeHtml(data.method || '—')}</span></div>
+          <div><span>ASIN</span><span>${escapeHtml(data.asin || '—')}</span></div>
           <div><span>Recent avg</span><span>${drivers.recent_avg ?? 0}/day</span></div>
           <div><span>On hand</span><span>${reorder.on_hand ?? 0}</span></div>
+          <div><span>Reserved</span><span>${reorder.reserved ?? 0}</span></div>
+          <div><span>Sent to FBA</span><span>${reorder.sent_to_fba ?? 0}</span></div>
+          <div><span>Inbound working</span><span>${reorder.inbound_working ?? 0}</span></div>
+          <div><span>Unfulfillable</span><span>${reorder.unfulfillable ?? 0}</span></div>
           <div><span>Inbound (outstanding)</span><span>${reorder.inbound ?? 0}</span></div>
           <div><span>Days of cover</span><span>${reorder.days_of_cover ?? '—'}</span></div>
           <div><span>Projected stockout</span><span>${reorder.stockout_date ?? 'not within horizon'}</span></div>
