@@ -743,6 +743,44 @@ async def select_profile(profile_id: str, user: dict = Depends(protect)):
     return {"ok": True, "profile_id": profile_id}
 
 
+# ==========================================
+# NEW ROUTE: AMAZON BRAND ANALYTICS
+# ==========================================
+from fastapi import HTTPException
+
+
+class BrandAnalyticsRequest(BaseModel):
+    keywords: list[str]
+    start_date: str
+    end_date: str
+    period: str = "WEEK"
+    marketplace: str | None = None
+
+
+@app.post("/brand-analytics/keyword-matches")
+async def get_keyword_matches(request: BrandAnalyticsRequest, user: dict = Depends(protect)):
+    """
+    Checks exact, phrase, and broad matches for target keywords using Amazon Brand Analytics.
+    """
+    try:
+        results = await amazon_sp.process_brand_analytics_keywords(
+            keywords=request.keywords,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            period=request.period,
+            marketplace=request.marketplace,
+        )
+        return {"status": "success", "data": results}
+
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving brand analytics: {str(e)}",
+        )
+
+
 # Serve frontend static files
 frontend_dir = Path(__file__).parent.parent / "frontend"
 app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")

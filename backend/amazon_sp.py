@@ -1317,3 +1317,91 @@ async def download_report(report_id: str, max_polls: int = 12, poll_interval: in
         await asyncio.sleep(poll_interval)
 
     return "Report timed out — still processing. Try again later."
+
+
+# ── Brand Analytics ─────────────────────────────────────────────────────────
+
+async def fetch_brand_analytics_search_terms(
+    start_date: str,
+    end_date: str,
+    period: str = "WEEK",
+    marketplace: str | None = None,
+) -> list[dict]:
+    """
+    Requests, polls, and downloads the Amazon Brand Analytics Search Terms report.
+    """
+    create_resp = await create_report(
+        report_type="GET_BRAND_ANALYTICS_SEARCH_TERMS_REPORT",
+        start_date=start_date,
+        end_date=end_date,
+        marketplace=marketplace,
+        report_options={"reportPeriod": period},
+        single_marketplace=True,
+    )
+
+    report_id = create_resp.get("reportId")
+    if not report_id:
+        raise RuntimeError(f"Brand Analytics report creation failed: {create_resp}")
+
+    raw_text = await download_report_raw(report_id, max_polls=30, poll_interval=10)
+
+    try:
+        data = json.loads(raw_text)
+        if isinstance(data, list):
+            return data
+        return data.get("dataByDepartmentAndSearchTerm", [])
+    except json.JSONDecodeError:
+        delimiter = "\t" if "\t" in raw_text else ","
+        reader = csv.DictReader(io.StringIO(raw_text), delimiter=delimiter)
+        return list(reader)
+
+def check_keyword_match_types(target_keywords: list[str], brand_analytics_data: list[dict]) -> dict:
+    """
+    Filters the Brand Analytics report data into Exact, Phrase, and Broad matches.
+    """
+    results = {}
+
+    for keyword in target_keywords:
+        kw_lower = keyword.lower().strip()
+        kw_words = set(kw_lower.split())
+
+        exact = []
+        phrase = []
+        broad = []
+
+        for row in brand_analytics_data:
+            search_term = row.get("searchTerm", row.get("search_term", "")).lower().strip()
+            if not search_term:
+                continue
+
+            if search_term == kw_lower:
+                exact.append(row)
+            elif kw_lower in search_term:
+                phrase.append(row)
+            else:
+                st_words = set(search_term.split())
+                if kw_words.issubset(st_words):
+                    broad.append(row)
+
+        results[keyword] = {
+            "exact_match": exact,
+            "phrase_match": phrase,
+            "broad_match": broad
+        }
+
+    return results
+
+async def process_brand_analytics_keywords(
+    keywords: list[str],
+    start_date: str,
+    end_date: str,
+    period: str = "WEEK",
+    marketplace: str | None = None,
+) -> dict:
+    """
+    Orchestrator function to fetch report and run match checks.
+    """
+    report_data = await fetch_brand_analytics_search_terms(start_date, end_date, period, marketplace)
+    match_data = check_keyword_match_types(keywords, report_data)
+
+    return match_data
