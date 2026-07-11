@@ -1632,6 +1632,7 @@
           <thead>
             <tr>
               <th>SKU</th>
+              <th title="Amazon Standard Identification Number">ASIN</th>
               <th class="num">Units</th>
               <th class="num" title="Revenue ÷ units">Avg Price</th>
               <th class="num">Revenue</th>
@@ -2686,7 +2687,7 @@
 
     // ── Profitability tab ───────────────────────────────
     async function loadProfitability() {
-      profitBodyEl.innerHTML = '<tr><td colspan="17" style="padding:20px;color:#888;">Loading… (first call may take 1–2 min: orders + items + fees per SKU + storage report + finances events)</td></tr>';
+      profitBodyEl.innerHTML = '<tr><td colspan="18" style="padding:20px;color:#888;">Loading… (first call may take 1–2 min: orders + items + fees per SKU + storage report + finances events)</td></tr>';
       profitFootEl.innerHTML = '';
       profitKpisEl.innerHTML = '';
       profitCaveatsEl.classList.remove('visible');
@@ -2695,7 +2696,7 @@
       const start = profitStartEl.value;
       const end = profitEndEl.value;
       if (!start || !end || start > end) {
-        profitBodyEl.innerHTML = `<tr><td colspan="17" style="padding:20px;color:#c62828;">Pick a valid start ≤ end date.</td></tr>`;
+        profitBodyEl.innerHTML = `<tr><td colspan="18" style="padding:20px;color:#c62828;">Pick a valid start ≤ end date.</td></tr>`;
         profitRefreshBtn.disabled = false;
         return;
       }
@@ -2735,6 +2736,7 @@
             return `
               <tr title="ASIN ${escapeHtml(r.asin || '—')}">
                 <td>${skuLabel}</td>
+                <td title="${escapeHtml(r.asin || '')}">${escapeHtml(r.asin || '—')}</td>
                 <td class="num">${r.units}</td>
                 <td class="num">${money(r.avg_price)}</td>
                 <td class="num">${money(r.revenue)}</td>
@@ -2757,6 +2759,7 @@
             profitFootEl.innerHTML = `
               <tr class="profit-totals-row">
                 <td class="profit-totals-label">Totals</td>
+                <td>—</td>
                 <td class="num">${t.units}</td>
                 <td class="num">—</td>
                 <td class="num">${money(t.revenue)}</td>
@@ -2809,7 +2812,7 @@
           profitCaveatsEl.classList.add('visible');
         }
       } catch (err) {
-        profitBodyEl.innerHTML = `<tr><td colspan="17" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
+        profitBodyEl.innerHTML = `<tr><td colspan="18" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
       } finally {
         profitRefreshBtn.disabled = false;
       }
