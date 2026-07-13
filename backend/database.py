@@ -359,15 +359,31 @@ async def get_placement_fee_cache(max_age_hours: int = 24) -> dict | None:
     age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
     if age_hours > max_age_hours:
         return None
+    per_sku = doc.get("perSku", {})
+    months = doc.get("monthsCovered", [])
+    if doc.get("accessDenied"):
+        return {
+            "per_sku": {},
+            "months_covered": months,
+            "updated_at": updated.isoformat(),
+            "access_denied": True,
+        }
+    # Legacy empty cache from a failed 403 — treat as miss so we retry once.
+    if not per_sku and not months:
+        return None
     return {
-        "per_sku": doc.get("perSku", {}),
-        "months_covered": doc.get("monthsCovered", []),
+        "per_sku": per_sku,
+        "months_covered": months,
         "updated_at": updated.isoformat(),
+        "access_denied": False,
     }
 
 
 async def put_placement_fee_cache(
-    per_sku: dict, months_covered: list[str],
+    per_sku: dict,
+    months_covered: list[str],
+    *,
+    access_denied: bool = False,
 ) -> None:
     user_id = _user_oid()
     await _placement_fee_cache().update_one(
@@ -376,6 +392,7 @@ async def put_placement_fee_cache(
             "$set": {
                 "perSku": per_sku,
                 "monthsCovered": months_covered,
+                "accessDenied": access_denied,
                 "updatedAt": datetime.now(timezone.utc),
             },
             "$setOnInsert": {"userId": user_id},

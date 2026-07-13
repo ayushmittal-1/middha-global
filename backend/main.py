@@ -665,6 +665,7 @@ async def profitability(
     days_back: int = 7,
     start: str | None = None,
     end: str | None = None,
+    timeZone: str | None = None,
     user: dict = Depends(protect),
 ):
     """Per-SKU profitability for the requested window. Walks SP-API
@@ -672,9 +673,12 @@ async def profitability(
 
     Accepts either `?start=YYYY-MM-DD&end=YYYY-MM-DD` (preferred, matches
     the FE date pickers) or `?days_back=N` (legacy, still used by the LLM
-    tool). If both are given, start/end wins."""
+    tool). If both are given, start/end wins.
+
+    Day boundaries use the seller's marketplace timezone (same as Aurora Orders)."""
     return await compute_profitability_data(
         days_back=days_back, start=start, end=end, paginate=True,
+        time_zone=timeZone,
     )
 
 
