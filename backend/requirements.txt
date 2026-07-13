@@ -13,3 +13,4 @@ apscheduler
 pandas
 numpy
 prophet
+tzdata

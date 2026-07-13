@@ -2531,7 +2531,7 @@
         const data = await r.json();
         if (data.error) throw new Error(data.error);
 
-        profitStampEl.textContent = `${data.orders_count} orders, ${data.skus_count} SKUs · ${data.start ?? start} → ${data.end ?? end} (${data.window_days ?? '?'}d)`;
+        profitStampEl.textContent = `${data.orders_count} orders, ${data.skus_count} SKUs · ${data.start ?? start} → ${data.end ?? end} (${data.window_days ?? '?'}d${data.timeZone ? ` · ${data.timeZone}` : ''})`;
 
         const t = data.totals;
         if (t) {

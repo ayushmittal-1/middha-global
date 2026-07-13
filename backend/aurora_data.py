@@ -19,6 +19,9 @@ from bson import ObjectId
 from auth import _db
 from amazon_sp import MARKETPLACE_NAMES, resolve_marketplace
 
+# Match auroraBackend dashboardMetrics — cancelled/unfulfillable orders are not sales.
+CANCELLED_ORDER_STATUSES = frozenset({"Canceled", "Cancelled", "Unfulfillable"})
+
 # Re-export order helpers from aurora_orders for a single import surface.
 from aurora_orders import (  # noqa: F401
     fetch_orders_with_items,
@@ -41,6 +44,28 @@ def _money_amount(block: Optional[dict]) -> float:
         return 0.0
 
 
+def is_excluded_order_status(status: Optional[str]) -> bool:
+    """True for Canceled / Cancelled / Unfulfillable (Aurora dashboard parity)."""
+    if not status:
+        return False
+    if status in CANCELLED_ORDER_STATUSES:
+        return True
+    return status.strip().lower() in {"canceled", "cancelled", "unfulfillable"}
+
+
+def line_item_sales_amount(item: dict) -> float:
+    """Net line revenue: itemSubtotal − promotionDiscount (Aurora order sync shape)."""
+    subtotal = _money_amount(item.get("itemSubtotal"))
+    promo = _money_amount(item.get("promotionDiscount"))
+    unit_price = _money_amount(item.get("itemPrice"))
+    if subtotal > 0:
+        return max(0.0, subtotal - promo)
+    if unit_price > 0:
+        # itemPrice in Aurora DB is the line total, not per-unit (orderSyncService).
+        return max(0.0, unit_price - promo)
+    return 0.0
+
+
 def aggregate_sku_metrics_from_orders(
     order_docs: list[dict],
 ) -> tuple[dict[str, dict], list[dict], int]:
@@ -60,22 +85,19 @@ def aggregate_sku_metrics_from_orders(
         }
     )
     na_price_rows: list[dict] = []
+    eligible_orders = 0
 
     for doc in order_docs:
+        if is_excluded_order_status(doc.get("orderStatus")):
+            continue
+        eligible_orders += 1
         oid = doc.get("amazonOrderId") or ""
         for it in doc.get("orderItems") or []:
             sku = it.get("sellerSku")
             if not sku:
                 continue
             qty = int(it.get("quantityOrdered") or 0)
-            subtotal = _money_amount(it.get("itemSubtotal"))
-            unit_price = _money_amount(it.get("itemPrice"))
-            if subtotal > 0:
-                amount = subtotal
-            elif unit_price > 0 and qty > 0:
-                amount = unit_price * qty
-            else:
-                amount = 0.0
+            amount = line_item_sales_amount(it)
             if amount <= 0 and qty > 0:
                 na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
                 continue
@@ -86,7 +108,7 @@ def aggregate_sku_metrics_from_orders(
             if not sku_data[sku]["asin"] and it.get("asin"):
                 sku_data[sku]["asin"] = it["asin"]
 
-    return sku_data, na_price_rows, len(order_docs)
+    return sku_data, na_price_rows, eligible_orders
 
 
 async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str, dict]:
@@ -208,8 +230,7 @@ async def aggregate_sales_daily_from_orders(
     )
     by_key: dict[tuple[str, datetime], dict] = {}
     for doc in docs:
-        status = (doc.get("orderStatus") or "").lower()
-        if status in ("canceled", "cancelled"):
+        if is_excluded_order_status(doc.get("orderStatus")):
             continue
         pd = doc.get("purchaseDate")
         if not isinstance(pd, datetime):
@@ -224,22 +245,7 @@ async def aggregate_sales_daily_from_orders(
             qty = int(it.get("quantityOrdered") or 0)
             if qty <= 0:
                 continue
-            subtotal = it.get("itemSubtotal") or {}
-            unit_price = it.get("itemPrice") or {}
-            try:
-                sub_amt = float(subtotal.get("amount") or 0)
-            except (TypeError, ValueError):
-                sub_amt = 0.0
-            try:
-                unit_amt = float(unit_price.get("amount") or 0)
-            except (TypeError, ValueError):
-                unit_amt = 0.0
-            if sub_amt > 0:
-                revenue = sub_amt
-            elif unit_amt > 0:
-                revenue = unit_amt * qty
-            else:
-                revenue = 0.0
+            revenue = line_item_sales_amount(it)
             key = (sku, day)
             agg = by_key.setdefault(key, {
                 "sku": sku,

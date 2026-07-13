@@ -784,11 +784,16 @@ _FEE_TYPE_BUCKETS = [
     ("return_processing", ("returnfee", "refundcommission", "returnprocessingfee")),
     ("low_inventory", ("lowinventorylevelfee", "lowinventoryfee")),
     ("inbound_placement", ("inboundplacement", "inboundconvenience",
-                           "inboundtransportationfee")),
+                           "inboundtransportationfee", "inboundplacementservice",
+                           "fbainboundplacementservice", "placementservice")),
     ("aged_inventory", ("agedinventorysurcharge", "longtermstoragefee")),
 ]
 
 _REMOVAL_ADJUSTMENT_HINTS = ("removal", "disposal")
+_PLACEMENT_ADJUSTMENT_HINTS = (
+    "inboundplacement", "inbound placement", "placementservice",
+    "placement service",
+)
 
 
 def _classify_fee_type(fee_type: str) -> str | None:
@@ -909,8 +914,13 @@ async def get_financial_events(
 
         for evt in events.get("ServiceFeeEventList") or []:
             sku = (evt.get("SellerSKU") or "").strip()
+            fee_desc = (
+                evt.get("FeeDescription") or evt.get("FeeReason") or ""
+            ).lower()
             for ftype, amt in _fees_from_lists(evt.get("FeeList")):
                 bucket = _classify_fee_type(ftype)
+                if not bucket and any(h in fee_desc for h in _PLACEMENT_ADJUSTMENT_HINTS):
+                    bucket = "inbound_placement"
                 if not bucket:
                     continue
                 target = by_sku[sku] if sku else unattributed
@@ -918,6 +928,25 @@ async def get_financial_events(
 
         for evt in events.get("AdjustmentEventList") or []:
             adj_type = (evt.get("AdjustmentType") or "").lower()
+            if any(h in adj_type for h in _PLACEMENT_ADJUSTMENT_HINTS):
+                adj_amt = evt.get("AdjustmentAmount") or {}
+                try:
+                    amt = float(adj_amt.get("CurrencyAmount", 0) or 0)
+                except (TypeError, ValueError, AttributeError):
+                    amt = 0.0
+                if amt:
+                    unattributed["inbound_placement"] += abs(amt)
+                for item in evt.get("AdjustmentItemList") or []:
+                    sku = (item.get("SellerSKU") or "").strip()
+                    amt_obj = item.get("PerUnitAmount") or item.get("TotalAmount") or {}
+                    try:
+                        item_amt = float(amt_obj.get("CurrencyAmount", 0) or 0)
+                    except (TypeError, ValueError, AttributeError):
+                        item_amt = 0.0
+                    if item_amt:
+                        target = by_sku[sku] if sku else unattributed
+                        target["inbound_placement"] += abs(item_amt)
+                continue
             if not any(h in adj_type for h in _REMOVAL_ADJUSTMENT_HINTS):
                 continue
             for item in evt.get("AdjustmentItemList") or []:
