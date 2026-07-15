@@ -312,3 +312,36 @@ async def refresh_forecasts_for_user(
         methods[result["method"]] = methods.get(result["method"], 0) + 1
         written += 1
     return {"skus": written, "methods": methods}
+
+
+async def recompute_restock_rows_for_user(
+    user_id: ObjectId,
+    cached: list[dict],
+) -> list[dict]:
+    """Re-apply reorder math using live Aurora product inventory.
+
+    Forecast series (p50 demand) stays cached; on-hand / inbound / cover
+    refresh on every Restock tab load so they match Seller Central after
+    Aurora's inventory sync — without refitting Prophet.
+    """
+    if not cached:
+        return []
+    inv_map = await latest_inventory_for_user(user_id)
+    settings = await get_forecast_settings_for_user(user_id)
+    shipments_by_sku = await active_inbound_shipments_for_user(user_id)
+    today = datetime.now(timezone.utc)
+
+    out: list[dict] = []
+    for c in cached:
+        sku = c.get("sku")
+        reorder = compute_reorder(
+            c.get("forecast") or [],
+            inv_map.get(sku),
+            c.get("drivers") or {},
+            settings,
+            shipments=shipments_by_sku.get(sku, []),
+            today=today,
+        )
+        row = {**c, "reorder": reorder}
+        out.append(row)
+    return out

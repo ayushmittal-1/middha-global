@@ -516,7 +516,13 @@ async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
         out[sku] = {
             "sku": sku,
             "date": p.get("lastSynced"),
-            "fulfillable": int(inv.get("fulfillableQuantity") or 0),
+            "fulfillable": int(inv.get("fulfillableQuantity") or inv.get("quantity") or 0),
+            "inbound_fba": int(inv.get("inboundQuantity") or 0)
+            or (
+                int(inv.get("inboundWorkingQuantity") or 0)
+                + int(inv.get("inboundShippedQuantity") or 0)
+                + int(inv.get("inboundReceivingQuantity") or 0)
+            ),
             "inbound_shipped": int(inv.get("inboundShippedQuantity") or 0),
             "inbound_working": int(inv.get("inboundWorkingQuantity") or 0),
             "reserved": int(inv.get("reservedQuantity") or 0),

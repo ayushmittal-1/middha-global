@@ -337,9 +337,15 @@ async def update_forecasting_settings_endpoint(
 async def forecasting_restock(user: dict = Depends(protect)):
     """The Restock dashboard's data source. One row per SKU with the
     forecast headline, reorder math, and method used."""
+    from bson import ObjectId as _OID
+    from forecasting.model import recompute_restock_rows_for_user
+
     cached = await get_forecast_cache()
+    user_id = _OID(str(user["_id"]))
+    refreshed = await recompute_restock_rows_for_user(user_id, cached)
+
     rows = []
-    for c in cached:
+    for c in refreshed:
         reorder = c.get("reorder") or {}
         forecast = c.get("forecast") or []
         next30 = sum(float(r.get("p50", 0)) for r in forecast[:30])
@@ -347,8 +353,11 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "sku": c["sku"],
             "method": c.get("method"),
             "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
+            "inventory_as_of": reorder.get("inventory_as_of"),
             "on_hand": reorder.get("on_hand", 0),
             "inbound": reorder.get("inbound", 0),
+            "inbound_fba": reorder.get("inbound_fba", 0),
+            "inbound_shipments": reorder.get("inbound_shipments", 0),
             "avg_daily_demand": reorder.get("avg_daily_demand", 0),
             "next_30_day_forecast": round(next30, 1),
             "days_of_cover": reorder.get("days_of_cover"),
@@ -383,7 +392,11 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
     cached = await get_forecast_cache(skus=[sku])
     if not cached:
         return {"error": f"No forecast for {sku}. Run /forecasting/refresh first."}
-    c = cached[0]
+    from bson import ObjectId as _OID
+    from forecasting.model import recompute_restock_rows_for_user
+
+    refreshed = await recompute_restock_rows_for_user(_OID(str(user["_id"])), cached)
+    c = refreshed[0]
 
     since = datetime.now(timezone.utc) - _td(days=90)
     raw_history = await get_sales_daily(sku=sku, since=since)

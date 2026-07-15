@@ -2250,7 +2250,11 @@
         }
         if (latest) {
           const d = new Date(latest);
-          restockStampEl.textContent = `Last refreshed ${d.toLocaleString()}`;
+          const invStamp = restockCache.find(r => r.inventory_as_of)?.inventory_as_of;
+          const invPart = invStamp
+            ? ` · Inventory as of ${new Date(invStamp).toLocaleString()}`
+            : ' · Inventory live from Aurora';
+          restockStampEl.textContent = `Forecast refreshed ${d.toLocaleString()}${invPart}`;
         }
         renderRestockRows();
       } catch (err) {

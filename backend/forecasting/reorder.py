@@ -173,12 +173,23 @@ def compute_reorder(
     shipments = shipments or []
 
     on_hand = int((inv_snapshot or {}).get("fulfillable", 0))
-    inbound_outstanding = sum(int(s.get("qty_outstanding", 0)) for s in shipments)
+    inbound_fba = int((inv_snapshot or {}).get("inbound_fba", 0))
+    inbound_shipments = sum(int(s.get("qty_outstanding", 0)) for s in shipments)
+    # Seller Central "Inbound" = FBA pipeline qty; fall back to shipment outstanding.
+    inbound = inbound_fba if inbound_fba > 0 else inbound_shipments
+
+    inv_date = (inv_snapshot or {}).get("date")
+    inventory_as_of = (
+        inv_date.isoformat() if hasattr(inv_date, "isoformat") else inv_date
+    )
 
     horizon_p50 = [float(r.get("p50", 0)) for r in forecast]
     empty_response = {
         "on_hand": on_hand,
-        "inbound": inbound_outstanding,
+        "inbound": inbound,
+        "inbound_fba": inbound_fba,
+        "inbound_shipments": inbound_shipments,
+        "inventory_as_of": inventory_as_of,
         "avg_daily_demand": 0.0,
         "safety_stock": 0,
         "reorder_point": 0,
@@ -209,7 +220,7 @@ def compute_reorder(
 
     days_of_cover: float | None = None
     if avg_daily_overall > 0:
-        days_of_cover = (on_hand + inbound_outstanding) / avg_daily_overall
+        days_of_cover = (on_hand + inbound) / avg_daily_overall
 
     stockout_dt = _simulate_stockout_date(
         on_hand=on_hand,
@@ -236,7 +247,7 @@ def compute_reorder(
     # arrives, net of what's already inbound. Rough model — good enough
     # to drive the "how much to ship" column.
     target_units = target_cover * avg_daily_overall
-    raw_po = target_units - (on_hand + inbound_outstanding)
+    raw_po = target_units - (on_hand + inbound)
 
     # Sanity ceiling — same guard as before. Prophet on sparse SKUs can
     # balloon the projection; cap against recent 28-day rate × 180 days.
@@ -250,7 +261,10 @@ def compute_reorder(
 
     return {
         "on_hand": on_hand,
-        "inbound": inbound_outstanding,
+        "inbound": inbound,
+        "inbound_fba": inbound_fba,
+        "inbound_shipments": inbound_shipments,
+        "inventory_as_of": inventory_as_of,
         "avg_daily_demand": round(avg_daily_overall, 2),
         # Safety stock kept in the response for backwards compat, but the
         # sim uses pure depletion so we report zero here.
