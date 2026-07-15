@@ -32,6 +32,7 @@ from database import (
     get_forecast_cache,
     get_sales_daily,
     active_inbound_shipments_for_user,
+    latest_inventory_for_user,
     get_product_settings,
     upsert_product_settings,
     all_product_settings_for_user,
@@ -355,6 +356,10 @@ async def forecasting_restock(user: dict = Depends(protect)):
     cogs_by_sku: dict[str, dict] = {r["sku"]: r for r in cogs_rows}
     settings_by_sku = await all_product_settings_for_user(user_id)
     ordered_by_sku = await open_ordered_qty_by_sku(user_id)
+    # Fresh read — buyability can flip Active/Inactive between forecast
+    # refreshes, and we want the UI to reflect that instantly rather than
+    # waiting for the next cache rebuild.
+    inv_map = await latest_inventory_for_user(user_id)
 
     today = datetime.now(timezone.utc).date()
 
@@ -403,11 +408,20 @@ async def forecasting_restock(user: dict = Depends(protect)):
                 pass
 
         ps = settings_by_sku.get(sku) or {}
+        inv_row = inv_map.get(sku) or {}
+        is_buyable = bool(inv_row.get("is_buyable", True))
+        # For non-buyable SKUs, zero the reorder recommendation regardless
+        # of what the forecast says — no point telling the seller to ship
+        # 500 units of an inactive listing.
+        recommended_po_qty = reorder.get("recommended_po_qty", 0) if is_buyable else 0
 
         rows.append({
             "sku": sku,
             "asin": c.get("asin"),
             "method": c.get("method"),
+            "is_buyable": is_buyable,
+            "status": inv_row.get("status"),
+            "listing_status": inv_row.get("listing_status"),
             "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
             "on_hand": reorder.get("on_hand", 0),
             "reserved": reorder.get("reserved", 0),
@@ -430,7 +444,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "inbound_shipments_count": reorder.get("inbound_shipments_count", 0),
             "next_shipment_eta": reorder.get("next_shipment_eta"),
             "next_shipment_qty": reorder.get("next_shipment_qty"),
-            "recommended_po_qty": reorder.get("recommended_po_qty", 0),
+            "recommended_po_qty": recommended_po_qty,
             "unit_cost": unit_cost,
             "landed_cost": round(landed_cost, 4),
             "stock_value": stock_value,
@@ -917,6 +931,8 @@ async def get_keyword_matches(request: BrandAnalyticsRequest, user: dict = Depen
             status_code=500,
             detail=f"Error retrieving brand analytics: {str(e)}"
         )
+
+
 # Serve frontend static files
 frontend_dir = Path(__file__).parent.parent / "frontend"
 app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")

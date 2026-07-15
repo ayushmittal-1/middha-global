@@ -607,6 +607,32 @@
     .urgency-green  { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
     .urgency-grey   { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }
 
+    /* Not-buyable rows — dim to signal Amazon has blocked / suppressed
+       the listing so the seller doesn't mistake stale suggested-qty for
+       an actionable restock recommendation. */
+    table.restock tbody tr.row-not-buyable td,
+    table.restock tbody tr.row-not-buyable td.sku-cell {
+      color: #94a3b8;
+      background: #f8fafc;
+    }
+    table.restock tbody tr.row-not-buyable:hover,
+    table.restock tbody tr.row-not-buyable:hover td.sku-cell {
+      background: #f1f5f9;
+    }
+    .not-buyable-badge {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      background: #fef2f2;
+      color: #b91c1c;
+      border: 1px solid #fecaca;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+
     .restock-loading {
       display: none;
       align-items: center;
@@ -2352,6 +2378,16 @@
       for (const row of visible) {
         const tr = document.createElement('tr');
         tr.dataset.sku = row.sku;
+        // is_buyable defaults to true when the field is absent (older
+        // cached responses / SKUs Aurora hasn't classified yet).
+        const isBuyable = row.is_buyable !== false;
+        if (!isBuyable) tr.classList.add('row-not-buyable');
+        const notBuyableTip = isBuyable
+          ? ''
+          : `Amazon has this listing blocked — status="${row.status || '?'}" listingStatus="${row.listing_status || '?'}". Restock recommendation suppressed.`;
+        const notBuyableBadge = isBuyable
+          ? ''
+          : ` <span class="not-buyable-badge" title="${escapeHtml(notBuyableTip)}">🚫 not buyable</span>`;
         const docCls = urgencyClass(row.days_of_cover);
         const inboundCount = row.inbound_shipments_count ?? 0;
         const inboundTip = inboundCount
@@ -2365,8 +2401,8 @@
         const airTip = `Dispatch by this date — ${row.air_transit_days ?? 10}d air transit to Amazon FC`;
         const oceanTip = `Dispatch by this date — ${row.ocean_transit_days ?? 45}d ocean transit to Amazon FC`;
         tr.innerHTML = `
-          <td class="sku-cell" title="${escapeHtml(row.sku)}">
-            <span class="sku-name">${escapeHtml(truncateSku(row.sku))}</span>
+          <td class="sku-cell" title="${escapeHtml(row.sku)}${notBuyableTip ? '\n' + escapeHtml(notBuyableTip) : ''}">
+            <span class="sku-name">${escapeHtml(truncateSku(row.sku))}</span>${notBuyableBadge}
           </td>
           <td title="${escapeHtml(row.asin || '')}">${escapeHtml(row.asin || '—')}</td>
           <td class="num">${fmtRestockNum(row.on_hand ?? 0)}</td>
@@ -2383,7 +2419,7 @@
           <td class="date-cell" title="${airTip}">${fmtRestockDate(row.reorder_by_date_air)}</td>
           <td class="date-cell" title="${oceanTip}">${fmtRestockDate(row.reorder_by_date_ocean ?? row.reorder_by_date_sea)}</td>
           <td class="num">${fmtDaysUntil(row.days_until_next_order)}</td>
-          <td class="num num-strong">${fmtRestockNum(row.recommended_po_qty ?? 0)}</td>
+          <td class="num num-strong">${isBuyable ? fmtRestockNum(row.recommended_po_qty ?? 0) : '—'}</td>
           <td class="num">${fmtRestockNum(row.ordered ?? 0)}</td>
           <td class="num">${row.stock_value > 0 ? '$' + fmtRestockNum(row.stock_value, 2) : '—'}</td>
           <td class="num">${row.missed_profit_est > 0 ? '$' + fmtRestockNum(row.missed_profit_est, 2) : '$0.00'}</td>

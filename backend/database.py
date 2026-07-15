@@ -520,7 +520,8 @@ async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
     """
     cursor = _db().products.find(
         {"sellerId": user_id},
-        {"sku": 1, "asin": 1, "inventory": 1, "lastSynced": 1, "_id": 0},
+        {"sku": 1, "asin": 1, "inventory": 1, "lastSynced": 1,
+         "status": 1, "listingStatus": 1, "_id": 0},
     )
     out: dict[str, dict] = {}
     async for p in cursor:
@@ -528,10 +529,25 @@ async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
         if not sku:
             continue
         inv = p.get("inventory") or {}
+        # Buyability signal for the Restock UI. Aurora surfaces two
+        # independent Amazon fields:
+        #   status         — 'Active' | 'Inactive' (listing-level state)
+        #   listingStatus  — comma-separated flags like 'DISCOVERABLE, BUYABLE'
+        # Both need to be positive for the SKU to actually be sellable;
+        # e.g. a suppressed listing is often DISCOVERABLE but not BUYABLE.
+        status = (p.get("status") or "").strip()
+        listing_status = (p.get("listingStatus") or "").strip()
+        is_buyable = (
+            status.lower() == "active"
+            and "buyable" in listing_status.lower()
+        )
         out[sku] = {
             "sku": sku,
             "asin": (p.get("asin") or "").strip() or None,
             "date": p.get("lastSynced"),
+            "status": status or None,
+            "listing_status": listing_status or None,
+            "is_buyable": is_buyable,
             "fulfillable": int(inv.get("fulfillableQuantity") or 0),
             "inbound_shipped": int(inv.get("inboundShippedQuantity") or 0),
             "inbound_working": int(inv.get("inboundWorkingQuantity") or 0),
