@@ -24,7 +24,7 @@ caller sees a clear error instead of a silent corruption.
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
 from pymongo import UpdateOne
@@ -474,6 +474,30 @@ async def get_sales_daily_for_user(
     sku: str | None = None,
     since: datetime | None = None,
 ) -> list[dict]:
+    """Return daily units-sold rows for the user, keyed by (sku, date).
+
+    Aurora is the source of truth: when AURORA_DATA_SOURCE=db we aggregate
+    the shared `orders` collection on every read, so the modal / restock
+    numbers never drift from Aurora. The stockout heuristic runs in-memory
+    on the aggregated series so the row shape stays identical to the
+    former `salesDaily` cache — callers don't change.
+
+    Falls back to the `salesDaily` cache in SP-API mode.
+    """
+    from aurora_data import aurora_db_enabled, aggregate_sales_daily_from_orders
+
+    if aurora_db_enabled():
+        end = datetime.now(timezone.utc) + timedelta(days=1)
+        start = since or (end - timedelta(days=540))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        rows = await aggregate_sales_daily_from_orders(user_id, start, end)
+        if sku:
+            rows = [r for r in rows if r.get("sku") == sku]
+        _flag_stockout_runs(rows)
+        rows.sort(key=lambda r: (r.get("sku") or "", r.get("date")))
+        return rows
+
     query: dict = {"userId": user_id}
     if sku:
         query["sku"] = sku
@@ -481,6 +505,77 @@ async def get_sales_daily_for_user(
         query["date"] = {"$gte": since}
     cursor = _sales_daily().find(query, {"_id": 0, "userId": 0}).sort("date", 1)
     return await cursor.to_list(length=None)
+
+
+def _flag_stockout_runs(
+    rows: list[dict],
+    *,
+    min_run: int = 3,
+    velocity_threshold: float = 0.5,
+    window_days: int = 28,
+) -> None:
+    """Same heuristic as `mark_stockouts_for_user`, applied in-memory.
+
+    Runs of ≥`min_run` consecutive zero-sales days flanked by a rolling
+    mean above `velocity_threshold` almost certainly reflect inventory
+    gaps rather than dead demand — the forecaster excludes them.
+    """
+    if not rows:
+        return
+    by_sku: dict[str, list[dict]] = {}
+    for r in rows:
+        by_sku.setdefault(r.get("sku") or "", []).append(r)
+
+    for sku_rows in by_sku.values():
+        sku_rows.sort(key=lambda r: r.get("date"))
+        # Densify: fill missing days with synthetic zero rows so runs are
+        # detectable. The synthetic rows aren't returned unless a stockout
+        # gets flagged on them — see below.
+        if not sku_rows:
+            continue
+        d0 = sku_rows[0].get("date")
+        d1 = sku_rows[-1].get("date")
+        if not isinstance(d0, datetime) or not isinstance(d1, datetime):
+            continue
+        by_date = {r["date"]: r for r in sku_rows}
+        span_days = (d1 - d0).days + 1
+        dense: list[dict] = []
+        for i in range(span_days):
+            day = d0 + timedelta(days=i)
+            dense.append(by_date.get(day) or {
+                "sku": sku_rows[0].get("sku"),
+                "date": day,
+                "asin": sku_rows[0].get("asin"),
+                "units_ordered": 0,
+                "ordered_revenue": 0.0,
+                "stockout_corrected": False,
+                "_synthetic": True,
+            })
+        units = [float(r.get("units_ordered") or 0) for r in dense]
+        i = 0
+        while i < len(units):
+            if units[i] != 0:
+                i += 1
+                continue
+            j = i
+            while j < len(units) and units[j] == 0:
+                j += 1
+            run_len = j - i
+            if run_len >= min_run:
+                lookback_start = max(0, i - window_days)
+                outside = units[lookback_start:i]
+                if outside:
+                    mean_outside = sum(outside) / len(outside)
+                    if mean_outside >= velocity_threshold:
+                        for k in range(i, j):
+                            dense[k]["stockout_corrected"] = True
+                            # Promote synthetic zero-rows into the output
+                            # only when they carry a stockout flag; the
+                            # forecaster needs to see them.
+                            if dense[k].get("_synthetic"):
+                                dense[k].pop("_synthetic", None)
+                                rows.append(dense[k])
+            i = j
 
 
 async def upsert_inventory_snapshot(user_id: ObjectId, rows: list[dict]) -> int:
