@@ -59,6 +59,7 @@ from agent import compute_profitability_data
 from campaigns import analyze_performance_data
 from amazon_ads import (
     exchange_auth_code,
+    fetch_suggested_keywords,
     get_profiles,
     save_refresh_token,
     save_profile_id,
@@ -931,6 +932,81 @@ async def get_keyword_matches(request: BrandAnalyticsRequest, user: dict = Depen
             status_code=500,
             detail=f"Error retrieving brand analytics: {str(e)}"
         )
+
+
+# ==========================================
+# NEW ROUTE: AMAZON ADS SUGGESTED KEYWORDS
+# ==========================================
+
+class SuggestedKeywordsRequest(BaseModel):
+    asin: str
+    max_suggestions: int = 100
+
+
+@app.post("/ads/suggested-keywords")
+async def get_ads_suggested_keywords(
+    request: SuggestedKeywordsRequest,
+    user: dict = Depends(protect),
+):
+    """Amazon-recommended keywords for a given ASIN via the Sponsored Products API."""
+    try:
+        results = await fetch_suggested_keywords(
+            asin=request.asin,
+            max_suggestions=request.max_suggestions,
+        )
+        return {"status": "success", "data": results}
+
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching suggested keywords: {str(e)}",
+        )
+
+
+# ==========================================
+# NEW ROUTE: KEYWORD MATRIX JOURNEY
+# ==========================================
+# Async multi-step flow: source keywords from 3 paths (Amazon ASIN, Meta,
+# Amazon Searchbar), enrich with Brand Analytics + CPC, score, and lay out a
+# 3x3 (Top/Medium/Low × source) matrix. The endpoint kicks off a background
+# job; the client polls the GET endpoint to render the stepper UI.
+import keyword_matrix
+
+
+class KeywordMatrixStartRequest(BaseModel):
+    asins: List[str]
+    ad_group_id: str | None = None
+    campaign_id: str | None = None
+
+
+@app.post("/keyword-matrix/start")
+async def start_keyword_matrix(
+    request: KeywordMatrixStartRequest,
+    user: dict = Depends(protect),
+):
+    try:
+        job_id = keyword_matrix.start_job(
+            asins=request.asins,
+            ad_group_id=request.ad_group_id,
+            campaign_id=request.campaign_id,
+        )
+        return {"status": "started", "job_id": job_id}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/keyword-matrix/{job_id}")
+async def get_keyword_matrix(job_id: str, user: dict = Depends(protect)):
+    job = keyword_matrix.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
 
 
 # Serve frontend static files

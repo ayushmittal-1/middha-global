@@ -7,6 +7,7 @@ user document in MongoDB — loaded by `auth.protect` / `auth.authenticate_ws`
 and pulled from the ContextVar by `auth.require_user()`.
 """
 
+import asyncio
 import os
 
 import httpx
@@ -212,6 +213,224 @@ async def _post_json(label: str, path: str, content_type: str, payload: dict) ->
             resp.raise_for_status()
         print(f"[amazon_ads] <- {label} OK status={resp.status_code}")
         return resp.json()
+
+
+async def fetch_suggested_keywords(
+    asin: str,
+    max_suggestions: int = 100,
+) -> dict:
+    """Return Amazon-recommended keywords for a product (Sponsored Products).
+
+    Wraps GET /v2/sp/asins/{asin}/suggested/keywords. Fast (<1s), no report
+    generation. Amazon's response is a raw JSON list of
+    `{"keywordText": "...", "matchType": "..."}` items — we normalize to
+    `{"asin": ..., "suggestedKeywords": [...]}` here so callers don't have
+    to deal with the top-level list shape (which broke code that assumed
+    the newer wrapped shape documented in some Amazon guides).
+    Bid data is not included here — use POST /sp/targets/bid/recommendations
+    with an adGroupId if you need per-keyword bid ranges.
+    """
+    user = require_user()
+    token = await get_ads_access_token(user)
+    profile_id = _ads_profile_id(user) or os.getenv("AMAZON_PROFILE_ID", "")
+    if not profile_id:
+        raise RuntimeError(
+            "No Ads profile id available for this user. Complete the Ads OAuth "
+            "flow (POST /amazon/profiles/{profile_id}/select) or set AMAZON_PROFILE_ID."
+        )
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Amazon-Advertising-API-ClientId": ADS_LWA_CLIENT_ID,
+        "Amazon-Advertising-API-Scope": profile_id,
+        "Accept": "application/json",
+    }
+    params = {"maxNumSuggestions": max(1, min(max_suggestions, 1000))}
+    url = f"{_ads_base(user)}/v2/sp/asins/{asin}/suggested/keywords"
+    print(f"[amazon_ads] -> GET suggestedKeywords {url} params={params}")
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, headers=headers, params=params)
+        if resp.is_error:
+            print(f"[amazon_ads] <- suggestedKeywords FAILED status={resp.status_code} body={resp.text}")
+            resp.raise_for_status()
+        raw = resp.json()
+    if isinstance(raw, list):
+        suggestions = raw
+    elif isinstance(raw, dict):
+        suggestions = raw.get("suggestedKeywords") or []
+    else:
+        suggestions = []
+    return {"asin": asin, "suggestedKeywords": suggestions}
+
+
+_SP_BID_REC_MEDIA = "application/vnd.spthemebasedbidrecommendation.v4+json"
+
+
+async def fetch_keyword_bid_recommendations(
+    keywords: list[str],
+    ad_group_id: str,
+    campaign_id: str,
+    match_type: str = "BROAD",
+) -> dict:
+    """Return low/medium/high suggested bids per keyword for an existing ad group.
+
+    Wraps POST /sp/targets/bid/recommendations (v4 media type). The legacy
+    /v2/sp/keywords/bidRecommendations endpoint was retired — it now 404s.
+    v4 requires BOTH the ad group id AND its campaign id, plus a
+    `recommendationType` and `targetingExpressions` list.
+
+    Amazon returns three bid values per targeting expression, ordered
+    low → medium → high. We normalize the response to the same shape the
+    caller previously consumed:
+      {"adGroupId": "...", "recommendations": [
+          {"keyword": "...", "matchType": "BROAD",
+           "suggestedBid": {"low": 0.33, "suggested": 0.58, "high": 0.64}},
+          ...
+      ]}
+    Cap is 100 targeting expressions per call; larger batches are chunked.
+    """
+    user = require_user()
+    token = await get_ads_access_token(user)
+    profile_id = _ads_profile_id(user) or os.getenv("AMAZON_PROFILE_ID", "")
+    if not profile_id:
+        raise RuntimeError(
+            "No Ads profile id available for this user. Complete the Ads OAuth "
+            "flow (POST /amazon/profiles/{profile_id}/select) or set AMAZON_PROFILE_ID."
+        )
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Amazon-Advertising-API-ClientId": ADS_LWA_CLIENT_ID,
+        "Amazon-Advertising-API-Scope": profile_id,
+        "Content-Type": _SP_BID_REC_MEDIA,
+        "Accept": _SP_BID_REC_MEDIA,
+    }
+    # v4 uses one targeting-expression type per match type.
+    expr_type = f"KEYWORD_{match_type.upper()}_MATCH"
+    url = f"{_ads_base(user)}/sp/targets/bid/recommendations"
+    recs: list[dict] = []
+    # Retry schedule for 429s. Ads API has a per-endpoint bucket that refills
+    # in a few seconds — three attempts (~1.5s + ~4s + ~10s) covers the usual
+    # throttle without dragging the pipeline for a full minute on a hard cap.
+    retry_waits = (1.5, 4.0, 10.0)
+    async with httpx.AsyncClient(timeout=20) as client:
+        for i in range(0, len(keywords), 100):
+            chunk = keywords[i : i + 100]
+            payload = {
+                "campaignId": campaign_id,
+                "adGroupId": ad_group_id,
+                "recommendationType": "BIDS_FOR_EXISTING_AD_GROUP",
+                "targetingExpressions": [
+                    {"type": expr_type, "value": k} for k in chunk
+                ],
+            }
+            print(f"[amazon_ads] -> POST bidRecommendations {url} n={len(chunk)}")
+            resp = None
+            for attempt in range(len(retry_waits) + 1):
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code != 429:
+                    break
+                if attempt >= len(retry_waits):
+                    break
+                # Respect Retry-After when Amazon sets it, else fall back to
+                # our schedule. Retry-After is typically seconds.
+                ra = resp.headers.get("Retry-After")
+                try:
+                    wait = float(ra) if ra else retry_waits[attempt]
+                except ValueError:
+                    wait = retry_waits[attempt]
+                print(
+                    f"[amazon_ads] <- bidRecommendations 429 — "
+                    f"waiting {wait:.1f}s (attempt {attempt + 1}/{len(retry_waits)})"
+                )
+                await asyncio.sleep(wait)
+            if resp is None or resp.is_error:
+                status = resp.status_code if resp else "no response"
+                body = resp.text if resp else ""
+                print(
+                    f"[amazon_ads] <- bidRecommendations FAILED "
+                    f"status={status} body={body}"
+                )
+                if resp is not None:
+                    resp.raise_for_status()
+                raise RuntimeError("bidRecommendations: no response")
+            data = resp.json()
+            # v4 groups bids by "theme"; a single ad group gets one theme
+            # (CONVERSION_OPPORTUNITIES). Flatten it back into a per-keyword list.
+            for theme in data.get("bidRecommendations", []):
+                for entry in theme.get("bidRecommendationsForTargetingExpressions", []):
+                    expr = entry.get("targetingExpression") or {}
+                    kw = expr.get("value")
+                    bids = [b.get("suggestedBid") for b in entry.get("bidValues", [])]
+                    if not kw or not bids:
+                        continue
+                    low = bids[0] if len(bids) > 0 else None
+                    mid = bids[len(bids) // 2] if bids else None
+                    high = bids[-1] if bids else None
+                    recs.append({
+                        "keyword": kw,
+                        "matchType": match_type,
+                        "suggestedBid": {
+                            "low": low,
+                            "suggested": mid,
+                            "high": high,
+                        },
+                    })
+    return {"adGroupId": ad_group_id, "recommendations": recs}
+
+
+async def find_default_ad_group(preferred_asin: str | None = None) -> dict | None:
+    """Return any valid ENABLED (campaignId, adGroupId) pair the account owns.
+
+    Used by the keyword-matrix flow to auto-pick an ad group for bid-recs when
+    the caller didn't supply one — bid-recs needs both IDs and requires the ad
+    group to actually exist in the account.
+
+    Prefers ad groups whose product ads include `preferred_asin` (so bids come
+    back scoped to that product's competitive context), then falls back to any
+    ENABLED ad group. NOTE: as of 2026-07, Amazon's `asinFilter` on
+    `/sp/productAds/list` is silently ignored — the filter is sent but Amazon
+    returns the same ordering for any ASIN. We keep the filter in the payload
+    (harmless, forward-compatible if Amazon fixes it) and scan up to 100 results
+    for a client-side match; if none matches we fall back to the first result.
+    """
+    for state in ("ENABLED", "PAUSED"):
+        payload: dict = {
+            "stateFilter": {"include": [state]},
+            "maxResults": 100,
+        }
+        if preferred_asin:
+            payload["asinFilter"] = {
+                "queryTermMatchType": "EXACT_MATCH",
+                "include": [preferred_asin],
+            }
+        try:
+            data = await _post_json(
+                "productAds/list", "/sp/productAds/list", SP_PRODUCT_AD_CT, payload
+            )
+        except Exception as e:
+            print(f"[amazon_ads] productAds lookup failed state={state}: {e}")
+            continue
+        ads = data.get("productAds") if isinstance(data, dict) else None
+        if not ads:
+            continue
+        # Client-side match on preferred ASIN if Amazon's filter didn't narrow.
+        matched_by_asin = False
+        pick = ads[0]
+        if preferred_asin:
+            for a in ads:
+                if (a.get("asin") or "").upper() == preferred_asin.upper():
+                    pick = a
+                    matched_by_asin = True
+                    break
+        cid = pick.get("campaignId")
+        gid = pick.get("adGroupId")
+        if cid and gid:
+            return {
+                "campaignId": str(cid),
+                "adGroupId": str(gid),
+                "state": state,
+                "matched_asin": matched_by_asin,
+            }
+    return None
 
 
 async def get_profiles() -> list[dict]:

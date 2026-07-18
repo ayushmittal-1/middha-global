@@ -1426,6 +1426,108 @@
       border-color: rgba(255, 255, 255, 0.12);
       color: #f8fafc;
     }
+
+    /* ── Keyword Matrix view ────────────────────────────── */
+    #keywords-view {
+      display: none;
+      flex-direction: column;
+      flex: 1;
+      overflow-y: auto;
+      background: #fafafa;
+    }
+    #keywords-view.visible { display: flex; }
+    #keywords-toolbar {
+      display: flex; align-items: center; gap: 12px;
+      padding: 16px 20px; border-bottom: 1px solid #e5e5e5;
+      background: #fff; flex-wrap: wrap;
+    }
+    #keywords-toolbar h2 { margin: 0; font-size: 18px; color: #1a1a2e; }
+    #keywords-toolbar input {
+      padding: 6px 10px; font-size: 13px;
+      border: 1px solid #d0d0d0; border-radius: 4px;
+      background: #fff; color: #1a1a2e;
+    }
+    #kw-asins { min-width: 320px; flex: 1; max-width: 600px; }
+    #kw-adgroup { width: 160px; }
+    #kw-run-btn {
+      padding: 6px 14px; font-size: 13px;
+      background: #4a6cf7; color: #fff; border: none;
+      border-radius: 4px; cursor: pointer;
+    }
+    #kw-run-btn:hover { background: #3a5bd6; }
+    #kw-run-btn:disabled { background: #a0a8bd; cursor: not-allowed; }
+    #kw-status { font-size: 12px; color: #666; }
+
+    #kw-body { padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; }
+
+    /* Stepper */
+    #kw-stepper {
+      display: flex; gap: 4px; align-items: center;
+      font-size: 12px; color: #666;
+    }
+    .kw-step {
+      padding: 4px 10px; border-radius: 12px;
+      background: #eee; color: #888;
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    .kw-step.active { background: #4a6cf7; color: #fff; }
+    .kw-step.done { background: #22c55e; color: #fff; }
+    .kw-step-arrow { color: #ccc; }
+
+    /* Per-source summary strip */
+    #kw-source-strip {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+    }
+    .kw-source-card {
+      background: #fff; border: 1px solid #e5e5e5; border-radius: 6px;
+      padding: 10px 12px; font-size: 12px;
+    }
+    .kw-source-card h4 {
+      margin: 0 0 4px; font-size: 13px; color: #1a1a2e;
+    }
+    .kw-source-card .kw-note {
+      color: #b71c1c; font-size: 11px; margin-top: 2px;
+    }
+
+    /* Matrix */
+    #kw-matrix {
+      background: #fff; border: 1px solid #e5e5e5; border-radius: 6px;
+      overflow: hidden;
+    }
+    #kw-matrix table { width: 100%; border-collapse: collapse; }
+    #kw-matrix th, #kw-matrix td {
+      padding: 10px 12px; vertical-align: top;
+      border-right: 1px solid #eee; border-bottom: 1px solid #eee;
+      text-align: left; font-size: 12px;
+    }
+    #kw-matrix th {
+      background: #f4f6fb; color: #1a1a2e; font-weight: 600;
+    }
+    #kw-matrix th.kw-tier {
+      background: #fff; width: 80px; text-align: center;
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    #kw-matrix th.kw-tier.tier-top { color: #22c55e; }
+    #kw-matrix th.kw-tier.tier-medium { color: #eab308; }
+    #kw-matrix th.kw-tier.tier-low { color: #b71c1c; }
+    #kw-matrix td { width: calc((100% - 80px) / 3); }
+    .kw-cell-item {
+      padding: 6px 0; border-bottom: 1px dashed #f0f0f0;
+    }
+    .kw-cell-item:last-child { border-bottom: none; }
+    .kw-cell-kw {
+      font-weight: 600; color: #1a1a2e; font-size: 13px;
+    }
+    .kw-cell-metrics {
+      display: flex; flex-wrap: wrap; gap: 8px;
+      font-size: 11px; color: #666; margin-top: 2px;
+    }
+    .kw-cell-metrics span b { color: #1a1a2e; font-weight: 600; }
+    .kw-cell-empty { color: #aaa; font-style: italic; font-size: 12px; }
+    #kw-error {
+      background: #fee; color: #b71c1c; padding: 8px 12px;
+      border-radius: 4px; font-size: 13px; display: none;
+    }
   </style>
 </head>
 <body>
@@ -1480,6 +1582,7 @@
       <button class="tab-btn" data-tab="campaigns">Campaigns</button>
       <button class="tab-btn" data-tab="profit">Profitability</button>
       <button class="tab-btn" data-tab="cogs">COGS</button>
+      <button class="tab-btn" data-tab="keywords">Keywords</button>
     </nav>
 
     <div id="chat-container">
@@ -1714,6 +1817,23 @@
       </div>
       <div id="cogs-empty" style="display:none; padding:20px; color:#888;">
         No COGS rows yet. Add one above or upload a CSV from the sidebar.
+      </div>
+    </div>
+
+    <div id="keywords-view">
+      <div id="keywords-toolbar">
+        <h2>Keyword Matrix</h2>
+        <input id="kw-asins" type="text" placeholder="ASINs (comma separated) — e.g. B0ABC123, B0DEF456">
+        <input id="kw-campaign" type="text" placeholder="Campaign ID (optional — auto-picked from ASIN)">
+        <input id="kw-adgroup" type="text" placeholder="Ad Group ID (optional — auto-picked from ASIN)">
+        <button id="kw-run-btn">Run</button>
+        <span id="kw-status"></span>
+      </div>
+      <div id="kw-body">
+        <div id="kw-error"></div>
+        <div id="kw-stepper" style="display:none;"></div>
+        <div id="kw-source-strip" style="display:none;"></div>
+        <div id="kw-matrix" style="display:none;"></div>
       </div>
     </div>
   </div>
@@ -2261,6 +2381,18 @@
     const cogsAddShipEl = document.getElementById('cogs-add-ship');
     let cogsLoaded = false;
 
+    const keywordsViewEl = document.getElementById('keywords-view');
+    const kwAsinsEl = document.getElementById('kw-asins');
+    const kwCampaignEl = document.getElementById('kw-campaign');
+    const kwAdgroupEl = document.getElementById('kw-adgroup');
+    const kwRunBtn = document.getElementById('kw-run-btn');
+    const kwStatusEl = document.getElementById('kw-status');
+    const kwStepperEl = document.getElementById('kw-stepper');
+    const kwStripEl = document.getElementById('kw-source-strip');
+    const kwMatrixEl = document.getElementById('kw-matrix');
+    const kwErrorEl = document.getElementById('kw-error');
+    let kwPollTimer = null;
+
     function setActiveTab(tab) {
       document.querySelectorAll('.tab-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
@@ -2271,6 +2403,7 @@
       const isCampaigns = tab === 'campaigns';
       const isProfit = tab === 'profit';
       const isCogs = tab === 'cogs';
+      const isKeywords = tab === 'keywords';
       chatContainerEl.style.display = isChat ? 'flex' : 'none';
       inputAreaEl.style.display = isChat ? 'flex' : 'none';
       restockViewEl.classList.toggle('visible', isRestock);
@@ -2278,6 +2411,7 @@
       campaignsViewEl.classList.toggle('visible', isCampaigns);
       profitViewEl.classList.toggle('visible', isProfit);
       cogsViewEl.classList.toggle('visible', isCogs);
+      keywordsViewEl.classList.toggle('visible', isKeywords);
       if (isRestock && !restockLoaded) {
         loadRestock();
         loadForecastSettings();
@@ -2972,6 +3106,191 @@
       } catch (err) {
         cogsFlash(`${sku}: ${err.message || err}`, true);
       }
+    });
+
+    // ── Keyword Matrix ──────────────────────────────────
+    const KW_STEPS = [
+      { key: 'sourcing',         label: 'Sourcing' },
+      { key: 'brand_analytics',  label: 'Brand Analytics' },
+      { key: 'cpc',              label: 'CPC' },
+      { key: 'scoring',          label: 'Scoring' },
+      { key: 'done',             label: 'Done' },
+    ];
+
+    function fmtKwNum(v, digits = 2) {
+      if (v === null || v === undefined) return '—';
+      return Number(v).toFixed(digits);
+    }
+    function fmtKwPct(v) {
+      if (v === null || v === undefined) return '—';
+      return `${(Number(v) * 100).toFixed(1)}%`;
+    }
+    function fmtKwSfr(v) {
+      if (v === null || v === undefined) return '—';
+      return Math.round(v).toLocaleString();
+    }
+
+    function renderKwStepper(currentStep, status) {
+      const parts = [];
+      let currentIdx = KW_STEPS.findIndex(s => s.key === currentStep);
+      if (currentIdx < 0) currentIdx = 0;
+      KW_STEPS.forEach((step, i) => {
+        let cls = 'kw-step';
+        if (status === 'done') cls += ' done';
+        else if (i < currentIdx) cls += ' done';
+        else if (i === currentIdx) cls += ' active';
+        parts.push(`<span class="${cls}">${step.label}</span>`);
+        if (i < KW_STEPS.length - 1) parts.push(`<span class="kw-step-arrow">›</span>`);
+      });
+      kwStepperEl.innerHTML = parts.join('');
+      kwStepperEl.style.display = 'flex';
+    }
+
+    function renderKwSourceStrip(sources) {
+      if (!sources) return;
+      const order = ['amazon_asin', 'meta', 'amazon_searchbar'];
+      const html = order.map(key => {
+        const s = sources[key];
+        if (!s) return '';
+        const cov = s.ba_coverage;
+        const covLine = cov
+          ? `<div>Brand Analytics: <b>${cov.in_report}/${cov.total}</b> matched</div>`
+          : '';
+        const notes = (s.notes || []).map(n => `<div class="kw-note">• ${n}</div>`).join('');
+        return `
+          <div class="kw-source-card">
+            <h4>${s.label}</h4>
+            <div>Raw keywords: <b>${s.raw_count}</b></div>
+            <div>Scorable: <b>${s.scorable_count}</b></div>
+            ${covLine}
+            ${notes}
+          </div>`;
+      }).join('');
+      kwStripEl.innerHTML = html;
+      kwStripEl.style.display = 'grid';
+    }
+
+    function renderKwCell(entries) {
+      if (!entries || entries.length === 0) {
+        return `<div class="kw-cell-empty">— no keywords —</div>`;
+      }
+      return entries.map(e => {
+        const kw = e.keyword || '';
+        return `
+          <div class="kw-cell-item">
+            <div class="kw-cell-kw">${kw}</div>
+            <div class="kw-cell-metrics">
+              <span>SFR <b>${fmtKwSfr(e.sfr)}</b></span>
+              <span>Click <b>${fmtKwPct(e.click_share)}</b></span>
+              <span>Conv <b>${fmtKwPct(e.conversion_share)}</b></span>
+              <span>CPC <b>${e.cpc == null ? '—' : '$' + fmtKwNum(e.cpc)}</b></span>
+              <span>Score <b>${fmtKwNum(e.composite)}</b></span>
+            </div>
+          </div>`;
+      }).join('');
+    }
+
+    function renderKwMatrix(matrix) {
+      if (!matrix) {
+        kwMatrixEl.style.display = 'none';
+        return;
+      }
+      const cols = matrix.cols || [];
+      const labels = matrix.col_labels || {};
+      const cells = matrix.cells || {};
+      const tierClass = { top: 'tier-top', medium: 'tier-medium', low: 'tier-low' };
+      const head = `
+        <tr>
+          <th class="kw-tier"></th>
+          ${cols.map(c => `<th>${labels[c] || c}</th>`).join('')}
+        </tr>`;
+      const rows = ['top', 'medium', 'low'].map(tier => `
+        <tr>
+          <th class="kw-tier ${tierClass[tier]}">${tier}</th>
+          ${cols.map(c => `<td>${renderKwCell((cells[tier] || {})[c])}</td>`).join('')}
+        </tr>`).join('');
+      kwMatrixEl.innerHTML = `<table><thead>${head}</thead><tbody>${rows}</tbody></table>`;
+      kwMatrixEl.style.display = 'block';
+    }
+
+    async function pollKwJob(jobId) {
+      try {
+        const r = await fetch(`/keyword-matrix/${encodeURIComponent(jobId)}`, {
+          headers: authHeaders(),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const job = await r.json();
+        renderKwStepper(job.step, job.status);
+        const adGroupNote = job.ad_group_id && job.campaign_id
+          ? ` — ad group ${job.ad_group_id} (${job.ad_group_source || 'user'})`
+          : '';
+        kwStatusEl.textContent = (job.status === 'done'
+          ? 'Done.'
+          : `Running (${job.step})…`) + adGroupNote;
+        if (job.matrix) renderKwSourceStrip(job.matrix.sources);
+        if (job.status === 'done') {
+          renderKwMatrix(job.matrix);
+          kwRunBtn.disabled = false;
+          if (kwPollTimer) { clearTimeout(kwPollTimer); kwPollTimer = null; }
+          return;
+        }
+        if (job.status === 'error') {
+          kwErrorEl.textContent = job.error || 'Job failed.';
+          kwErrorEl.style.display = 'block';
+          kwStatusEl.textContent = 'Error.';
+          kwRunBtn.disabled = false;
+          if (kwPollTimer) { clearTimeout(kwPollTimer); kwPollTimer = null; }
+          return;
+        }
+        kwPollTimer = setTimeout(() => pollKwJob(jobId), 1200);
+      } catch (err) {
+        kwErrorEl.textContent = err.message || String(err);
+        kwErrorEl.style.display = 'block';
+        kwRunBtn.disabled = false;
+      }
+    }
+
+    async function runKwJob() {
+      const asins = kwAsinsEl.value
+        .split(/[,\s]+/)
+        .map(s => s.trim())
+        .filter(Boolean);
+      if (asins.length === 0) {
+        kwErrorEl.textContent = 'Enter at least one ASIN.';
+        kwErrorEl.style.display = 'block';
+        return;
+      }
+      kwErrorEl.style.display = 'none';
+      kwErrorEl.textContent = '';
+      kwMatrixEl.style.display = 'none';
+      kwStripEl.style.display = 'none';
+      kwRunBtn.disabled = true;
+      kwStatusEl.textContent = 'Starting…';
+      if (kwPollTimer) { clearTimeout(kwPollTimer); kwPollTimer = null; }
+      const ad_group_id = kwAdgroupEl.value.trim() || null;
+      const campaign_id = kwCampaignEl.value.trim() || null;
+      try {
+        const r = await fetch('/keyword-matrix/start', {
+          method: 'POST',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ asins, ad_group_id, campaign_id }),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          throw new Error(j.detail || `HTTP ${r.status}`);
+        }
+        const j = await r.json();
+        pollKwJob(j.job_id);
+      } catch (err) {
+        kwErrorEl.textContent = err.message || String(err);
+        kwErrorEl.style.display = 'block';
+        kwRunBtn.disabled = false;
+        kwStatusEl.textContent = '';
+      }
+    }
+    kwRunBtn.addEventListener('click', runKwJob);
+    kwAsinsEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter') runKwJob();
     });
 
     // ── SKU drawer ──────────────────────────────────────
