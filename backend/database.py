@@ -811,8 +811,9 @@ DEFAULT_PRODUCT_SETTINGS: dict = {
     "shipping_to_fba_days": None,     # None → falls back to global AIR_TRANSIT_DAYS
     "fba_buffer_days": 0,
     "target_stock_days": None,        # None → falls back to global target_cover_days
-    # Forecast tab
-    "velocity_weights": None,         # {"d3":..., "d7":..., "d30":..., "d60":..., "d180":...} or None
+    # Forecast tab — SellerBoard-style defaults so recent demand dominates.
+    # Users can override per-SKU; leaving all weights at 0 falls back to Prophet.
+    "velocity_weights": {"d3": 0.5, "d7": 0.3, "d30": 0.2, "d60": 0.0, "d180": 0.0},
     # Shipping to FBA tab (packing template — pure storage)
     "packing": None,
     # Purchase order tab (supplier — pure storage)
