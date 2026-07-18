@@ -376,7 +376,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
     now_utc = datetime.now(timezone.utc)
     velocities_by_sku: dict[str, dict[str, float]] = {}
     for sku_key, sku_rows in sales_by_sku.items():
-        w = compute_velocity_windows(sku_rows, now_utc, windows=(7, 30, 90))
+        w = compute_velocity_windows(sku_rows, now_utc, windows=(3, 7, 30, 90))
         entry: dict[str, float] = {}
         for row in w:
             entry[f"velocity_{row['period_days']}d"] = row["velocity"]
@@ -458,9 +458,11 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "inbound": reorder.get("inbound", 0),
             "ordered": int(ordered_by_sku.get(sku) or 0),
             "avg_daily_demand": reorder.get("avg_daily_demand", 0),
+            "velocity_3d": velocities_by_sku.get(sku, {}).get("velocity_3d", 0.0),
             "velocity_7d": velocities_by_sku.get(sku, {}).get("velocity_7d", 0.0),
             "velocity_30d": velocities_by_sku.get(sku, {}).get("velocity_30d", 0.0),
             "velocity_90d": velocities_by_sku.get(sku, {}).get("velocity_90d", 0.0),
+            "units_3d": velocities_by_sku.get(sku, {}).get("units_3d", 0),
             "units_7d": velocities_by_sku.get(sku, {}).get("units_7d", 0),
             "units_30d": velocities_by_sku.get(sku, {}).get("units_30d", 0),
             "units_90d": velocities_by_sku.get(sku, {}).get("units_90d", 0),
