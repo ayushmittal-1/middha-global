@@ -34,8 +34,6 @@ per-source metadata rather than aborting the job.
 from __future__ import annotations
 
 import asyncio
-import gzip
-import json
 import os
 import re
 import uuid
@@ -43,7 +41,6 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 
 import amazon_sp
 from amazon_ads import (
@@ -143,10 +140,30 @@ async def _run_job(job_id: str) -> None:
                 job["sources"][name]["notes"].extend(res.get("notes", []))
 
         job["step"] = "brand_analytics"
-        ba_index = await _fetch_brand_analytics_index()
+        user_key = _ba_user_key()
+        ba_week = await _ensure_ba_week(user_key)
+        # Union all sourced keywords into a single Mongo $in lookup so we hit
+        # the database once regardless of how many sources produced keywords.
+        # Memory cost of the returned dict is proportional to the union size,
+        # not the 2.8M-row report.
+        all_keywords: set[str] = set()
+        for source in SOURCES:
+            for kw in job["sources"][source]["keywords"]:
+                all_keywords.add(kw)
+        if ba_week and all_keywords:
+            term_map = await _ba_lookup_terms(
+                user_key, ba_week[0], ba_week[1], list(all_keywords)
+            )
+        else:
+            term_map = {}
+            if not ba_week:
+                for source in SOURCES:
+                    job["sources"][source]["notes"].append(
+                        "brand analytics unavailable — enrichment skipped"
+                    )
         for source in SOURCES:
             src = job["sources"][source]
-            enriched, coverage = _enrich_with_brand_analytics(src["keywords"], ba_index)
+            enriched, coverage = _enrich_with_brand_analytics(src["keywords"], term_map)
             src["enriched"] = enriched
             src["ba_coverage"] = coverage
 
@@ -405,21 +422,27 @@ async def _source_amazon_searchbar(titles: list[str]) -> dict:
 
 _BA_MAX_WEEKS_BACK = 3
 
-# BA reports are cached in Mongo (GridFS) as one gzipped JSON blob per
-# (user, week). We keep only the trimmed 3-signal shape — SFR, total click
-# share, total conversion share — because that's all the scorer needs; the
-# raw report is ~500 MB uncompressed / ~7 GB as Python dicts, which is not
-# something we want in-process memory. Trimmed shape shrinks to ~150 MB
-# uncompressed / ~15-25 MB gzipped — a healthy Mongo doc size.
+# BA data is cached in Mongo as ONE DOC PER TERM in the `brand_analytics_terms`
+# collection. Doc shape:
+#   {user_id, week_start, week_end, term, sfr, click_share, conversion_share}
+# A single marker doc per (user, week) with {_marker: True, count: N} records
+# that a week finished importing successfully.
 #
-# Nothing is cached in-process across jobs — every job hits Mongo once, loads
-# the ~20-40 MB blob, decodes it into a local dict for that request's
-# enrichment, then lets it get garbage-collected when the job finishes. This
-# is deliberate: keeping the index in RAM is where the memory blow-up hides.
-_BA_GRIDFS_BUCKET = "brand_analytics_cache"
+# This is the memory-safe cache design: at enrichment time we do a single
+# `find({user, week, term: {$in: [<200 keywords>]}})` and get back only what
+# we need — ~200 tiny docs, <1 MB in Python. We never load the 2.8M-row
+# index into RAM. Fits comfortably within Render's 512 MB tier during a
+# cache hit.
+#
+# The compound index (user_id, week_start, week_end, term) needs to exist for
+# the $in query to stay fast; `_ensure_ba_indexes` creates it lazily on first
+# use so we don't need a migration step.
+_BA_COLLECTION = "brand_analytics_terms"
+_BA_WRITE_BATCH = 5000
 # Per-user lock so a second job kicked off while the first is still parsing
 # waits on the same fetch instead of triggering a duplicate 500 MB download.
 _BA_LOCKS: dict[str, asyncio.Lock] = {}
+_BA_INDEXES_ENSURED = False
 
 
 def _ba_user_key() -> str:
@@ -427,12 +450,30 @@ def _ba_user_key() -> str:
     return str(user.get("_id") or user.get("email") or "anon")
 
 
-def _ba_cache_filename(user_key: str, week_start: str, week_end: str) -> str:
-    return f"{user_key}:{week_start}:{week_end}"
+def _ba_coll():
+    return _db()[_BA_COLLECTION]
 
 
-def _ba_gridfs() -> AsyncIOMotorGridFSBucket:
-    return AsyncIOMotorGridFSBucket(_db(), bucket_name=_BA_GRIDFS_BUCKET)
+async def _ensure_ba_indexes() -> None:
+    """Create the compound + marker indexes once per process."""
+    global _BA_INDEXES_ENSURED
+    if _BA_INDEXES_ENSURED:
+        return
+    coll = _ba_coll()
+    # Main lookup index — supports $in on term within a (user, week) scope.
+    await coll.create_index(
+        [("user_id", 1), ("week_start", 1), ("week_end", 1), ("term", 1)],
+        name="user_week_term",
+        background=True,
+    )
+    # Marker index for the completion sentinel doc.
+    await coll.create_index(
+        [("user_id", 1), ("week_start", 1), ("week_end", 1), ("_marker", 1)],
+        name="user_week_marker",
+        background=True,
+        sparse=True,
+    )
+    _BA_INDEXES_ENSURED = True
 
 
 def _f(row: dict, *names: str) -> float | None:
@@ -482,89 +523,150 @@ def _trim_row_for_cache(row: dict) -> dict:
     }
 
 
-async def _ba_mongo_read(user_key: str, week_start: str, week_end: str) -> dict[str, dict] | None:
-    """Load a cached trimmed BA index from Mongo GridFS. Returns None on miss."""
-    filename = _ba_cache_filename(user_key, week_start, week_end)
-    try:
-        stream = await _ba_gridfs().open_download_stream_by_name(filename)
-    except Exception:
-        return None
-    # Motor's GridOut.read() is async; close() is sync. Don't await close().
-    raw = await stream.read()
-    try:
-        payload = gzip.decompress(raw)
-        return json.loads(payload)
-    except Exception as e:
-        print(f"[keyword_matrix] BA mongo decode failed for {filename}: {e}")
-        return None
-
-
-async def _ba_mongo_write(user_key: str, week_start: str, week_end: str, index: dict[str, dict]) -> None:
-    """Persist the trimmed BA index to Mongo GridFS, replacing any older copy."""
-    filename = _ba_cache_filename(user_key, week_start, week_end)
-    payload = gzip.compress(
-        json.dumps(index, separators=(",", ":")).encode("utf-8")
+async def _ba_week_is_cached(user_key: str, week_start: str, week_end: str) -> bool:
+    """True if the marker doc exists for this (user, week) — i.e. import done."""
+    doc = await _ba_coll().find_one(
+        {
+            "user_id": user_key,
+            "week_start": week_start,
+            "week_end": week_end,
+            "_marker": True,
+        },
+        projection={"_id": 1},
     )
-    # Wipe stale copies of the same (user, week) so GridFS doesn't accumulate
-    # duplicates on every re-fetch.
-    fs = _ba_gridfs()
-    async for f in fs.find({"filename": filename}):
-        try:
-            await fs.delete(f._id)
-        except Exception as e:
-            print(f"[keyword_matrix] BA mongo delete stale copy failed: {e}")
-    await fs.upload_from_stream(filename, payload)
-    print(
-        f"[keyword_matrix] BA cache WROTE mongo {filename} "
-        f"({len(index)} terms, {len(payload) / 1e6:.1f} MB gzipped)"
-    )
+    return doc is not None
 
 
-async def _fetch_brand_analytics_index() -> dict[str, dict]:
-    """Return the trimmed BA index for the most recent successful week.
+async def _ba_lookup_terms(
+    user_key: str,
+    week_start: str,
+    week_end: str,
+    terms: list[str],
+) -> dict[str, dict]:
+    """Fetch trimmed BA data for a specific batch of terms via $in.
 
-    Amazon publishes weekly reports for full ISO weeks. The most recent one
-    frequently FATALs because Amazon hasn't finished processing it yet — we
-    walk back a week at a time and retry, up to `_BA_MAX_WEEKS_BACK` weeks,
-    before giving up.
-
-    Cache flow: check Mongo (per-user, per-week GridFS blob) newest → oldest,
-    return the first hit. Miss → run the fetch loop, trim rows, store the
-    trimmed dict back to Mongo, return it. Downstream code treats an empty
-    index as "no keyword matches" rather than an error.
+    Only returns rows Mongo has — missing terms simply don't show up in the
+    result dict, and the enricher falls back to `in_report=False` for them.
+    Peak memory is the returned dict size, which for 200 keywords is <1 MB.
     """
-    user_key = _ba_user_key()
+    if not terms:
+        return {}
+    cursor = _ba_coll().find(
+        {
+            "user_id": user_key,
+            "week_start": week_start,
+            "week_end": week_end,
+            "term": {"$in": terms},
+        },
+        projection={"_id": 0, "term": 1, "sfr": 1, "click_share": 1, "conversion_share": 1},
+    )
+    out: dict[str, dict] = {}
+    async for doc in cursor:
+        term = doc.pop("term", None)
+        if term:
+            out[term] = doc
+    return out
+
+
+async def _ba_write_week(
+    user_key: str,
+    week_start: str,
+    week_end: str,
+    rows,
+) -> int:
+    """Persist a freshly-parsed BA report as per-term docs + a marker doc.
+
+    Wipes any existing (user, week) docs first so re-runs never leave stale
+    duplicates. Inserts in batches of `_BA_WRITE_BATCH` so we don't ship a
+    single 2.8M-doc bulk op at Mongo (both slower and more memory-hungry
+    on the client). Iterates the input as a generator/list — the caller is
+    responsible for freeing the raw report bytes before calling this.
+    """
+    coll = _ba_coll()
+    # Nuke any old copy (including its marker) so we don't half-overwrite.
+    await coll.delete_many(
+        {"user_id": user_key, "week_start": week_start, "week_end": week_end}
+    )
+
+    batch: list[dict] = []
+    total = 0
+    for row in rows:
+        term = (row.get("searchTerm") or row.get("search_term") or "").strip().lower()
+        if not term:
+            continue
+        trimmed = _trim_row_for_cache(row)
+        batch.append(
+            {
+                "user_id": user_key,
+                "week_start": week_start,
+                "week_end": week_end,
+                "term": term,
+                **trimmed,
+            }
+        )
+        if len(batch) >= _BA_WRITE_BATCH:
+            await coll.insert_many(batch, ordered=False)
+            total += len(batch)
+            batch = []
+    if batch:
+        await coll.insert_many(batch, ordered=False)
+        total += len(batch)
+
+    # Marker last — its presence means "the terms above are complete."
+    await coll.insert_one(
+        {
+            "user_id": user_key,
+            "week_start": week_start,
+            "week_end": week_end,
+            "_marker": True,
+            "count": total,
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    print(
+        f"[keyword_matrix] BA cache WROTE mongo user={user_key} "
+        f"week {week_start}..{week_end} ({total} terms across per-term docs)"
+    )
+    return total
+
+
+async def _ensure_ba_week(user_key: str) -> tuple[str, str] | None:
+    """Return the (start, end) of a cached-or-freshly-fetched BA week for this user.
+
+    Walks up to `_BA_MAX_WEEKS_BACK` weeks newest → oldest looking for one
+    that's already imported. On miss, tries the fetch loop, imports, and
+    returns the first week that succeeds. Returns None if nothing works.
+
+    This does NOT return the actual data — that comes later via
+    `_ba_lookup_terms`, which pulls only the specific keywords a job needs.
+    """
+    await _ensure_ba_indexes()
     today = date.today()
-    # Anchor on the last completed Sunday–Saturday window.
     days_since_sunday = (today.weekday() + 1) % 7
     last_sat = today - timedelta(days=days_since_sunday + 1)
 
-    # Mongo cache probe (newest → oldest). First hit wins.
     for attempt in range(_BA_MAX_WEEKS_BACK):
         end = last_sat - timedelta(days=7 * attempt)
         start = end - timedelta(days=6)
-        cached = await _ba_mongo_read(user_key, start.isoformat(), end.isoformat())
-        if cached is not None:
+        if await _ba_week_is_cached(user_key, start.isoformat(), end.isoformat()):
             print(
                 f"[keyword_matrix] BA cache HIT mongo user={user_key} "
-                f"week {start}..{end} ({len(cached)} terms)"
+                f"week {start}..{end}"
             )
-            return cached
+            return start.isoformat(), end.isoformat()
 
     lock = _BA_LOCKS.setdefault(user_key, asyncio.Lock())
     async with lock:
-        # Re-check under the lock — another concurrent job may have populated
-        # Mongo while we were queued behind it.
+        # Re-check under the lock — a concurrent job may have populated it.
         for attempt in range(_BA_MAX_WEEKS_BACK):
             end = last_sat - timedelta(days=7 * attempt)
             start = end - timedelta(days=6)
-            cached = await _ba_mongo_read(user_key, start.isoformat(), end.isoformat())
-            if cached is not None:
+            if await _ba_week_is_cached(user_key, start.isoformat(), end.isoformat()):
                 print(
                     f"[keyword_matrix] BA cache HIT mongo (post-lock) "
                     f"user={user_key} week {start}..{end}"
                 )
-                return cached
+                return start.isoformat(), end.isoformat()
 
         for attempt in range(_BA_MAX_WEEKS_BACK):
             end = last_sat - timedelta(days=7 * attempt)
@@ -590,54 +692,44 @@ async def _fetch_brand_analytics_index() -> dict[str, dict]:
                 )
                 if not retryable:
                     print(f"[keyword_matrix] brand analytics fetch failed hard: {e}")
-                    return {}
+                    return None
                 print(
                     f"[keyword_matrix] BA week {start}..{end} unavailable "
                     f"({msg[:80]}) — attempt {attempt + 1}/{_BA_MAX_WEEKS_BACK}, "
                     f"retrying older week"
                 )
                 continue
-            index: dict[str, dict] = {}
-            for row in rows:
-                term = (row.get("searchTerm") or row.get("search_term") or "").strip().lower()
-                if term:
-                    index[term] = _trim_row_for_cache(row)
-            # Drop the raw rows list so the parsed BA report can be freed
-            # while we're serializing to Mongo — otherwise we double the
-            # memory footprint during the write.
-            del rows
             try:
-                await _ba_mongo_write(user_key, start.isoformat(), end.isoformat(), index)
+                await _ba_write_week(user_key, start.isoformat(), end.isoformat(), rows)
             except Exception as e:
-                print(f"[keyword_matrix] BA mongo write failed (continuing): {e}")
-            print(
-                f"[keyword_matrix] BA week {start}..{end} OK — indexed "
-                f"{len(index)} terms"
-            )
-            return index
+                print(f"[keyword_matrix] BA mongo write failed: {e}")
+                return None
+            finally:
+                # Free the parsed report as early as possible — on a 512 MB
+                # Render instance the difference is life or death.
+                del rows
+            return start.isoformat(), end.isoformat()
 
         print(
             f"[keyword_matrix] brand analytics FATAL for last "
             f"{_BA_MAX_WEEKS_BACK} weeks — giving up"
         )
-        return {}
+        return None
 
 
 def _enrich_with_brand_analytics(
-    keywords: list[str], index: dict[str, dict]
+    keywords: list[str], term_map: dict[str, dict]
 ) -> tuple[list[dict], dict]:
     """Attach SFR + click share + conversion share to each keyword.
 
-    Reads directly from the trimmed cache shape written by
-    `_trim_row_for_cache` — {sfr, click_share, conversion_share} per term.
-    Keywords not in the report are still returned but with all metrics None
-    — the scorer drops them from ranking, and the notes surface coverage so
-    the user sees the drop.
+    `term_map` is the output of `_ba_lookup_terms` — a small dict containing
+    only the terms Mongo returned (i.e. only the ones present in the report).
+    Keywords not in the map are still returned but with all metrics None.
     """
     enriched: list[dict] = []
     hits = 0
     for kw in keywords:
-        row = index.get(kw)
+        row = term_map.get(kw)
         if not row:
             enriched.append(
                 {
