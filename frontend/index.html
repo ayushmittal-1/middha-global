@@ -1629,6 +1629,12 @@
         <label>Target cover (days)
           <input id="setting-target-cover" type="number" min="7" max="365">
         </label>
+        <label title="Days from your origin to the Amazon FC once an air shipment dispatches — feeds Ship by (Air).">Air transit (days)
+          <input id="setting-air-transit" type="number" min="1" max="365">
+        </label>
+        <label title="Days from your origin to the Amazon FC once an ocean shipment dispatches — feeds Ship by (Ocean).">Ocean transit (days)
+          <input id="setting-ocean-transit" type="number" min="1" max="365">
+        </label>
         <button id="setting-save">Save</button>
       </div>
 
@@ -2343,6 +2349,8 @@
     let restockCache = [];  // last fetch — re-rendered on toggle
     const settingMoq = document.getElementById('setting-moq');
     const settingCover = document.getElementById('setting-target-cover');
+    const settingAirTransit = document.getElementById('setting-air-transit');
+    const settingOceanTransit = document.getElementById('setting-ocean-transit');
     const settingSave = document.getElementById('setting-save');
     let restockLoaded = false;
     let skuChart = null;
@@ -2664,6 +2672,8 @@
         const s = await r.json();
         settingMoq.value = s.moq;
         settingCover.value = s.target_cover_days;
+        settingAirTransit.value = s.air_transit_days ?? 10;
+        settingOceanTransit.value = s.ocean_transit_days ?? 45;
       } catch (_) {}
     }
 
@@ -2677,6 +2687,8 @@
           body: JSON.stringify({
             moq: Number(settingMoq.value),
             target_cover_days: Number(settingCover.value),
+            air_transit_days: Number(settingAirTransit.value),
+            ocean_transit_days: Number(settingOceanTransit.value),
           }),
         });
         settingSave.textContent = 'Saved';

@@ -35,8 +35,11 @@ from datetime import datetime, timedelta, timezone
 
 # ── Transit time constants ───────────────────────────────────────────────
 # Time from the seller's origin to Amazon FC once a shipment physically
-# dispatches. Rough China → US defaults; per-org override via forecast
-# settings can come later.
+# dispatches. Rough China → US defaults; the compute_reorder settings
+# dict (populated from the org-wide DEFAULT_FORECAST_SETTINGS + any
+# saved override) supersedes these when it carries `air_transit_days` /
+# `ocean_transit_days`. Kept as constants for tests and callers that
+# pass an empty settings dict.
 AIR_TRANSIT_DAYS = 10
 OCEAN_TRANSIT_DAYS = 45
 
@@ -176,13 +179,15 @@ def compute_reorder(
     # Air transit gets the seller's real supply chain: manufacturing time
     # → shipping to prep center (only if they use one) → shipping to FBA
     # → FBA buffer. Falls back to our regional default when nothing set.
+    air_default = int(settings.get("air_transit_days") or AIR_TRANSIT_DAYS)
+    ocean_default = int(settings.get("ocean_transit_days") or OCEAN_TRANSIT_DAYS)
     fba_transit = ps.get("shipping_to_fba_days")
-    fba_transit = int(fba_transit) if fba_transit is not None else AIR_TRANSIT_DAYS
+    fba_transit = int(fba_transit) if fba_transit is not None else air_default
     mfg_time = int(ps.get("manufacturing_time_days") or 0)
     to_prep = int(ps.get("shipping_to_prep_days") or 0) if ps.get("use_prep_center") else 0
     buffer = int(ps.get("fba_buffer_days") or 0)
     air_lead_days = mfg_time + to_prep + fba_transit + buffer
-    ocean_lead_days = mfg_time + to_prep + OCEAN_TRANSIT_DAYS + buffer
+    ocean_lead_days = mfg_time + to_prep + ocean_default + buffer
 
     moq = int(settings.get("moq", 1))
     target_cover = int(

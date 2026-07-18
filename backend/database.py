@@ -773,6 +773,12 @@ DEFAULT_FORECAST_SETTINGS = {
     "moq": 1,
     "target_cover_days": 90,
     "service_level": 0.95,
+    # Transit time from the seller's origin to the Amazon FC once a
+    # shipment physically dispatches. Historic defaults matched a rough
+    # China → US benchmark; sellers can now override org-wide from the
+    # Restock settings panel.
+    "air_transit_days": 10,
+    "ocean_transit_days": 45,
 }
 
 
