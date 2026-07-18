@@ -3409,16 +3409,21 @@
           </div>
         `;
       } else if (tab === 'forecast') {
+        // Hardcoded default weights (SellerBoard-style — recent demand
+        // dominates). Kept in sync with backend DEFAULT_PRODUCT_SETTINGS
+        // so the modal renders these values even before the SKU is saved.
+        const DEFAULT_VELOCITY_WEIGHTS = { d3: 0.5, d7: 0.3, d30: 0.2, d60: 0, d180: 0 };
         const weights = s.velocity_weights || {};
         const rows = settingsState.windows.map(w => {
           const wKey = 'd' + w.period_days;
+          const value = weights[wKey] ?? DEFAULT_VELOCITY_WEIGHTS[wKey] ?? 0;
           return `
             <tr>
               <td>${w.period_days}</td>
               <td>${w.days_in_stock}</td>
               <td>${w.units_sold.toLocaleString()}</td>
               <td>${w.velocity.toFixed(2)}</td>
-              <td><input type="number" min="0" max="1" step="0.05" data-weight="${wKey}" value="${weights[wKey] ?? 0}"></td>
+              <td><input type="number" min="0" max="1" step="0.05" data-weight="${wKey}" value="${value}"></td>
             </tr>`;
         }).join('');
         settingsBody.innerHTML = `
