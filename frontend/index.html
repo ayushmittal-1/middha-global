@@ -3666,6 +3666,28 @@
           <div><span>Suggested next-shipment qty</span><span>${reorder.recommended_po_qty ?? 0}</span></div>
           <div><span>MOQ / target cover</span><span>${reorder.moq ?? 1} / ${reorder.target_cover_days ?? '?'}d</span></div>
           ${shipmentsHtml}
+          ${(() => {
+            const bt = data.backtest;
+            if (!bt || !bt.metrics) return '';
+            const m = bt.metrics;
+            const biasSign = m.bias > 0 ? 'over-predicting' : m.bias < 0 ? 'under-predicting' : 'unbiased';
+            const mapeStr = m.mape_pct == null ? '—' : `${m.mape_pct}%`;
+            return `
+              <div class="sku-backtest" style="margin-top:12px;padding:10px;border:1px solid #e5e7eb;border-radius:6px;background:#f9fafb;">
+                <div style="font-weight:600;font-size:13px;margin-bottom:6px;">Prediction accuracy (holdout ${escapeHtml(bt.holdout_start)} → ${escapeHtml(bt.holdout_end)})</div>
+                <div style="font-size:11px;color:#6b7280;margin-bottom:8px;">
+                  Trained on ${escapeHtml(bt.train_start || '?')} → ${escapeHtml(bt.train_end)} · method: <strong>${escapeHtml(bt.method || '?')}</strong> · ${m.days_evaluated} days evaluated
+                </div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;font-size:12px;">
+                  <div><span style="color:#6b7280;">Actual</span><br><strong>${m.actual_total}</strong> units</div>
+                  <div><span style="color:#6b7280;">Predicted</span><br><strong>${m.predicted_total}</strong> units</div>
+                  <div><span style="color:#6b7280;">MAE</span><br><strong>${m.mae}</strong> units/day</div>
+                  <div><span style="color:#6b7280;">MAPE</span><br><strong>${mapeStr}</strong></div>
+                  <div><span style="color:#6b7280;">Bias</span><br><strong>${m.bias > 0 ? '+' : ''}${m.bias}</strong><br><span style="font-size:10px;color:#6b7280;">(${biasSign})</span></div>
+                  <div><span style="color:#6b7280;">Coverage (p90)</span><br><strong>${m.coverage_pct}%</strong></div>
+                </div>
+              </div>`;
+          })()}
         `;
         // Build a continuous timeline: 90 days of historical actuals,
         // then the 90-day forecast. We densify the history (fill missing
@@ -3701,6 +3723,20 @@
         const p90Aligned = new Array(histLabels.length).fill(null)
           .concat(fc.map(r => r.p90));
 
+        // Backtest overlay: predicted p50 for the holdout window (last
+        // 30 days of history), aligned onto the same x-axis as the
+        // actuals. Renders as a dashed line so it's visually distinct
+        // from the forward forecast.
+        const btDays = (data.backtest && data.backtest.days) || [];
+        const btByDate = new Map();
+        for (const d of btDays) btByDate.set(d.date.slice(0, 10), d);
+        const btP50Aligned = histLabels
+          .map(lbl => {
+            const d = btByDate.get(lbl);
+            return d ? d.p50 : null;
+          })
+          .concat(new Array(fcLabels.length).fill(null));
+
         if (skuChart) skuChart.destroy();
         skuChart = new Chart(chartCanvas, {
           type: 'line',
@@ -3719,6 +3755,10 @@
               { label: 'p50 forecast', data: p50Aligned,
                 borderColor: '#4a6cf7', backgroundColor: 'rgba(74,108,247,0.05)',
                 pointRadius: 0, borderWidth: 2, tension: 0.2 },
+              { label: 'backtest predicted', data: btP50Aligned,
+                borderColor: '#f59e0b', backgroundColor: 'transparent',
+                pointRadius: 0, borderWidth: 1.5, tension: 0.2,
+                borderDash: [4, 4] },
             ],
           },
           options: {

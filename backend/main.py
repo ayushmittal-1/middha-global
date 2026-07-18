@@ -640,6 +640,95 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
         for s in shipments_by_sku.get(sku, [])
     ]
 
+    # ── Backtest / holdout validation ────────────────────────────────────
+    # Train on days [-60, -31], predict days [-30, -1], compare against
+    # actual. Gives the seller a concrete accuracy read on the model
+    # they're seeing — not a black-box "trust me" number.
+    backtest: dict | None = None
+    try:
+        bt_since = now_utc - _td(days=60)
+        bt_rows = await get_sales_daily(sku=sku, since=bt_since)
+        cutoff = (now_utc - _td(days=30)).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+        cutoff_naive = cutoff.replace(tzinfo=None)
+
+        def _row_day(r):
+            d = r.get("date")
+            if not isinstance(d, datetime):
+                return None
+            return d.replace(tzinfo=None) if d.tzinfo is not None else d
+
+        train_rows_bt: list[dict] = []
+        holdout_by_day: dict[str, int] = {}
+        for r in bt_rows:
+            d = _row_day(r)
+            if d is None:
+                continue
+            if d < cutoff_naive:
+                train_rows_bt.append(r)
+            else:
+                key = d.date().isoformat()
+                holdout_by_day[key] = holdout_by_day.get(key, 0) + int(
+                    r.get("units_ordered") or 0,
+                )
+
+        bt_result = _forecast_one(train_rows_bt, horizon=30, today=cutoff)
+        bt_days: list[dict] = []
+        for r in bt_result.get("forecast") or []:
+            d_key = r["date"][:10]
+            actual = int(holdout_by_day.get(d_key, 0))
+            p50 = float(r.get("p50", 0))
+            p90 = float(r.get("p90", 0))
+            bt_days.append({
+                "date": d_key,
+                "actual": actual,
+                "p50": round(p50, 2),
+                "p90": round(p90, 2),
+            })
+
+        metrics: dict | None = None
+        n = len(bt_days)
+        if n > 0:
+            errors = [d["p50"] - d["actual"] for d in bt_days]
+            abs_errors = [abs(e) for e in errors]
+            squared = [e * e for e in errors]
+            actual_total = sum(d["actual"] for d in bt_days)
+            pred_total = sum(d["p50"] for d in bt_days)
+            pct_errors = [
+                abs(d["p50"] - d["actual"]) / d["actual"]
+                for d in bt_days if d["actual"] > 0
+            ]
+            coverage_hits = sum(1 for d in bt_days if 0 <= d["actual"] <= d["p90"])
+            metrics = {
+                "mae": round(sum(abs_errors) / n, 2),
+                "rmse": round((sum(squared) / n) ** 0.5, 2),
+                "bias": round(sum(errors) / n, 2),
+                "mape_pct": round(
+                    (sum(pct_errors) / len(pct_errors)) * 100, 1,
+                ) if pct_errors else None,
+                "actual_total": actual_total,
+                "predicted_total": round(pred_total, 1),
+                "coverage_pct": round((coverage_hits / n) * 100, 1),
+                "days_evaluated": n,
+            }
+
+        train_start = train_rows_bt[0].get("date") if train_rows_bt else None
+        backtest = {
+            "train_start": (
+                train_start.date().isoformat()
+                if isinstance(train_start, datetime) else None
+            ),
+            "train_end": (cutoff - _td(days=1)).date().isoformat(),
+            "holdout_start": cutoff.date().isoformat(),
+            "holdout_end": (now_utc - _td(days=1)).date().isoformat(),
+            "method": bt_result.get("method"),
+            "days": bt_days,
+            "metrics": metrics,
+        }
+    except Exception:
+        backtest = None
+
     return {
         "sku": sku,
         "asin": c.get("asin"),
@@ -651,6 +740,7 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
         "forecast": live_forecast,
         "history": history,
         "inbound_shipments": shipments,
+        "backtest": backtest,
     }
 
 
