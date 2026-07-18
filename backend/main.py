@@ -441,12 +441,40 @@ async def forecasting_restock(user: dict = Depends(protect)):
         missed_units = round(stockout_days * velocity, 1)
         missed_profit_est = round(missed_units * landed_cost * 0.25, 2) if landed_cost > 0 else 0.0
 
+        # Override the forecast-cache reorder numbers with values derived
+        # from the weighted velocity so the whole restock row tells one
+        # consistent story: Orders/day, Days of cover, Stockout on, and
+        # both Ship-by dates all trust the same demand signal the seller
+        # sees in the modal. When weighted velocity is 0 (brand new SKU
+        # with no trailing sales), fall through to the Prophet-driven
+        # cached values so we don't clobber a legitimate horizon-based
+        # forecast with zeros.
+        wv = weighted_by_sku.get(sku, 0.0)
+        stock_forward = on_hand + reserved + sent_to_fba + inbound_working
+        days_of_cover_val = reorder.get("days_of_cover")
+        stockout_date_iso = reorder.get("stockout_date")
+        reorder_by_date_air_iso = reorder.get("reorder_by_date_air")
+        reorder_by_date_ocean_iso = reorder.get("reorder_by_date_ocean")
+        if wv > 0:
+            days_of_cover_val = round(stock_forward / wv, 1)
+            stockout_date_obj = today + timedelta(days=int(stock_forward / wv))
+            stockout_date_iso = stockout_date_obj.isoformat()
+            air_transit = int(reorder.get("air_transit_days") or 10)
+            ocean_transit = int(reorder.get("ocean_transit_days") or 45)
+            # Clamp ship-by dates to today when they'd be in the past —
+            # a past date is confusing UI; "ship NOW" is the message.
+            reorder_by_date_air_iso = max(
+                today, stockout_date_obj - timedelta(days=air_transit),
+            ).isoformat()
+            reorder_by_date_ocean_iso = max(
+                today, stockout_date_obj - timedelta(days=ocean_transit),
+            ).isoformat()
+
         # Days until next-order deadline (based on air ship-by date).
         days_until_next_order = None
-        rba = reorder.get("reorder_by_date_air")
-        if rba:
+        if reorder_by_date_air_iso:
             try:
-                d = datetime.fromisoformat(rba).date()
+                d = datetime.fromisoformat(reorder_by_date_air_iso).date()
                 days_until_next_order = (d - today).days
             except ValueError:
                 pass
@@ -476,12 +504,12 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "avg_daily_demand": reorder.get("avg_daily_demand", 0),
             "weighted_velocity": round(weighted_by_sku.get(sku, 0.0), 2),
             "next_30_day_forecast": round(next30, 1),
-            "days_of_cover": reorder.get("days_of_cover"),
-            "stockout_date": reorder.get("stockout_date"),
+            "days_of_cover": days_of_cover_val,
+            "stockout_date": stockout_date_iso,
             "reorder_by_date": reorder.get("reorder_by_date"),
-            "reorder_by_date_air": reorder.get("reorder_by_date_air"),
-            "reorder_by_date_ocean": reorder.get("reorder_by_date_ocean"),
-            "reorder_by_date_sea": reorder.get("reorder_by_date_sea"),  # legacy alias
+            "reorder_by_date_air": reorder_by_date_air_iso,
+            "reorder_by_date_ocean": reorder_by_date_ocean_iso,
+            "reorder_by_date_sea": reorder_by_date_ocean_iso,  # legacy alias
             "days_until_next_order": days_until_next_order,
             "air_transit_days": reorder.get("air_transit_days"),
             "ocean_transit_days": reorder.get("ocean_transit_days"),
