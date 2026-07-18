@@ -46,7 +46,9 @@ VELOCITY_WINDOWS = (3, 7, 30, 60, 180)
 
 
 def compute_velocity_windows(
-    rows: list[dict], today: datetime | None = None
+    rows: list[dict],
+    today: datetime | None = None,
+    windows: tuple[int, ...] | None = None,
 ) -> list[dict]:
     """Per-window sales velocity table (mirrors SellerBoard's Forecast tab).
 
@@ -74,7 +76,7 @@ def compute_velocity_windows(
         normalised.append((d, units, oos))
 
     out = []
-    for w in VELOCITY_WINDOWS:
+    for w in (windows or VELOCITY_WINDOWS):
         start = end - timedelta(days=w - 1)
         units_sold = 0
         days_in_stock = 0
