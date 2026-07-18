@@ -371,17 +371,23 @@ async def forecasting_restock(user: dict = Depends(protect)):
         forecast = c.get("forecast") or []
         next30 = sum(float(r.get("p50", 0)) for r in forecast[:30])
 
+        # Prefer the fresh Aurora snapshot for the 5 SP-API-sourced counts;
+        # fall back to the forecast cache when the SKU isn't in `inv_map`
+        # (e.g. delisted from Aurora but still in forecast_cache). `inbound`
+        # comes from the shipments collection and stays on `reorder`.
+        inv_row = inv_map.get(sku) or {}
+        on_hand = int(inv_row.get("fulfillable", reorder.get("on_hand", 0)) or 0)
+        reserved = int(inv_row.get("reserved", reorder.get("reserved", 0)) or 0)
+        sent_to_fba = int(inv_row.get("inbound_shipped", reorder.get("sent_to_fba", 0)) or 0)
+        inbound_working = int(inv_row.get("inbound_working", reorder.get("inbound_working", 0)) or 0)
+        unfulfillable = int(inv_row.get("unfulfillable", reorder.get("unfulfillable", 0)) or 0)
+
         # Stock value = (on_hand + reserved + inbound + sent_to_fba) × unit landed cost.
         cogs = cogs_by_sku.get(sku) or {}
         unit_cost = float(cogs.get("unit_cost") or 0)
         unit_ship = float(cogs.get("inbound_shipping_per_unit") or 0)
         landed_cost = unit_cost + unit_ship
-        stock_units = (
-            int(reorder.get("on_hand", 0))
-            + int(reorder.get("reserved", 0))
-            + int(reorder.get("sent_to_fba", 0))
-            + int(reorder.get("inbound_working", 0))
-        )
+        stock_units = on_hand + reserved + sent_to_fba + inbound_working
         stock_value = round(stock_units * landed_cost, 2) if landed_cost > 0 else 0.0
 
         # Missed profit estimate — count stockout-corrected days in the
@@ -409,7 +415,6 @@ async def forecasting_restock(user: dict = Depends(protect)):
                 pass
 
         ps = settings_by_sku.get(sku) or {}
-        inv_row = inv_map.get(sku) or {}
         is_buyable = bool(inv_row.get("is_buyable", True))
         # For non-buyable SKUs, zero the reorder recommendation regardless
         # of what the forecast says — no point telling the seller to ship
@@ -424,11 +429,11 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "status": inv_row.get("status"),
             "listing_status": inv_row.get("listing_status"),
             "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
-            "on_hand": reorder.get("on_hand", 0),
-            "reserved": reorder.get("reserved", 0),
-            "sent_to_fba": reorder.get("sent_to_fba", 0),
-            "inbound_working": reorder.get("inbound_working", 0),
-            "unfulfillable": reorder.get("unfulfillable", 0),
+            "on_hand": on_hand,
+            "reserved": reserved,
+            "sent_to_fba": sent_to_fba,
+            "inbound_working": inbound_working,
+            "unfulfillable": unfulfillable,
             "inbound": reorder.get("inbound", 0),
             "ordered": int(ordered_by_sku.get(sku) or 0),
             "avg_daily_demand": reorder.get("avg_daily_demand", 0),
