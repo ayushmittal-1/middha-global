@@ -328,7 +328,11 @@ async def forecast_sku_for_user(
     """Build a forecast for a single SKU. Used by the agent tool and the
     nightly refresh job."""
     today = datetime.now(timezone.utc)
-    since = today - timedelta(days=540)
+    # Train on the trailing 30 days — SellerBoard-style. With ≤ 41 days
+    # of densified history, `_forecast_one` falls through to
+    # `_naive_forecast` (trimmed-mean × day-of-week multiplier), which is
+    # more stable than Prophet on tiny samples.
+    since = today - timedelta(days=30)
     rows = await get_sales_daily_for_user(user_id, sku=sku, since=since)
     result = await asyncio.to_thread(_forecast_one, rows, horizon, today)
     result["sku"] = sku
@@ -345,7 +349,11 @@ async def refresh_forecasts_for_user(
     provided). Called by the nightly job after ingest. Also computes the
     reorder fields so the dashboard can render from a single read."""
     today = datetime.now(timezone.utc)
-    since = today - timedelta(days=540)
+    # Train on the trailing 30 days — SellerBoard-style. With ≤ 41 days
+    # of densified history, `_forecast_one` falls through to
+    # `_naive_forecast` (trimmed-mean × day-of-week multiplier), which is
+    # more stable than Prophet on tiny samples.
+    since = today - timedelta(days=30)
 
     if skus is None:
         # Pull the full history once, then group by SKU. Cheaper than 100s
