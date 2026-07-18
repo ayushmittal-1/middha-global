@@ -1606,6 +1606,7 @@
         <label id="restock-show-no-demand-label" title="Include SKUs with no recent demand and no PO suggestion">
           <input type="checkbox" id="restock-show-no-demand"> Show no-demand SKUs
         </label>
+        <!--
         <label title="Trailing window used to compute the Orders/day column (Aurora sales, out-of-stock days excluded)">
           Velocity window
           <select id="restock-velocity-window">
@@ -1615,6 +1616,8 @@
             <option value="90">90 days</option>
           </select>
         </label>
+        -->
+
         <button id="restock-settings-toggle" class="secondary">Settings</button>
         <button id="restock-refresh">Refresh forecasts</button>
       </div>
@@ -1647,8 +1650,8 @@
               <th class="num" title="Damaged or customer-returned units currently unsellable">Unfulfillable</th>
               <!-- <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th> -->
               <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next arrival</th>
-              <th class="num" title="Trailing sales velocity from Aurora orders — window chosen in the toolbar (out-of-stock days excluded from the denominator)"><span id="restock-velocity-header">Orders/day (30d)</span></th>
-              <th class="num" title="Total units sold in the selected window (Aurora orders, cancelled/pending excluded)"><span id="restock-units-header">Units (30d)</span></th>
+              <th class="num" title="Weighted sales velocity — 0.5×v3d + 0.3×v7d + 0.2×v30d (out-of-stock days excluded)">Orders/day</th>
+              <!-- <th class="num" title="Total units sold in the selected window (Aurora orders, cancelled/pending excluded)"><span id="restock-units-header">Units (30d)</span></th> -->
               <th class="num">30-day forecast</th>
               <th>Days of cover</th>
               <th title="Projected stockout date given on-hand + inbound shipments − daily demand">Stockout on</th>
@@ -2328,10 +2331,12 @@
     const restockStampEl = document.getElementById('restock-stamp');
     const restockCountEl = document.getElementById('restock-count');
     const restockShowNoDemandEl = document.getElementById('restock-show-no-demand');
-    const restockVelocityWindowEl = document.getElementById('restock-velocity-window');
-    const restockVelocityHeaderEl = document.getElementById('restock-velocity-header');
-    const restockUnitsHeaderEl = document.getElementById('restock-units-header');
-    let restockVelocityWindow = 30;
+    // Velocity window selector was replaced with a single weighted-velocity
+    // column (0.5/0.3/0.2/0/0). Elements below no longer exist.
+    // const restockVelocityWindowEl = document.getElementById('restock-velocity-window');
+    // const restockVelocityHeaderEl = document.getElementById('restock-velocity-header');
+    // const restockUnitsHeaderEl = document.getElementById('restock-units-header');
+    // let restockVelocityWindow = 30;
     const restockRefreshBtn = document.getElementById('restock-refresh');
     const restockSettingsToggle = document.getElementById('restock-settings-toggle');
     const restockSettingsPanel = document.getElementById('restock-settings');
@@ -2560,8 +2565,8 @@
           <td class="num">${fmtRestockNum(row.unfulfillable ?? 0)}</td>
           <!-- <td class="num" title="${inboundTip}">${fmtRestockNum(row.inbound ?? 0)}</td> -->
           <td title="${inboundTip}">${nextArrivalCell}</td>
-          <td class="num restock-velocity-cell" data-v3="${row.velocity_3d ?? 0}" data-v7="${row.velocity_7d ?? 0}" data-v30="${row.velocity_30d ?? 0}" data-v90="${row.velocity_90d ?? 0}">${fmtRestockNum(row[`velocity_${restockVelocityWindow}d`] ?? 0, 2)}</td>
-          <td class="num restock-units-cell" data-u3="${row.units_3d ?? 0}" data-u7="${row.units_7d ?? 0}" data-u30="${row.units_30d ?? 0}" data-u90="${row.units_90d ?? 0}">${fmtRestockNum(row[`units_${restockVelocityWindow}d`] ?? 0)}</td>
+          <td class="num">${fmtRestockNum(row.weighted_velocity ?? 0, 2)}</td>
+          <!-- <td class="num restock-units-cell">${fmtRestockNum(row.units_30d ?? 0)}</td> -->
           <td class="num">${fmtRestockNum(row.next_30_day_forecast ?? 0, 1)}</td>
           <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>
           <td class="date-cell">${fmtRestockDate(row.stockout_date)}</td>
@@ -2621,21 +2626,8 @@
 
     restockShowNoDemandEl.addEventListener('change', renderRestockRows);
 
-    restockVelocityWindowEl.addEventListener('change', () => {
-      restockVelocityWindow = parseInt(restockVelocityWindowEl.value, 10) || 30;
-      restockVelocityHeaderEl.textContent = `Orders/day (${restockVelocityWindow}d)`;
-      restockUnitsHeaderEl.textContent = `Units (${restockVelocityWindow}d)`;
-      // Swap the value in each existing cell without re-rendering the
-      // whole table — velocities + unit counts are attached via data-attrs.
-      document.querySelectorAll('.restock-velocity-cell').forEach(cell => {
-        const v = parseFloat(cell.dataset[`v${restockVelocityWindow}`] || 0);
-        cell.textContent = fmtRestockNum(v, 2);
-      });
-      document.querySelectorAll('.restock-units-cell').forEach(cell => {
-        const u = parseFloat(cell.dataset[`u${restockVelocityWindow}`] || 0);
-        cell.textContent = fmtRestockNum(u);
-      });
-    });
+    // Velocity window selector removed — Orders/day now shows the fixed
+    // weighted-velocity number computed on the backend.
 
     restockRefreshBtn.addEventListener('click', async () => {
       const orig = restockRefreshBtn.textContent;

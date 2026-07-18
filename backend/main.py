@@ -367,21 +367,22 @@ async def forecasting_restock(user: dict = Depends(protect)):
     # demand rather than the forecast_cache's frozen number. One 90-day
     # Mongo aggregation covers every SKU — the per-window slicing happens
     # in-memory in `compute_velocity_windows`.
-    from forecasting.model import compute_velocity_windows
-    since_90d = datetime.now(timezone.utc) - timedelta(days=90)
-    sales_rows = await get_sales_daily(sku=None, since=since_90d)
+    from forecasting.model import compute_velocity_windows, weighted_velocity
+    from database import DEFAULT_PRODUCT_SETTINGS
+    since_180d = datetime.now(timezone.utc) - timedelta(days=180)
+    sales_rows = await get_sales_daily(sku=None, since=since_180d)
     sales_by_sku: dict[str, list[dict]] = {}
     for r in sales_rows:
         sales_by_sku.setdefault(r.get("sku") or "", []).append(r)
     now_utc = datetime.now(timezone.utc)
-    velocities_by_sku: dict[str, dict[str, float]] = {}
+    default_weights = DEFAULT_PRODUCT_SETTINGS["velocity_weights"]
+    weighted_by_sku: dict[str, float] = {}
     for sku_key, sku_rows in sales_by_sku.items():
-        w = compute_velocity_windows(sku_rows, now_utc, windows=(3, 7, 30, 90))
-        entry: dict[str, float] = {}
-        for row in w:
-            entry[f"velocity_{row['period_days']}d"] = row["velocity"]
-            entry[f"units_{row['period_days']}d"] = row["units_sold"]
-        velocities_by_sku[sku_key] = entry
+        windows = compute_velocity_windows(
+            sku_rows, now_utc, windows=(3, 7, 30, 60, 180),
+        )
+        wv = weighted_velocity(windows, default_weights)
+        weighted_by_sku[sku_key] = float(wv) if wv is not None else 0.0
 
     today = datetime.now(timezone.utc).date()
 
@@ -458,14 +459,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "inbound": reorder.get("inbound", 0),
             "ordered": int(ordered_by_sku.get(sku) or 0),
             "avg_daily_demand": reorder.get("avg_daily_demand", 0),
-            "velocity_3d": velocities_by_sku.get(sku, {}).get("velocity_3d", 0.0),
-            "velocity_7d": velocities_by_sku.get(sku, {}).get("velocity_7d", 0.0),
-            "velocity_30d": velocities_by_sku.get(sku, {}).get("velocity_30d", 0.0),
-            "velocity_90d": velocities_by_sku.get(sku, {}).get("velocity_90d", 0.0),
-            "units_3d": velocities_by_sku.get(sku, {}).get("units_3d", 0),
-            "units_7d": velocities_by_sku.get(sku, {}).get("units_7d", 0),
-            "units_30d": velocities_by_sku.get(sku, {}).get("units_30d", 0),
-            "units_90d": velocities_by_sku.get(sku, {}).get("units_90d", 0),
+            "weighted_velocity": round(weighted_by_sku.get(sku, 0.0), 2),
             "next_30_day_forecast": round(next30, 1),
             "days_of_cover": reorder.get("days_of_cover"),
             "stockout_date": reorder.get("stockout_date"),
