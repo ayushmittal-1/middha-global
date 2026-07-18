@@ -377,9 +377,11 @@ async def forecasting_restock(user: dict = Depends(protect)):
     velocities_by_sku: dict[str, dict[str, float]] = {}
     for sku_key, sku_rows in sales_by_sku.items():
         w = compute_velocity_windows(sku_rows, now_utc, windows=(7, 30, 90))
-        velocities_by_sku[sku_key] = {
-            f"velocity_{row['period_days']}d": row["velocity"] for row in w
-        }
+        entry: dict[str, float] = {}
+        for row in w:
+            entry[f"velocity_{row['period_days']}d"] = row["velocity"]
+            entry[f"units_{row['period_days']}d"] = row["units_sold"]
+        velocities_by_sku[sku_key] = entry
 
     today = datetime.now(timezone.utc).date()
 
@@ -459,6 +461,9 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "velocity_7d": velocities_by_sku.get(sku, {}).get("velocity_7d", 0.0),
             "velocity_30d": velocities_by_sku.get(sku, {}).get("velocity_30d", 0.0),
             "velocity_90d": velocities_by_sku.get(sku, {}).get("velocity_90d", 0.0),
+            "units_7d": velocities_by_sku.get(sku, {}).get("units_7d", 0),
+            "units_30d": velocities_by_sku.get(sku, {}).get("units_30d", 0),
+            "units_90d": velocities_by_sku.get(sku, {}).get("units_90d", 0),
             "next_30_day_forecast": round(next30, 1),
             "days_of_cover": reorder.get("days_of_cover"),
             "stockout_date": reorder.get("stockout_date"),

@@ -839,7 +839,13 @@ async def get_product_settings_for_user(user_id: ObjectId, sku: str) -> dict:
         {"userId": user_id, "sku": (sku or "").strip()},
         {"_id": 0, "userId": 0},
     )
-    return _merge_settings(doc)
+    merged = _merge_settings(doc)
+    # Weights are platform-locked for now — always return the default so
+    # every SKU (including ones with old per-SKU overrides in Mongo)
+    # renders the same numbers in the Forecast tab and drives the same
+    # weighted velocity downstream.
+    merged["velocity_weights"] = dict(DEFAULT_PRODUCT_SETTINGS["velocity_weights"])
+    return merged
 
 
 async def get_product_settings(sku: str) -> dict:
@@ -858,7 +864,10 @@ async def all_product_settings_for_user(user_id: ObjectId) -> dict[str, dict]:
         sku = (r.get("sku") or "").strip()
         if not sku:
             continue
-        out[sku] = _merge_settings(r)
+        merged = _merge_settings(r)
+        # Same platform-locked weights override as the per-SKU getter.
+        merged["velocity_weights"] = dict(DEFAULT_PRODUCT_SETTINGS["velocity_weights"])
+        out[sku] = merged
     return out
 
 
