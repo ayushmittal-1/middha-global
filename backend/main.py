@@ -538,14 +538,80 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
     SKU — drives the detail chart. Stockout days are flagged so the FE can
     render them differently (the model trained without them)."""
     from datetime import datetime, timezone, timedelta as _td
+    from forecasting.model import (
+        _forecast_one, compute_velocity_windows, weighted_velocity,
+    )
+    from database import DEFAULT_PRODUCT_SETTINGS
+    from bson import ObjectId as _OID
 
     cached = await get_forecast_cache(skus=[sku])
     if not cached:
         return {"error": f"No forecast for {sku}. Run /forecasting/refresh first."}
     c = cached[0]
 
+    # Chart data — always 90 days of actuals for context.
     since = datetime.now(timezone.utc) - _td(days=90)
     raw_history = await get_sales_daily(sku=sku, since=since)
+
+    # Live model refresh: recompute the forecast on the current
+    # 30-day training window so the chart's p50/p90 reflects the model
+    # we're actually using. Also recompute the reorder-side numbers
+    # (days_of_cover, stockout_date, ship-by dates) off the same
+    # weighted velocity that drives the restock table's Orders/day,
+    # so this modal and the row underneath tell one consistent story.
+    now_utc = datetime.now(timezone.utc)
+    train_since = now_utc - _td(days=30)
+    train_rows = await get_sales_daily(sku=sku, since=train_since)
+    try:
+        fresh = _forecast_one(train_rows, horizon=90, today=now_utc)
+        live_forecast = fresh.get("forecast") or c.get("forecast")
+        live_method = fresh.get("method") or c.get("method")
+        live_drivers = fresh.get("drivers") or c.get("drivers")
+    except Exception:
+        live_forecast = c.get("forecast")
+        live_method = c.get("method")
+        live_drivers = c.get("drivers")
+
+    # Weighted velocity from the last 180 days of Aurora sales — same
+    # blend the restock endpoint uses.
+    wv_rows = await get_sales_daily(sku=sku, since=now_utc - _td(days=180))
+    windows = compute_velocity_windows(
+        wv_rows, now_utc, windows=(3, 7, 30, 60, 180),
+    )
+    wv_raw = weighted_velocity(
+        windows, DEFAULT_PRODUCT_SETTINGS["velocity_weights"],
+    )
+    wv = float(wv_raw) if wv_raw is not None else 0.0
+
+    # Override cached reorder numbers with the weighted-velocity view
+    # exactly like /forecasting/restock does.
+    reorder = dict(c.get("reorder") or {})
+    inv_map = await latest_inventory_for_user(_OID(str(user["_id"])))
+    inv_row = inv_map.get(sku) or {}
+    on_hand = int(inv_row.get("fulfillable", reorder.get("on_hand", 0)) or 0)
+    reserved = int(inv_row.get("reserved", reorder.get("reserved", 0)) or 0)
+    sent_to_fba = int(inv_row.get("inbound_shipped", reorder.get("sent_to_fba", 0)) or 0)
+    inbound_working = int(inv_row.get("inbound_working", reorder.get("inbound_working", 0)) or 0)
+    stock_forward = on_hand + reserved + sent_to_fba + inbound_working
+    today_date = now_utc.date()
+    if wv > 0 and stock_forward > 0:
+        reorder["days_of_cover"] = round(stock_forward / wv, 1)
+        stockout_dt = today_date + _td(days=int(stock_forward / wv))
+        reorder["stockout_date"] = stockout_dt.isoformat()
+        air_transit = int(reorder.get("air_transit_days") or 10)
+        ocean_transit = int(reorder.get("ocean_transit_days") or 45)
+        reorder["reorder_by_date_air"] = max(
+            today_date, stockout_dt - _td(days=air_transit),
+        ).isoformat()
+        reorder["reorder_by_date_ocean"] = max(
+            today_date, stockout_dt - _td(days=ocean_transit),
+        ).isoformat()
+    reorder["on_hand"] = on_hand
+    reorder["reserved"] = reserved
+    reorder["sent_to_fba"] = sent_to_fba
+    reorder["inbound_working"] = inbound_working
+    reorder["avg_daily_demand"] = round(wv, 2) if wv > 0 else reorder.get("avg_daily_demand", 0)
+
     # Densify the array on the frontend; here we just emit the (date,
     # units, stockout_corrected) tuples for whichever days we have rows.
     history = [
@@ -557,7 +623,6 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
         for r in raw_history
     ]
 
-    from bson import ObjectId as _OID
     shipments_by_sku = await active_inbound_shipments_for_user(
         _OID(str(user["_id"])),
     )
@@ -578,12 +643,12 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
     return {
         "sku": sku,
         "asin": c.get("asin"),
-        "method": c.get("method"),
+        "method": live_method,
         "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
         "horizon_days": c.get("horizon_days"),
-        "drivers": c.get("drivers"),
-        "reorder": c.get("reorder"),
-        "forecast": c.get("forecast"),
+        "drivers": live_drivers,
+        "reorder": reorder,
+        "forecast": live_forecast,
         "history": history,
         "inbound_shipments": shipments,
     }
