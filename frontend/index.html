@@ -1636,7 +1636,7 @@
               <th class="num" title="Units Amazon has received into the network but not yet checked into the destination FC (inboundShippedQuantity)">Sent to FBA</th>
               <th class="num" title="Units on an inbound shipment plan you've created but not yet shipped (inboundWorkingQuantity)">Inbound working</th>
               <th class="num" title="Damaged or customer-returned units currently unsellable">Unfulfillable</th>
-              <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th>
+              <!-- <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th> -->
               <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next arrival</th>
               <th class="num" title="Forecasted average orders per day (drives the stockout timeline and ship-by dates)">Orders/day</th>
               <th class="num">30-day forecast</th>
@@ -2544,7 +2544,7 @@
           <td class="num">${fmtRestockNum(row.sent_to_fba ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.inbound_working ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.unfulfillable ?? 0)}</td>
-          <td class="num" title="${inboundTip}">${fmtRestockNum(row.inbound ?? 0)}</td>
+          <!-- <td class="num" title="${inboundTip}">${fmtRestockNum(row.inbound ?? 0)}</td> -->
           <td title="${inboundTip}">${nextArrivalCell}</td>
           <td class="num">${fmtRestockNum(row.avg_daily_demand ?? 0, 2)}</td>
           <td class="num">${fmtRestockNum(row.next_30_day_forecast ?? 0, 1)}</td>

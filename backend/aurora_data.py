@@ -268,6 +268,89 @@ async def aggregate_sales_daily_from_orders(
     return list(by_key.values())
 
 
+async def aggregate_sales_daily_lean(
+    user_id: ObjectId,
+    start: datetime,
+    end: datetime,
+    sku: Optional[str] = None,
+) -> list[dict]:
+    """Server-side (sku, date) aggregation from Aurora `orders`.
+
+    Uses a Mongo aggregation pipeline so the AI backend only receives the
+    already-summed rows — the naive per-doc fetch in
+    `aggregate_sales_daily_from_orders` was OOM-ing Render's 512 MB tier
+    on multi-hundred-day windows.
+    """
+    cancelled = list(CANCELLED_ORDER_STATUSES) + ["canceled", "cancelled", "unfulfillable"]
+    pipeline: list[dict] = [
+        {
+            "$match": {
+                "sellerId": user_id,
+                "purchaseDate": {"$gte": start, "$lt": end},
+                "orderStatus": {"$nin": cancelled},
+            },
+        },
+        {"$unwind": "$orderItems"},
+    ]
+    if sku:
+        pipeline.append({"$match": {"orderItems.sellerSku": sku}})
+    pipeline += [
+        {
+            "$project": {
+                "_id": 0,
+                "sku": "$orderItems.sellerSku",
+                "asin": "$orderItems.asin",
+                "qty": {"$ifNull": ["$orderItems.quantityOrdered", 0]},
+                "subtotal": {"$ifNull": ["$orderItems.itemSubtotal.amount", 0]},
+                "item_price": {"$ifNull": ["$orderItems.itemPrice.amount", 0]},
+                "promo": {"$ifNull": ["$orderItems.promotionDiscount.amount", 0]},
+                "day": {
+                    "$dateTrunc": {"date": "$purchaseDate", "unit": "day", "timezone": "UTC"},
+                },
+            },
+        },
+        {"$match": {"sku": {"$ne": None, "$nin": ["", None]}, "qty": {"$gt": 0}}},
+        {
+            "$group": {
+                "_id": {"sku": "$sku", "date": "$day"},
+                "asin": {"$first": "$asin"},
+                "units_ordered": {"$sum": "$qty"},
+                "ordered_revenue": {
+                    "$sum": {
+                        "$max": [
+                            0,
+                            {"$subtract": [
+                                {"$cond": [{"$gt": ["$subtotal", 0]}, "$subtotal", "$item_price"]},
+                                "$promo",
+                            ]},
+                        ],
+                    },
+                },
+            },
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "sku": "$_id.sku",
+                "date": "$_id.date",
+                "asin": 1,
+                "units_ordered": 1,
+                "ordered_revenue": 1,
+                "sessions": {"$literal": 0},
+                "page_views": {"$literal": 0},
+                "buy_box_pct": {"$literal": 0.0},
+                "ad_spend": {"$literal": 0.0},
+                "ad_impressions": {"$literal": 0},
+                "ad_clicks": {"$literal": 0},
+                "stockout_corrected": {"$literal": False},
+            },
+        },
+        {"$sort": {"sku": 1, "date": 1}},
+    ]
+    cursor = _db().orders.aggregate(pipeline, allowDiskUse=True)
+    return await cursor.to_list(length=None)
+
+
 async def inventory_snapshot_rows_from_products(user_id: ObjectId) -> list[dict]:
     """Today's inventory snapshot rows from Aurora products."""
     today = datetime.combine(

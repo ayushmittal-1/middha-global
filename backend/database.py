@@ -484,18 +484,15 @@ async def get_sales_daily_for_user(
 
     Falls back to the `salesDaily` cache in SP-API mode.
     """
-    from aurora_data import aurora_db_enabled, aggregate_sales_daily_from_orders
+    from aurora_data import aurora_db_enabled, aggregate_sales_daily_lean
 
     if aurora_db_enabled():
         end = datetime.now(timezone.utc) + timedelta(days=1)
         start = since or (end - timedelta(days=540))
         if start.tzinfo is None:
             start = start.replace(tzinfo=timezone.utc)
-        rows = await aggregate_sales_daily_from_orders(user_id, start, end)
-        if sku:
-            rows = [r for r in rows if r.get("sku") == sku]
+        rows = await aggregate_sales_daily_lean(user_id, start, end, sku=sku)
         _flag_stockout_runs(rows)
-        rows.sort(key=lambda r: (r.get("sku") or "", r.get("date")))
         return rows
 
     query: dict = {"userId": user_id}
