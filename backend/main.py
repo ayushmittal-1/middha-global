@@ -700,13 +700,21 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
                 for d in bt_days if d["actual"] > 0
             ]
             coverage_hits = sum(1 for d in bt_days if 0 <= d["actual"] <= d["p90"])
-            # WAPE-based accuracy — industry standard for demand forecasts
-            # with zero-heavy series where MAPE explodes on low-denominator
-            # days. WAPE = Σ|error| / Σactual → accuracy = clamp(1 - WAPE).
+            # Volume accuracy — how close is the total predicted volume to
+            # the total actual? Forgives offsetting daily misses (some days
+            # over, some under) so the metric matches the seller's intuition
+            # for "did we order the right amount". WAPE-style daily-error
+            # accuracy stays available in `accuracy_daily_pct` for anyone
+            # who cares about day-level jitter (stockout-timing analyses).
+            volume_error = abs(pred_total - actual_total)
+            accuracy_pct = (
+                round(max(0.0, (1 - volume_error / actual_total) * 100), 1)
+                if actual_total > 0 else None
+            )
             wape = (
                 sum(abs_errors) / actual_total if actual_total > 0 else None
             )
-            accuracy_pct = (
+            accuracy_daily_pct = (
                 round(max(0.0, (1 - wape) * 100), 1) if wape is not None else None
             )
             metrics = {
@@ -717,6 +725,7 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
                     (sum(pct_errors) / len(pct_errors)) * 100, 1,
                 ) if pct_errors else None,
                 "accuracy_pct": accuracy_pct,
+                "accuracy_daily_pct": accuracy_daily_pct,
                 "actual_total": actual_total,
                 "predicted_total": round(pred_total, 1),
                 "coverage_pct": round((coverage_hits / n) * 100, 1),
