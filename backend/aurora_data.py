@@ -20,7 +20,11 @@ from auth import _db
 from amazon_sp import MARKETPLACE_NAMES, resolve_marketplace
 
 # Match auroraBackend dashboardMetrics — cancelled/unfulfillable orders are not sales.
-CANCELLED_ORDER_STATUSES = frozenset({"Canceled", "Cancelled", "Unfulfillable"})
+# `Pending` is also excluded: those orders aren't confirmed yet and Amazon can flip
+# them to Canceled before the buyer is charged, so counting them inflates velocity.
+CANCELLED_ORDER_STATUSES = frozenset({
+    "Canceled", "Cancelled", "Unfulfillable", "Pending", "InvoiceUnconfirmed",
+})
 
 # Re-export order helpers from aurora_orders for a single import surface.
 from aurora_orders import (  # noqa: F401
@@ -45,12 +49,15 @@ def _money_amount(block: Optional[dict]) -> float:
 
 
 def is_excluded_order_status(status: Optional[str]) -> bool:
-    """True for Canceled / Cancelled / Unfulfillable (Aurora dashboard parity)."""
+    """True for Canceled / Cancelled / Unfulfillable / Pending — anything
+    that isn't a confirmed, revenue-recognisable sale."""
     if not status:
         return False
     if status in CANCELLED_ORDER_STATUSES:
         return True
-    return status.strip().lower() in {"canceled", "cancelled", "unfulfillable"}
+    return status.strip().lower() in {
+        "canceled", "cancelled", "unfulfillable", "pending", "invoiceunconfirmed",
+    }
 
 
 def line_item_sales_amount(item: dict) -> float:
@@ -281,7 +288,9 @@ async def aggregate_sales_daily_lean(
     `aggregate_sales_daily_from_orders` was OOM-ing Render's 512 MB tier
     on multi-hundred-day windows.
     """
-    cancelled = list(CANCELLED_ORDER_STATUSES) + ["canceled", "cancelled", "unfulfillable"]
+    cancelled = list(CANCELLED_ORDER_STATUSES) + [
+        "canceled", "cancelled", "unfulfillable", "pending", "invoiceunconfirmed",
+    ]
     pipeline: list[dict] = [
         {
             "$match": {
