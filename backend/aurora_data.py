@@ -288,15 +288,16 @@ async def aggregate_sales_daily_lean(
     `aggregate_sales_daily_from_orders` was OOM-ing Render's 512 MB tier
     on multi-hundred-day windows.
     """
-    cancelled = list(CANCELLED_ORDER_STATUSES) + [
-        "canceled", "cancelled", "unfulfillable", "pending", "invoiceunconfirmed",
-    ]
+    # For velocity/forecasting we count every order that was placed —
+    # including Pending and Cancelled — because they still represent
+    # customer demand at the moment of purchase. Profitability paths
+    # (aggregate_sku_metrics_from_orders) keep the CANCELLED_ORDER_STATUSES
+    # filter because those don't recognise revenue.
     pipeline: list[dict] = [
         {
             "$match": {
                 "sellerId": user_id,
                 "purchaseDate": {"$gte": start, "$lt": end},
-                "orderStatus": {"$nin": cancelled},
             },
         },
         {"$unwind": "$orderItems"},
