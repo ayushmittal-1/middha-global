@@ -700,6 +700,15 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
                 for d in bt_days if d["actual"] > 0
             ]
             coverage_hits = sum(1 for d in bt_days if 0 <= d["actual"] <= d["p90"])
+            # WAPE-based accuracy — industry standard for demand forecasts
+            # with zero-heavy series where MAPE explodes on low-denominator
+            # days. WAPE = Σ|error| / Σactual → accuracy = clamp(1 - WAPE).
+            wape = (
+                sum(abs_errors) / actual_total if actual_total > 0 else None
+            )
+            accuracy_pct = (
+                round(max(0.0, (1 - wape) * 100), 1) if wape is not None else None
+            )
             metrics = {
                 "mae": round(sum(abs_errors) / n, 2),
                 "rmse": round((sum(squared) / n) ** 0.5, 2),
@@ -707,6 +716,7 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
                 "mape_pct": round(
                     (sum(pct_errors) / len(pct_errors)) * 100, 1,
                 ) if pct_errors else None,
+                "accuracy_pct": accuracy_pct,
                 "actual_total": actual_total,
                 "predicted_total": round(pred_total, 1),
                 "coverage_pct": round((coverage_hits / n) * 100, 1),

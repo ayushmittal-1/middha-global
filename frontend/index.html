@@ -3681,8 +3681,9 @@
                 <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;font-size:12px;">
                   <div><span style="color:#6b7280;">Actual</span><br><strong>${m.actual_total}</strong> units</div>
                   <div><span style="color:#6b7280;">Predicted</span><br><strong>${m.predicted_total}</strong> units</div>
+                  <div><span style="color:#6b7280;" title="Weighted accuracy: 1 − Σ|error|/Σactual. Stable when actuals include zero days, unlike MAPE.">Accuracy</span><br><strong>${m.accuracy_pct == null ? '—' : m.accuracy_pct + '%'}</strong></div>
                   <div><span style="color:#6b7280;">MAE</span><br><strong>${m.mae}</strong> units/day</div>
-                  <div><span style="color:#6b7280;">MAPE</span><br><strong>${mapeStr}</strong></div>
+                  <div><span style="color:#6b7280;" title="Mean absolute % error — inflates on zero-heavy series. Use Accuracy above for a fair read.">MAPE</span><br><strong>${mapeStr}</strong></div>
                   <div><span style="color:#6b7280;">Bias</span><br><strong>${m.bias > 0 ? '+' : ''}${m.bias}</strong><br><span style="font-size:10px;color:#6b7280;">(${biasSign})</span></div>
                   <div><span style="color:#6b7280;">Coverage (p90)</span><br><strong>${m.coverage_pct}%</strong></div>
                 </div>
