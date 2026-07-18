@@ -377,12 +377,23 @@ async def forecasting_restock(user: dict = Depends(protect)):
     now_utc = datetime.now(timezone.utc)
     default_weights = DEFAULT_PRODUCT_SETTINGS["velocity_weights"]
     weighted_by_sku: dict[str, float] = {}
+    stockout_days_by_sku: dict[str, int] = {}
+    cutoff_90d = now_utc - timedelta(days=90)
     for sku_key, sku_rows in sales_by_sku.items():
         windows = compute_velocity_windows(
             sku_rows, now_utc, windows=(3, 7, 30, 60, 180),
         )
         wv = weighted_velocity(windows, default_weights)
         weighted_by_sku[sku_key] = float(wv) if wv is not None else 0.0
+        # Live count of stockout-corrected days in the trailing 90d —
+        # get_sales_daily runs `_flag_stockout_runs` on read, so any row
+        # inside the window with the flag set is a missed-sales day.
+        stockout_days_by_sku[sku_key] = sum(
+            1 for r in sku_rows
+            if r.get("stockout_corrected")
+            and isinstance(r.get("date"), datetime)
+            and r["date"] >= cutoff_90d
+        )
 
     today = datetime.now(timezone.utc).date()
 
@@ -413,17 +424,14 @@ async def forecasting_restock(user: dict = Depends(protect)):
         stock_value = round(stock_units * landed_cost, 2) if landed_cost > 0 else 0.0
 
         # Missed profit estimate — count stockout-corrected days in the
-        # trailing 90-day history and value them at avg_daily_demand × margin.
-        # Margin here is a coarse proxy: (recent_avg_price − landed_cost).
-        # We don't have per-SKU price in this endpoint, so we skip pricing
-        # and just report the *unit* opportunity loss (velocity × oos_days)
-        # unless we can compute a real margin.
+        # trailing 90-day history (live from Aurora sales, not the frozen
+        # forecast_cache drivers) and value them at weighted velocity ×
+        # 25% margin. The 25% is a coarse proxy until per-SKU sale price
+        # is threaded through this endpoint.
         drivers = c.get("drivers") or {}
-        stockout_days = int(drivers.get("stockout_days_90d") or 0)
-        velocity = float(reorder.get("avg_daily_demand") or 0)
+        stockout_days = stockout_days_by_sku.get(sku, 0) or int(drivers.get("stockout_days_90d") or 0)
+        velocity = weighted_by_sku.get(sku, 0.0) or float(reorder.get("avg_daily_demand") or 0)
         missed_units = round(stockout_days * velocity, 1)
-        # Placeholder — until price feeds in here we can only price the
-        # loss at landed cost margin ≈ 25% (rough). Better than nothing.
         missed_profit_est = round(missed_units * landed_cost * 0.25, 2) if landed_cost > 0 else 0.0
 
         # Days until next-order deadline (based on air ship-by date).
