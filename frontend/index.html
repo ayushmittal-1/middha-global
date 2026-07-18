@@ -1628,9 +1628,6 @@
       </div>
 
       <div id="restock-settings">
-        <label>MOQ
-          <input id="setting-moq" type="number" min="1">
-        </label>
         <label>Target cover (days)
           <input id="setting-target-cover" type="number" min="7" max="365">
         </label>
@@ -2354,7 +2351,8 @@
     const restockSettingsToggle = document.getElementById('restock-settings-toggle');
     const restockSettingsPanel = document.getElementById('restock-settings');
     let restockCache = [];  // last fetch — re-rendered on toggle
-    const settingMoq = document.getElementById('setting-moq');
+    // MOQ input removed from the toolbar — keep the backend field alone,
+    // but the seller-facing control is gone.
     const settingCover = document.getElementById('setting-target-cover');
     const settingAirTransit = document.getElementById('setting-air-transit');
     const settingOceanTransit = document.getElementById('setting-ocean-transit');
@@ -2704,7 +2702,6 @@
         const r = await fetch('/forecasting/settings', { headers: authHeaders() });
         if (!r.ok) return;
         const s = await r.json();
-        settingMoq.value = s.moq;
         settingCover.value = s.target_cover_days;
         settingAirTransit.value = s.air_transit_days ?? 10;
         settingOceanTransit.value = s.ocean_transit_days ?? 45;
@@ -2719,7 +2716,6 @@
           method: 'PUT',
           headers: authHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({
-            moq: Number(settingMoq.value),
             target_cover_days: Number(settingCover.value),
             air_transit_days: Number(settingAirTransit.value),
             ocean_transit_days: Number(settingOceanTransit.value),
