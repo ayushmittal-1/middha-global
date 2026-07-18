@@ -1606,6 +1606,11 @@
         <label id="restock-show-no-demand-label" title="Include SKUs with no recent demand and no PO suggestion">
           <input type="checkbox" id="restock-show-no-demand"> Show no-demand SKUs
         </label>
+        <label id="restock-hide-non-buyable-label" title="Hide SKUs Amazon has flagged as not buyable (blocked / suppressed listings)">
+          <input type="checkbox" id="restock-hide-non-buyable"> Hide non-buyable
+        </label>
+        <input type="text" id="restock-search" placeholder="Filter by SKU or ASIN" style="min-width:180px;padding:4px 8px;font-size:12px;border:1px solid #cbd5e1;border-radius:4px;">
+
         <!--
         <label title="Trailing window used to compute the Orders/day column (Aurora sales, out-of-stock days excluded)">
           Velocity window
@@ -2337,6 +2342,8 @@
     const restockStampEl = document.getElementById('restock-stamp');
     const restockCountEl = document.getElementById('restock-count');
     const restockShowNoDemandEl = document.getElementById('restock-show-no-demand');
+    const restockHideNonBuyableEl = document.getElementById('restock-hide-non-buyable');
+    const restockSearchEl = document.getElementById('restock-search');
     // Velocity window selector was replaced with a single weighted-velocity
     // column (0.5/0.3/0.2/0/0). Elements below no longer exist.
     // const restockVelocityWindowEl = document.getElementById('restock-velocity-window');
@@ -2526,14 +2533,34 @@
     function renderRestockRows() {
       restockBodyEl.innerHTML = '';
       const showAll = restockShowNoDemandEl.checked;
-      const visible = showAll
+      const hideNonBuyable = restockHideNonBuyableEl.checked;
+      const q = (restockSearchEl.value || '').trim().toLowerCase();
+
+      let visible = showAll
         ? restockCache
         : restockCache.filter(r => !isNoDemand(r));
+      if (hideNonBuyable) {
+        visible = visible.filter(r => r.is_buyable !== false);
+      }
+      if (q) {
+        visible = visible.filter(r =>
+          (r.sku && r.sku.toLowerCase().includes(q)) ||
+          (r.asin && r.asin.toLowerCase().includes(q))
+        );
+      }
 
-      const hiddenCount = restockCache.length - visible.length;
-      const tail = hiddenCount > 0 && !showAll
-        ? ` (${hiddenCount} no-demand hidden)`
-        : '';
+      const totalHidden = restockCache.length - visible.length;
+      const tailParts = [];
+      if (!showAll) {
+        const noDemandHidden = restockCache.filter(r => isNoDemand(r)).length;
+        if (noDemandHidden > 0) tailParts.push(`${noDemandHidden} no-demand`);
+      }
+      if (hideNonBuyable) {
+        const nbHidden = restockCache.filter(r => r.is_buyable === false).length;
+        if (nbHidden > 0) tailParts.push(`${nbHidden} non-buyable`);
+      }
+      if (q) tailParts.push(`search "${q}"`);
+      const tail = tailParts.length > 0 ? ` (${tailParts.join(', ')} filtered)` : '';
       restockCountEl.textContent = `${visible.length} SKU${visible.length === 1 ? '' : 's'}${tail}`;
 
       for (const row of visible) {
@@ -2633,6 +2660,13 @@
     }
 
     restockShowNoDemandEl.addEventListener('change', renderRestockRows);
+    restockHideNonBuyableEl.addEventListener('change', renderRestockRows);
+    // Debounce search input so we don't rerender on every keystroke.
+    let restockSearchTimer = null;
+    restockSearchEl.addEventListener('input', () => {
+      if (restockSearchTimer) clearTimeout(restockSearchTimer);
+      restockSearchTimer = setTimeout(renderRestockRows, 150);
+    });
 
     // Velocity window selector removed — Orders/day now shows the fixed
     // weighted-velocity number computed on the backend.
