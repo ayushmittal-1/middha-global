@@ -378,7 +378,9 @@ async def forecasting_restock(user: dict = Depends(protect)):
     default_weights = DEFAULT_PRODUCT_SETTINGS["velocity_weights"]
     weighted_by_sku: dict[str, float] = {}
     stockout_days_by_sku: dict[str, int] = {}
-    cutoff_90d = now_utc - timedelta(days=90)
+    # Mongo returns naive UTC datetimes — strip the tz on the cutoff so
+    # `date >= cutoff_90d` doesn't blow up on the naive/aware mismatch.
+    cutoff_90d_naive = (now_utc - timedelta(days=90)).replace(tzinfo=None)
     for sku_key, sku_rows in sales_by_sku.items():
         windows = compute_velocity_windows(
             sku_rows, now_utc, windows=(3, 7, 30, 60, 180),
@@ -388,12 +390,17 @@ async def forecasting_restock(user: dict = Depends(protect)):
         # Live count of stockout-corrected days in the trailing 90d —
         # get_sales_daily runs `_flag_stockout_runs` on read, so any row
         # inside the window with the flag set is a missed-sales day.
-        stockout_days_by_sku[sku_key] = sum(
-            1 for r in sku_rows
-            if r.get("stockout_corrected")
-            and isinstance(r.get("date"), datetime)
-            and r["date"] >= cutoff_90d
-        )
+        count = 0
+        for r in sku_rows:
+            if not r.get("stockout_corrected"):
+                continue
+            d = r.get("date")
+            if not isinstance(d, datetime):
+                continue
+            d_naive = d.replace(tzinfo=None) if d.tzinfo is not None else d
+            if d_naive >= cutoff_90d_naive:
+                count += 1
+        stockout_days_by_sku[sku_key] = count
 
     today = datetime.now(timezone.utc).date()
 
