@@ -14,6 +14,7 @@ import io
 import json
 import os
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlencode, urlparse
 
@@ -472,6 +473,84 @@ async def get_order_items(order_id: str) -> dict:
 # ── Product Fees API (v0) ────────────────────────────────────────────────────
 
 
+def _fee_line_amount(entry: dict) -> float:
+    for key in ("FinalFee", "FeeAmount", "feeAmount"):
+        block = entry.get(key)
+        if block is not None:
+            try:
+                return float(block.get("Amount") or block.get("amount") or 0)
+            except (TypeError, ValueError, AttributeError):
+                pass
+    try:
+        return float(entry.get("amount") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def split_bundled_fulfillment_total(total: float) -> tuple[float, float]:
+    """Split a bundled FBA fulfillment total into base + fuel (Revenue Calculator)."""
+    if total <= 0:
+        return 0.0, 0.0
+    base = round(total / 1.035, 4)
+    fuel = round(total - base, 4)
+    return base, fuel
+
+
+def parse_fee_detail_lines(detail_list: list) -> dict:
+    """Parse Product Fees API / Aurora `fees.breakdown` into referral, base FBA, fuel."""
+    referral = 0.0
+    fba = 0.0
+    fuel = 0.0
+    variable_closing = 0.0
+    has_explicit_fuel = False
+    has_base_fba = False
+    bundled_fba = 0.0
+    breakdown: list[dict] = []
+
+    for entry in detail_list or []:
+        ftype_raw = entry.get("FeeType") or entry.get("feeType") or ""
+        ftype = str(ftype_raw).lower()
+        amount = _fee_line_amount(entry)
+        breakdown.append({"type": ftype_raw, "amount": amount})
+
+        if ftype in ("fbafees", "fulfillmentfees"):
+            bundled_fba += amount
+            continue
+        if ftype in ("commission",) or "referral" in ftype:
+            referral += amount
+        elif "fuel" in ftype or "inflation" in ftype:
+            fuel += amount
+            has_explicit_fuel = True
+        elif "fbaperunitfulfillmentfee" in ftype or "fbaperorderfulfillmentfee" in ftype:
+            fba += amount
+            has_base_fba = True
+        elif ("fba" in ftype or "fulfillment" in ftype) and "fuel" not in ftype:
+            fba += amount
+            has_base_fba = True
+        elif "variableclosingfee" in ftype:
+            variable_closing += amount
+
+    if bundled_fba > 0 and not has_base_fba:
+        base, bundled_fuel = split_bundled_fulfillment_total(bundled_fba)
+        fba += base
+        if not has_explicit_fuel:
+            fuel += bundled_fuel
+            has_explicit_fuel = bundled_fuel > 0
+        has_base_fba = True
+    elif fba > 0 and fuel == 0 and has_base_fba and not has_explicit_fuel:
+        fuel = round(fba * 0.035, 4)
+
+    total = referral + fba + fuel + variable_closing
+    return {
+        "referral": referral,
+        "fba": fba,
+        "fuel_surcharge": fuel,
+        "variable_closing": variable_closing,
+        "total": round(total, 4),
+        "breakdown": breakdown,
+    }
+
+
 def _parse_fees_result(result: dict) -> dict:
     """Normalize one FeesEstimateResult into the shape callers expect
     (referral / fba / fuel_surcharge / total etc.). Same logic whether
@@ -479,33 +558,13 @@ def _parse_fees_result(result: dict) -> dict:
     estimate = (result.get("FeesEstimate") or {})
     detail_list = (estimate.get("FeeDetailList") or [])
     total = (estimate.get("TotalFeesEstimate") or {}).get("Amount") or 0
+    parsed = parse_fee_detail_lines(detail_list)
     out = {
-        "referral": 0.0,
-        "fba": 0.0,
-        "fuel_surcharge": 0.0,
-        "variable_closing": 0.0,
-        "total": float(total),
-        "breakdown": [],
+        **parsed,
+        "total": float(total) if total else parsed["total"],
         "status": (result.get("Status") or "").lower(),
         "error": result.get("Error"),
     }
-    for d in detail_list:
-        ftype = (d.get("FeeType") or "").lower()
-        amount = float(((d.get("FinalFee") or d.get("FeeAmount") or {}).get("Amount")) or 0)
-        out["breakdown"].append({"type": d.get("FeeType"), "amount": amount})
-        if "referralfee" in ftype:
-            out["referral"] += amount
-        elif "fbafees" in ftype or "fulfillmentfees" in ftype:
-            out["fba"] += amount
-        elif "fuelsurcharge" in ftype:
-            out["fuel_surcharge"] += amount
-        elif "variableclosingfee" in ftype:
-            out["variable_closing"] += amount
-    # If Amazon didn't break out a fuel surcharge separately (some categories
-    # bundle it into FBA), derive it per the PDF formula so the breakdown is
-    # always populated.
-    if out["fba"] > 0 and out["fuel_surcharge"] == 0:
-        out["fuel_surcharge"] = round(out["fba"] * 0.035, 4)
     return out
 
 
@@ -749,8 +808,13 @@ async def fetch_storage_fees_per_sku(months_back: int = 2) -> tuple[dict, list[s
     text = await download_report_raw(report_id, max_polls=24, poll_interval=10)
 
     reader = csv.DictReader(io.StringIO(text), delimiter="\t")
-    # (asin, month) -> summed fee
-    by_asin_month: dict[tuple[str, str], float] = {}
+    qty_keys = (
+        "average_quantity_on_hand",
+        "average-quantity-on-hand",
+        "Average quantity on hand",
+    )
+    # (asin, month) -> {fee, qty}
+    by_asin_month: dict[tuple[str, str], dict] = {}
     months: set[str] = set()
     for row in reader:
         asin = (row.get("asin") or "").strip()
@@ -760,19 +824,44 @@ async def fetch_storage_fees_per_sku(months_back: int = 2) -> tuple[dict, list[s
             fee = float(row.get("estimated_monthly_storage_fee") or 0)
         except (TypeError, ValueError):
             fee = 0.0
+        qty = 0.0
+        for key in qty_keys:
+            raw = row.get(key)
+            if raw not in (None, ""):
+                try:
+                    qty = float(raw)
+                except (TypeError, ValueError):
+                    qty = 0.0
+                break
         month = (row.get("month_of_charge") or "").strip()
         if not month:
             continue
         months.add(month)
         key = (asin, month)
-        by_asin_month[key] = by_asin_month.get(key, 0.0) + fee
+        bucket = by_asin_month.setdefault(key, {"fee": 0.0, "qty": 0.0})
+        bucket["fee"] += fee
+        bucket["qty"] += qty
 
-    # Now average across months per ASIN
-    by_asin: dict[str, list[float]] = {}
-    for (asin, _month), fee in by_asin_month.items():
-        by_asin.setdefault(asin, []).append(fee)
-    per_asin_avg = {asin: round(sum(v) / len(v), 4) for asin, v in by_asin.items() if v}
-    return per_asin_avg, sorted(months)
+    # Average monthly fee + quantity per ASIN, then per-unit storage like Revenue Calculator.
+    by_asin_monthly: dict[str, list[dict]] = defaultdict(list)
+    for (asin, _month), bucket in by_asin_month.items():
+        by_asin_monthly[asin].append(bucket)
+
+    per_asin: dict[str, dict] = {}
+    for asin, rows in by_asin_monthly.items():
+        monthly_fees = [r["fee"] for r in rows if r["fee"] > 0]
+        monthly_qtys = [r["qty"] for r in rows if r["qty"] > 0]
+        avg_monthly_fee = sum(monthly_fees) / len(monthly_fees) if monthly_fees else 0.0
+        avg_qty = sum(monthly_qtys) / len(monthly_qtys) if monthly_qtys else 0.0
+        if avg_monthly_fee <= 0:
+            continue
+        divisor = max(avg_qty, 1.0)
+        per_asin[asin] = {
+            "monthly_fee": round(avg_monthly_fee, 4),
+            "avg_quantity_on_hand": round(avg_qty, 2),
+            "storage_per_unit": round(avg_monthly_fee / divisor, 4),
+        }
+    return per_asin, sorted(months)
 
 
 # ── Finances API (v0) ────────────────────────────────────────────────────────
@@ -1055,10 +1144,20 @@ async def fetch_inbound_placement_fees_per_sku(
         if units <= 0 and fee == 0:
             continue
         bucket = per_sku.setdefault(
-            sku, {"fee_total": 0.0, "units_received": 0}
+            sku,
+            {
+                "fee_total": 0.0,
+                "units_received": 0,
+                # Only units that incurred a placement charge — used for the
+                # Revenue Calculator-style per-unit rate. Including $0-fee
+                # Amazon-optimized inbound units diluted the rate ~4×+.
+                "fee_bearing_units": 0,
+            },
         )
         bucket["fee_total"] += fee
         bucket["units_received"] += units
+        if fee > 0 and units > 0:
+            bucket["fee_bearing_units"] += units
         dt = (_get(date_keys) or "").strip()
         if dt:
             months.add(dt[:7])  # YYYY-MM prefix
@@ -1067,6 +1166,7 @@ async def fetch_inbound_placement_fees_per_sku(
         sku: {
             "fee_total": round(v["fee_total"], 2),
             "units_received": v["units_received"],
+            "fee_bearing_units": v["fee_bearing_units"],
         }
         for sku, v in per_sku.items()
     }

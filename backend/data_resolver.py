@@ -231,14 +231,19 @@ def skus_needing_fees_api(
     sku_data: dict[str, dict],
     product_fee_fallback: dict[str, dict],
 ) -> list[str]:
-    """SKUs with sales but no referral/FBA from order lines or products.fees."""
+    """SKUs that still need a live Product Fees API estimate.
+
+    Prefer Aurora `products.fees` (same source as the Products page). Do **not**
+    skip the Fees API just because order line items have referral/FBA — those
+    line fees are often incomplete/stale and were the root cause of Profitability
+    disagreeing with Aurora Products / Revenue Calculator.
+    """
     need: list[str] = []
     for sku, d in sku_data.items():
         if int(d.get("units") or 0) <= 0:
             continue
-        if float(d.get("referral_total") or 0) > 0 or float(d.get("fba_total") or 0) > 0:
-            continue
-        if sku in product_fee_fallback:
+        pf = product_fee_fallback.get(sku) or {}
+        if float(pf.get("referral_per_unit") or 0) > 0 or float(pf.get("fba_per_unit") or 0) > 0:
             continue
         if d.get("asin") and float(d.get("revenue") or 0) > 0:
             need.append(sku)
