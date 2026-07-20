@@ -973,10 +973,11 @@ async def compute_profitability_data(
     placement_cache_meta = await get_placement_fee_cache(max_age_hours=24)
     try:
         placement_per_sku: dict = {}
+        placement_avg_per_unit = None
+        need_placement_fetch = False
         if placement_cache_meta and placement_cache_meta.get("access_denied"):
             placement_meta["source"] = "finances_fallback"
             placement_meta["access_denied"] = True
-            placement_avg_per_unit = None
             warnings.append(
                 "Inbound placement report unavailable — Amazon denied access (403). "
                 "Reconnect Amazon in Aurora Integration after enabling Reports access "
@@ -984,19 +985,30 @@ async def compute_profitability_data(
             )
         elif placement_cache_meta:
             placement_per_sku = placement_cache_meta.get("per_sku") or {}
-            placement_meta["source"] = "report_cache"
-            placement_meta["sku_count"] = len(placement_per_sku)
-            if placement_per_sku:
+            # Old cache lacked fee_bearing_units and diluted per-unit rates — refresh.
+            if placement_per_sku and not any(
+                isinstance(b, dict) and "fee_bearing_units" in b
+                for b in placement_per_sku.values()
+            ):
+                need_placement_fetch = True
+            elif placement_per_sku:
+                placement_meta["source"] = "report_cache"
+                placement_meta["sku_count"] = len(placement_per_sku)
                 placement_avg_per_unit = {}
-                for sku, b in placement_per_sku.items():
-                    u = int(b.get("units_received") or 0)
+                for psku, b in placement_per_sku.items():
                     fee = float(b.get("fee_total") or 0)
-                    if u > 0 and fee > 0:
-                        placement_avg_per_unit[sku] = fee / u
+                    bearing = int(b.get("fee_bearing_units") or 0)
+                    received = int(b.get("units_received") or 0)
+                    denom = bearing if bearing > 0 else received
+                    if denom > 0 and fee > 0:
+                        placement_avg_per_unit[psku] = fee / denom
                 placement_meta["resolved_skus"] = len(placement_avg_per_unit)
             else:
-                placement_avg_per_unit = None
+                need_placement_fetch = True
         else:
+            need_placement_fetch = True
+
+        if need_placement_fetch:
             placement_per_sku, months = (
                 await amazon_sp.fetch_inbound_placement_fees_per_sku(months_back=12)
             )
@@ -1005,11 +1017,13 @@ async def compute_profitability_data(
             placement_meta["sku_count"] = len(placement_per_sku)
             if placement_per_sku:
                 placement_avg_per_unit = {}
-                for sku, b in placement_per_sku.items():
-                    u = int(b.get("units_received") or 0)
+                for psku, b in placement_per_sku.items():
                     fee = float(b.get("fee_total") or 0)
-                    if u > 0 and fee > 0:
-                        placement_avg_per_unit[sku] = fee / u
+                    bearing = int(b.get("fee_bearing_units") or 0)
+                    received = int(b.get("units_received") or 0)
+                    denom = bearing if bearing > 0 else received
+                    if denom > 0 and fee > 0:
+                        placement_avg_per_unit[psku] = fee / denom
                 placement_meta["resolved_skus"] = len(placement_avg_per_unit)
             else:
                 placement_avg_per_unit = None
@@ -1038,6 +1052,8 @@ async def compute_profitability_data(
             await put_aged_inventory_cache({})
         aged_monthly_per_sku = None
 
+    # products.fees is primary (same as Aurora Products). Fees API only for SKUs
+    # missing that sync — do not prefer stale order-line fees.
     if use_db:
         product_fee_fallback = await aurora_data.product_fee_estimates_by_sku(
             require_user(), skus,
@@ -1046,14 +1062,15 @@ async def compute_profitability_data(
         batch_items = [
             (sku_data[sku]["asin"], sku_data[sku]["revenue"] / sku_data[sku]["units"])
             for sku in fee_skus
-            if sku_data[sku]["asin"] and sku_data[sku]["units"]
+            if sku_data[sku].get("asin") and sku_data[sku]["units"]
             and sku_data[sku]["revenue"] > 0
         ]
     else:
+        product_fee_fallback = {}
         batch_items = [
             (sku_data[sku]["asin"], sku_data[sku]["revenue"] / sku_data[sku]["units"])
             for sku in skus
-            if sku_data[sku]["asin"] and sku_data[sku]["units"]
+            if sku_data[sku].get("asin") and sku_data[sku]["units"]
             and sku_data[sku]["revenue"] > 0
         ]
 
@@ -1102,36 +1119,62 @@ async def compute_profitability_data(
         avg_price = revenue / units if units else 0.0
         asin = d["asin"]
 
-        # Referral / base FBA / fuel: order line items → products.fees → Fees API.
-        referral_total = round(float(d.get("referral_total") or 0), 2)
-        fba_total = round(float(d.get("fba_total") or 0), 2)
+        # Referral / base FBA / fuel — match Aurora Products + Revenue Calculator.
+        # Priority:
+        #   1) products.fees (same Fees API sync the Products page shows — user source of truth)
+        #   2) live Product Fees API at this window's avg selling price
+        #   3) order line totals (often incomplete — last resort only)
+        referral_total = 0.0
+        fba_total = 0.0
         fuel_total = 0.0
-        fees_from_db_lines = referral_total > 0 or fba_total > 0
 
-        if fees_from_db_lines and fba_total > 0 and fuel_total == 0:
-            fba_total, fuel_total = split_bundled_fulfillment_total(fba_total)
+        est = fees_by_asin.get(asin) if asin else None
+        est_ok = bool(
+            est
+            and not est.get("error")
+            and (
+                float(est.get("referral") or 0) > 0
+                or float(est.get("fba") or 0) > 0
+                or float(est.get("fuel_surcharge") or 0) > 0
+            )
+        )
+        pf = product_fee_fallback.get(sku) if sku in product_fee_fallback else None
+        pf_ok = bool(
+            pf
+            and (
+                float(pf.get("referral_per_unit") or 0) > 0
+                or float(pf.get("fba_per_unit") or 0) > 0
+                or float(pf.get("fuel_per_unit") or 0) > 0
+            )
+        )
 
-        if referral_total == 0 and fba_total == 0 and sku in product_fee_fallback:
-            pf = product_fee_fallback[sku]
-            referral_total = round(pf.get("referral_per_unit", 0) * units, 2)
-            fba_total = round(pf.get("fba_per_unit", 0) * units, 2)
-            fuel_total = round(pf.get("fuel_per_unit", 0) * units, 2)
+        if pf_ok:
+            listing_price = float(pf.get("listing_price") or 0)
+            ref_unit = float(pf.get("referral_per_unit") or 0)
+            if listing_price > 0 and ref_unit > 0 and revenue > 0:
+                referral_total = round(revenue * (ref_unit / listing_price), 2)
+            else:
+                referral_total = round(ref_unit * units, 2)
+            fba_total = round(float(pf.get("fba_per_unit") or 0) * units, 2)
+            fuel_total = round(float(pf.get("fuel_per_unit") or 0) * units, 2)
             if not asin and pf.get("asin"):
                 asin = pf["asin"]
-        if referral_total == 0 and fba_total == 0 and asin and avg_price > 0:
-            est = fees_by_asin.get(asin)
-            if est:
-                referral_total = round(float(est.get("referral", 0.0)) * units, 2)
-                fba_total = round(float(est.get("fba", 0.0)) * units, 2)
-                fuel_total = round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
-                if est.get("error"):
-                    fee_errors.append(f"{sku} ({asin}): {str(est['error'])[:120]}")
-            elif use_db:
-                fee_errors.append(f"{sku} ({asin}): no fee data in DB or Fees API")
-            else:
-                fee_errors.append(f"{sku} ({asin}): no estimate returned")
-        elif not asin and avg_price > 0:
-            fee_errors.append(f"{sku}: no ASIN found in order items")
+        elif est_ok:
+            referral_total = round(float(est.get("referral", 0.0)) * units, 2)
+            fba_total = round(float(est.get("fba", 0.0)) * units, 2)
+            fuel_total = round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
+        else:
+            line_ref = round(float(d.get("referral_total") or 0), 2)
+            line_fba = round(float(d.get("fba_total") or 0), 2)
+            if line_ref > 0 or line_fba > 0:
+                referral_total = line_ref
+                fba_total, fuel_total = split_bundled_fulfillment_total(line_fba)
+            elif asin and avg_price > 0:
+                fee_errors.append(f"{sku} ({asin}): no fee data in products.fees or Fees API")
+            elif avg_price > 0:
+                fee_errors.append(f"{sku}: no ASIN found in order items")
+            if est and est.get("error"):
+                fee_errors.append(f"{sku} ({asin}): {str(est['error'])[:120]}")
 
         amazon_fees = round(referral_total + fba_total + fuel_total, 2)
 
@@ -1164,7 +1207,15 @@ async def compute_profitability_data(
         # to the sales-window numbers so we never regress to $0.
         report_placement = 0.0
         if placement_avg_per_unit is not None:
-            report_placement = placement_avg_per_unit.get(sku, 0.0) * units
+            rate = placement_avg_per_unit.get(sku)
+            if rate is None:
+                # Case-insensitive SKU match (Amazon report SKUs often differ in casing)
+                rate = next(
+                    (v for k, v in placement_avg_per_unit.items()
+                     if k.lower() == sku.lower()),
+                    0.0,
+                )
+            report_placement = float(rate or 0) * units
         finance_placement = (
             fin_sku.get("inbound_placement", 0.0)
             + unattr_per_unit["inbound_placement"] * units

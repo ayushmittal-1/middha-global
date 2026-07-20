@@ -1144,10 +1144,20 @@ async def fetch_inbound_placement_fees_per_sku(
         if units <= 0 and fee == 0:
             continue
         bucket = per_sku.setdefault(
-            sku, {"fee_total": 0.0, "units_received": 0}
+            sku,
+            {
+                "fee_total": 0.0,
+                "units_received": 0,
+                # Only units that incurred a placement charge — used for the
+                # Revenue Calculator-style per-unit rate. Including $0-fee
+                # Amazon-optimized inbound units diluted the rate ~4×+.
+                "fee_bearing_units": 0,
+            },
         )
         bucket["fee_total"] += fee
         bucket["units_received"] += units
+        if fee > 0 and units > 0:
+            bucket["fee_bearing_units"] += units
         dt = (_get(date_keys) or "").strip()
         if dt:
             months.add(dt[:7])  # YYYY-MM prefix
@@ -1156,6 +1166,7 @@ async def fetch_inbound_placement_fees_per_sku(
         sku: {
             "fee_total": round(v["fee_total"], 2),
             "units_received": v["units_received"],
+            "fee_bearing_units": v["fee_bearing_units"],
         }
         for sku, v in per_sku.items()
     }

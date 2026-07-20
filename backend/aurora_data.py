@@ -120,7 +120,12 @@ def aggregate_sku_metrics_from_orders(
 
 
 async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str, dict]:
-    """Fallback unit fees from Aurora `products.fees` when order lines lack them."""
+    """Per-unit fees from Aurora `products.fees` (same source as Products page).
+
+    Used as the primary fee basis for Profitability — not a last-resort fallback.
+    Referral is stored as a per-unit amount at the listing price; callers should
+    scale it by revenue when the sale price differs.
+    """
     if not skus:
         return {}
     seller_id = ObjectId(str(user["_id"]))
@@ -141,6 +146,12 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
             referral = parsed["referral"]
             fba = parsed["fba"]
             fuel = parsed["fuel_surcharge"]
+            # If breakdown only had a bundled FBAFees parent, parser already split.
+            # If fbaFee field is the full fulfillment total and breakdown missed fuel,
+            # prefer splitting the stored fbaFee when it is clearly larger.
+            stored_fba = _money_amount(fees.get("fbaFee"))
+            if stored_fba > 0 and fuel <= 0 and abs(stored_fba - (fba + fuel)) > 0.02:
+                fba, fuel = split_bundled_fulfillment_total(stored_fba)
         else:
             fba_total = _money_amount(fees.get("fbaFee"))
             referral = _money_amount(fees.get("referralFee"))
@@ -150,10 +161,13 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
             elif referral <= 0 and price > 0:
                 referral = price * 0.15
             fba, fuel = split_bundled_fulfillment_total(fba_total)
+        if referral <= 0 and fba <= 0 and fuel <= 0:
+            continue
         out[sku] = {
-            "referral_per_unit": referral if price or referral else 0.0,
+            "referral_per_unit": referral,
             "fba_per_unit": fba,
             "fuel_per_unit": fuel,
+            "listing_price": price,
             "asin": doc.get("asin"),
         }
     return out
