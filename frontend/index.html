@@ -2969,9 +2969,9 @@
               ? `<strong>${escapeHtml(r.sku)}</strong>`
               : `<strong>${escapeHtml(r.sku)}</strong> <span title="No COGS uploaded" style="color:#b35200;">⚠</span>`;
             return `
-              <tr title="ASIN ${escapeHtml(r.asin || '—')}">
+              <tr>
                 <td>${skuLabel}</td>
-                <td title="${escapeHtml(r.asin || '')}">${escapeHtml(r.asin || '—')}</td>
+                <td title="ASIN ${escapeHtml(r.asin || '—')}">${escapeHtml(r.asin || '—')}</td>
                 <td class="num">${r.units}</td>
                 <td class="num"><a href="#" class="profit-price-link" data-sku="${escapeHtml(r.sku)}" title="Click to see every unit's price">${money(r.avg_price)}</a></td>
                 <td class="num">${money(r.revenue)}</td>

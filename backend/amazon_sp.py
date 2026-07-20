@@ -871,17 +871,24 @@ _FEE_TYPE_BUCKETS = [
     # (bucket key, list of substrings — matched case-insensitively against
     # Finances API FeeType strings, which have drifted over time)
     ("return_processing", ("returnfee", "refundcommission", "returnprocessingfee")),
-    ("low_inventory", ("lowinventorylevelfee", "lowinventoryfee")),
+    ("low_inventory", ("lowinventorylevelfee", "lowinventoryfee", "lowinventory")),
     ("inbound_placement", ("inboundplacement", "inboundconvenience",
                            "inboundtransportationfee", "inboundplacementservice",
-                           "fbainboundplacementservice", "placementservice")),
-    ("aged_inventory", ("agedinventorysurcharge", "longtermstoragefee")),
+                           "fbainboundplacementservice", "placementservice",
+                           "placementfee")),
+    ("aged_inventory", ("agedinventorysurcharge", "longtermstoragefee",
+                        "agedinventory", "inventoryagesurcharge",
+                        "agedinventoryfee")),
 ]
 
 _REMOVAL_ADJUSTMENT_HINTS = ("removal", "disposal")
 _PLACEMENT_ADJUSTMENT_HINTS = (
     "inboundplacement", "inbound placement", "placementservice",
-    "placement service",
+    "placement service", "placement fee",
+)
+_AGED_ADJUSTMENT_HINTS = (
+    "agedinventory", "aged inventory", "longtermstorage", "long-term storage",
+    "inventory age",
 )
 
 
@@ -1010,6 +1017,8 @@ async def get_financial_events(
                 bucket = _classify_fee_type(ftype)
                 if not bucket and any(h in fee_desc for h in _PLACEMENT_ADJUSTMENT_HINTS):
                     bucket = "inbound_placement"
+                if not bucket and any(h in fee_desc for h in _AGED_ADJUSTMENT_HINTS):
+                    bucket = "aged_inventory"
                 if not bucket:
                     continue
                 target = by_sku[sku] if sku else unattributed
@@ -1035,6 +1044,25 @@ async def get_financial_events(
                     if item_amt:
                         target = by_sku[sku] if sku else unattributed
                         target["inbound_placement"] += abs(item_amt)
+                continue
+            if any(h in adj_type for h in _AGED_ADJUSTMENT_HINTS):
+                adj_amt = evt.get("AdjustmentAmount") or {}
+                try:
+                    amt = float(adj_amt.get("CurrencyAmount", 0) or 0)
+                except (TypeError, ValueError, AttributeError):
+                    amt = 0.0
+                if amt:
+                    unattributed["aged_inventory"] += abs(amt)
+                for item in evt.get("AdjustmentItemList") or []:
+                    sku = (item.get("SellerSKU") or "").strip()
+                    amt_obj = item.get("PerUnitAmount") or item.get("TotalAmount") or {}
+                    try:
+                        item_amt = float(amt_obj.get("CurrencyAmount", 0) or 0)
+                    except (TypeError, ValueError, AttributeError):
+                        item_amt = 0.0
+                    if item_amt:
+                        target = by_sku[sku] if sku else unattributed
+                        target["aged_inventory"] += abs(item_amt)
                 continue
             if not any(h in adj_type for h in _REMOVAL_ADJUSTMENT_HINTS):
                 continue
@@ -1117,6 +1145,7 @@ async def fetch_inbound_placement_fees_per_sku(
     # Amazon exports have drifted between snake_case and "friendly" column
     # names; accept common variants so we don't break if they rename.
     sku_keys = ("sku", "seller_sku", "SKU")
+    asin_keys = ("asin", "ASIN", "Asin")
     qty_keys = ("actual_received_quantity", "received_quantity",
                 "Actual received quantity")
     fee_keys = ("total_fba_inbound_placement_service_fee_charge",
@@ -1131,6 +1160,7 @@ async def fetch_inbound_placement_fees_per_sku(
                     return v
             return None
         sku = (_get(sku_keys) or "").strip()
+        asin = (_get(asin_keys) or "").strip().upper()
         if not sku:
             continue
         try:
@@ -1152,12 +1182,15 @@ async def fetch_inbound_placement_fees_per_sku(
                 # Revenue Calculator-style per-unit rate. Including $0-fee
                 # Amazon-optimized inbound units diluted the rate ~4×+.
                 "fee_bearing_units": 0,
+                "asin": asin or None,
             },
         )
         bucket["fee_total"] += fee
         bucket["units_received"] += units
         if fee > 0 and units > 0:
             bucket["fee_bearing_units"] += units
+        if asin and not bucket.get("asin"):
+            bucket["asin"] = asin
         dt = (_get(date_keys) or "").strip()
         if dt:
             months.add(dt[:7])  # YYYY-MM prefix
@@ -1167,6 +1200,7 @@ async def fetch_inbound_placement_fees_per_sku(
             "fee_total": round(v["fee_total"], 2),
             "units_received": v["units_received"],
             "fee_bearing_units": v["fee_bearing_units"],
+            "asin": v.get("asin"),
         }
         for sku, v in per_sku.items()
     }
@@ -1239,6 +1273,7 @@ async def fetch_aged_inventory_fees_per_sku() -> dict:
     per_sku: dict[str, dict] = {}
     for row in reader:
         sku = (row.get("sku") or row.get("seller-sku") or "").strip()
+        asin = (row.get("asin") or row.get("ASIN") or "").strip().upper()
         if not sku:
             continue
         monthly_fee = sum(_f(row.get(c)) for c in ais_fee_cols)
@@ -1246,16 +1281,19 @@ async def fetch_aged_inventory_fees_per_sku() -> dict:
         if monthly_fee == 0 and aged_units == 0:
             continue
         bucket = per_sku.setdefault(
-            sku, {"monthly_fee": 0.0, "total_aged_units": 0}
+            sku, {"monthly_fee": 0.0, "total_aged_units": 0, "asin": asin or None}
         )
         # A SKU can appear once per (fnsku, marketplace) — sum defensively.
         bucket["monthly_fee"] += monthly_fee
         bucket["total_aged_units"] += aged_units
+        if asin and not bucket.get("asin"):
+            bucket["asin"] = asin
 
     return {
         sku: {
             "monthly_fee": round(v["monthly_fee"], 2),
             "total_aged_units": v["total_aged_units"],
+            "asin": v.get("asin"),
         }
         for sku, v in per_sku.items()
     }
