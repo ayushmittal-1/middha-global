@@ -18,6 +18,7 @@ from bson import ObjectId
 
 from auth import _db
 from amazon_sp import MARKETPLACE_NAMES, resolve_marketplace
+from amazon_sp import parse_fee_detail_lines, split_bundled_fulfillment_total
 
 # Match auroraBackend dashboardMetrics — cancelled/unfulfillable orders are not sales.
 # `Pending` is also excluded: those orders aren't confirmed yet and Amazon can flip
@@ -133,13 +134,26 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
         if not sku:
             continue
         fees = doc.get("fees") or {}
-        fba = _money_amount(fees.get("fbaFee"))
-        total = _money_amount(fees.get("totalFees"))
         price = _money_amount((doc.get("price") or {}))
-        referral = max(total - fba, price * 0.15) if total and fba else price * 0.15
+        breakdown = fees.get("breakdown") or []
+        if breakdown:
+            parsed = parse_fee_detail_lines(breakdown)
+            referral = parsed["referral"]
+            fba = parsed["fba"]
+            fuel = parsed["fuel_surcharge"]
+        else:
+            fba_total = _money_amount(fees.get("fbaFee"))
+            referral = _money_amount(fees.get("referralFee"))
+            total = _money_amount(fees.get("totalFees"))
+            if referral <= 0 and total > 0 and fba_total > 0:
+                referral = max(total - fba_total, 0.0)
+            elif referral <= 0 and price > 0:
+                referral = price * 0.15
+            fba, fuel = split_bundled_fulfillment_total(fba_total)
         out[sku] = {
-            "referral_per_unit": referral if price else 0.0,
+            "referral_per_unit": referral if price or referral else 0.0,
             "fba_per_unit": fba,
+            "fuel_per_unit": fuel,
             "asin": doc.get("asin"),
         }
     return out

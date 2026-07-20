@@ -727,8 +727,8 @@ async def compute_profitability_data(
       Net = Selling Price
             − Referral Fee
             − FBA Fulfilment Fee
-            − Fuel Surcharge (3.5% of FBA)
-            − Allocated Storage Fee
+            − Fuel Surcharge (Product Fees API — split from fulfillment when bundled)
+            − Allocated Storage Fee (monthly storage ÷ avg units on hand × units sold)
             − Product Cost (COGS)
             − Shipping Cost to Amazon (inbound)
             − Advertising Cost (allocated)
@@ -754,6 +754,7 @@ async def compute_profitability_data(
         put_placement_fee_cache,
         put_storage_cache,
     )
+    from amazon_sp import split_bundled_fulfillment_total
 
     # Normalize window using marketplace timezone (matches Aurora Orders / SC).
     user = require_user()
@@ -919,7 +920,7 @@ async def compute_profitability_data(
             "Amazon Orders API rate-limited us mid-fetch — showing partial results. "
             "Re-open this tab in a minute to see the full window."
         )
-    storage_per_asin_monthly: dict = {}
+    storage_per_asin: dict = {}
     storage_cached_at: str | None = None
     product_fee_fallback: dict[str, dict] = {}
     fin_by_sku: dict[str, dict] = {}
@@ -933,19 +934,26 @@ async def compute_profitability_data(
 
     storage_meta = await get_storage_cache(max_age_hours=24)
     if storage_meta:
-        storage_per_asin_monthly = storage_meta.get("per_sku_monthly") or {}
+        cached_map = storage_meta.get("per_sku_monthly") or {}
+        # Legacy cache stored flat monthly fees — ignore so we rebuild per-unit map.
+        if cached_map and not any(isinstance(v, dict) for v in cached_map.values()):
+            cached_map = {}
+        storage_per_asin = cached_map
         storage_cached_at = storage_meta.get("updated_at")
-    else:
+    if not storage_per_asin:
         try:
-            storage_per_asin_monthly, months = await amazon_sp.fetch_storage_fees_per_sku(months_back=2)
-            await put_storage_cache(storage_per_asin_monthly, months)
+            storage_per_asin, months = await amazon_sp.fetch_storage_fees_per_sku(months_back=2)
+            await put_storage_cache(storage_per_asin, months)
             storage_cached_at = datetime.now(timezone.utc).isoformat()
         except Exception as e:
             warnings.append(_sp_report_warning("Storage", e))
 
+    # Finances fees (low inv, placement settlements, returns) often post weeks
+    # after the related sale/inbound event — look back 45 days before the window.
+    fin_posted_after = utc_instant_to_iso_z(start_dt - timedelta(days=45))
     try:
         fin = await amazon_sp.get_financial_events(
-            posted_after=created_after,
+            posted_after=fin_posted_after,
             posted_before=created_before,
             paginate=True,
         )
@@ -1094,14 +1102,20 @@ async def compute_profitability_data(
         avg_price = revenue / units if units else 0.0
         asin = d["asin"]
 
-        # Referral/FBA: DB line items → products.fees → Fees API fallback
+        # Referral / base FBA / fuel: order line items → products.fees → Fees API.
         referral_total = round(float(d.get("referral_total") or 0), 2)
         fba_total = round(float(d.get("fba_total") or 0), 2)
         fuel_total = 0.0
+        fees_from_db_lines = referral_total > 0 or fba_total > 0
+
+        if fees_from_db_lines and fba_total > 0 and fuel_total == 0:
+            fba_total, fuel_total = split_bundled_fulfillment_total(fba_total)
+
         if referral_total == 0 and fba_total == 0 and sku in product_fee_fallback:
             pf = product_fee_fallback[sku]
             referral_total = round(pf.get("referral_per_unit", 0) * units, 2)
             fba_total = round(pf.get("fba_per_unit", 0) * units, 2)
+            fuel_total = round(pf.get("fuel_per_unit", 0) * units, 2)
             if not asin and pf.get("asin"):
                 asin = pf["asin"]
         if referral_total == 0 and fba_total == 0 and asin and avg_price > 0:
@@ -1118,15 +1132,16 @@ async def compute_profitability_data(
                 fee_errors.append(f"{sku} ({asin}): no estimate returned")
         elif not asin and avg_price > 0:
             fee_errors.append(f"{sku}: no ASIN found in order items")
-        if fuel_total == 0 and (referral_total > 0 or fba_total > 0):
-            fuel_total = round(fba_total * 0.035, 2)
 
         amazon_fees = round(referral_total + fba_total + fuel_total, 2)
 
-        # Storage allocation: monthly per-ASIN × months in window
-        storage = round(
-            float(storage_per_asin_monthly.get(asin or "", 0)) * months_in_window, 2,
-        )
+        # Storage: monthly fee ÷ average units on hand × units sold (Revenue Calculator).
+        asin_storage = storage_per_asin.get(asin or "", {})
+        if isinstance(asin_storage, dict):
+            storage_per_unit = float(asin_storage.get("storage_per_unit") or 0)
+        else:
+            storage_per_unit = float(asin_storage or 0)
+        storage = round(storage_per_unit * units, 2)
 
         # Ads: per-campaign attribution when the campaign lists this SKU,
         # plus a share of the unattributed pool spread per unit.
@@ -1157,11 +1172,9 @@ async def compute_profitability_data(
         if placement_avg_per_unit is None:
             inbound_placement_fee = round(finance_placement, 2)
         else:
-            # Report amortizes inbound receipt fees over units sold; also
-            # include any placement fees posted in Finances for this window.
-            inbound_placement_fee = round(
-                report_placement + finance_placement, 2,
-            )
+            # 12-month placement report already amortizes inbound fees per unit
+            # received — do not also add Finances API placement (double-count).
+            inbound_placement_fee = round(report_placement, 2)
         # Aged inventory: per-SKU monthly projection from the Planning
         # report × months in window. Falls back to the sales-window
         # unattributed spread when resolution fails.
@@ -1248,15 +1261,19 @@ async def compute_profitability_data(
         f"Date range uses marketplace timezone ({mp_tz}) — same day boundaries as Aurora Orders.",
         "Units and revenue exclude Canceled, Cancelled, and Unfulfillable orders "
         "(same rules as the Aurora dashboard).",
-        "Inbound placement uses the 12-month placement report (amortized per unit "
-        "sold) plus any placement fees in the Finances API for this window. "
-        "Amazon often posts placement ~45 days after inbound receipt.",
+        "Inbound placement uses the 12-month placement report (fee ÷ units "
+        "received × units sold in this window). Finances API is only used when "
+        "that report is unavailable. Amazon often posts placement ~45 days "
+        "after inbound receipt.",
+        "Storage uses GET_FBA_STORAGE_FEE_CHARGES_DATA: estimated monthly "
+        "storage fee ÷ average quantity on hand × units sold (Revenue Calculator).",
         "Return processing, low-inventory, aged-inventory, and removal fees "
-        "come from the Finances API — recent orders may not have them yet.",
+        "come from the Finances API (45-day lookback before the window start) — "
+        "recent orders may not have them yet.",
         "Ads are allocated uniformly per unit — per-SKU PPC attribution requires productAd joins.",
         "Fees posted without a SellerSKU (typically removals) are spread across units proportionally.",
     ]
-    if not storage_per_asin_monthly:
+    if not storage_per_asin:
         caveats.append("Storage fees: report unavailable for this window; values are 0.")
     placement_total = totals_out.get("inbound_placement_fee", 0)
     if placement_total == 0:
