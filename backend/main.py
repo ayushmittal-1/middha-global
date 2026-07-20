@@ -942,6 +942,104 @@ async def profitability(
     )
 
 
+@app.get("/profitability/sku/{sku}/prices")
+async def profitability_sku_prices(
+    sku: str,
+    start: str | None = None,
+    end: str | None = None,
+    user: dict = Depends(protect),
+):
+    """Per-line-item price breakdown for one SKU over a date range.
+
+    Powers the "click Avg Price → see every unit's price" drill-down.
+    Same date-range parsing rules as /profitability so the modal shows
+    the same universe of orders as the row above it.
+    """
+    from bson import ObjectId as _OID
+    from database import _db
+    from marketplace_timezone import resolve_dashboard_timezone, parse_date_range_for_query
+
+    user_id = _OID(str(user["_id"]))
+    mp_tz = resolve_dashboard_timezone(user, None)
+    now = datetime.now(timezone.utc)
+
+    if start and end:
+        start_dt, end_dt = parse_date_range_for_query(start, end, mp_tz)
+    else:
+        start_dt = now - timedelta(days=7)
+        end_dt = now
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+
+    pipeline = [
+        {"$match": {
+            "sellerId": user_id,
+            "purchaseDate": {"$gte": start_dt, "$lte": end_dt},
+        }},
+        {"$unwind": "$orderItems"},
+        {"$match": {"orderItems.sellerSku": sku}},
+        {"$project": {
+            "_id": 0,
+            "amazon_order_id": "$amazonOrderId",
+            "order_status": "$orderStatus",
+            "purchase_date": "$purchaseDate",
+            "qty": {"$ifNull": ["$orderItems.quantityOrdered", 0]},
+            "item_price_line": {"$ifNull": ["$orderItems.itemPrice.amount", 0]},
+            "item_subtotal_line": {"$ifNull": ["$orderItems.itemSubtotal.amount", 0]},
+            "promotion_discount": {"$ifNull": ["$orderItems.promotionDiscount.amount", 0]},
+            "currency": {"$ifNull": ["$orderItems.itemPrice.currencyCode", "USD"]},
+            "asin": "$orderItems.asin",
+            "city": "$shippingAddress.city",
+            "state": "$shippingAddress.stateOrRegion",
+        }},
+        {"$sort": {"purchase_date": -1}},
+    ]
+    docs = await _db().orders.aggregate(pipeline).to_list(length=None)
+
+    rows = []
+    for d in docs:
+        qty = int(d.get("qty") or 0)
+        subtotal = float(d.get("item_subtotal_line") or 0)
+        item_price = float(d.get("item_price_line") or 0)
+        promo = float(d.get("promotion_discount") or 0)
+        gross_line = subtotal if subtotal > 0 else item_price
+        net_line = max(0.0, gross_line - promo)
+        unit_price = net_line / qty if qty > 0 else 0.0
+        rows.append({
+            "amazon_order_id": d.get("amazon_order_id"),
+            "order_status": d.get("order_status"),
+            "purchase_date": d["purchase_date"].isoformat() if d.get("purchase_date") else None,
+            "qty": qty,
+            "gross_line": round(gross_line, 2),
+            "promo_discount": round(promo, 2),
+            "net_line": round(net_line, 2),
+            "unit_price": round(unit_price, 2),
+            "currency": d.get("currency") or "USD",
+            "asin": d.get("asin"),
+            "ship_to": ", ".join(
+                x for x in [d.get("city"), d.get("state")] if x
+            ) or None,
+        })
+
+    total_units = sum(r["qty"] for r in rows)
+    total_net_revenue = round(sum(r["net_line"] for r in rows), 2)
+    prices = [r["unit_price"] for r in rows if r["qty"] > 0]
+    return {
+        "sku": sku,
+        "start": start_dt.date().isoformat(),
+        "end": end_dt.date().isoformat(),
+        "line_count": len(rows),
+        "total_units": total_units,
+        "total_net_revenue": total_net_revenue,
+        "avg_price": round(total_net_revenue / total_units, 2) if total_units else 0.0,
+        "min_price": round(min(prices), 2) if prices else 0.0,
+        "max_price": round(max(prices), 2) if prices else 0.0,
+        "lines": rows,
+    }
+
+
 # ── Amazon OAuth endpoints ─────────────────────────────────────────────────
 
 AMAZON_AUTH_URL = "https://www.amazon.com/ap/oa"
