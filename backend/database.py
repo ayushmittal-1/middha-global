@@ -648,22 +648,16 @@ async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
             "inbound_working": int(inv.get("inboundWorkingQuantity") or 0),
             "reserved": int(inv.get("reservedQuantity") or 0),
             "unfulfillable": int(inv.get("unfulfillableQuantity") or 0),
-            # Seller Central "On-hand (FBA)" = Available + Inbound + Reserved
-            # + Unfulfillable — Amazon's own totalQuantity. Verified against
-            # a live Manage Inventory screenshot (2026-07-21): SKU ASG-Kiwi
-            # Sponge Shoe Black+Neutral Combo showed On-hand 107 = Available
-            # 101 + Inbound 6, matching totalQuantity=107 in our DB. When
-            # totalQuantity hasn't synced yet, reconstruct it from the parts.
-            "on_hand": int(
-                inv.get("totalQuantity")
-                or (
-                    int(inv.get("fulfillableQuantity") or 0)
-                    + int(inv.get("reservedQuantity") or 0)
-                    + int(inv.get("unfulfillableQuantity") or 0)
-                    + int(inv.get("inboundWorkingQuantity") or 0)
-                    + int(inv.get("inboundShippedQuantity") or 0)
-                    + int(inv.get("inboundReceivingQuantity") or 0)
-                )
+            # Seller Central "On-hand (FBA)" = Available + FC Transfer
+            # (pendingTransshipment). Reserved (customer orders + FC
+            # processing), Unfulfillable, and Inbound are separate columns
+            # and are NOT part of on-hand. Verified 2026-07-21 against live
+            # Manage Inventory: Liquid Polish Brown 555+4=559; Shoe Shine
+            # Sponge Black 88+1=89; Sponge Combo 101+6=107.
+            "fc_transfer": int(inv.get("reservedPendingTransshipment") or 0),
+            "on_hand": (
+                int(inv.get("fulfillableQuantity") or 0)
+                + int(inv.get("reservedPendingTransshipment") or 0)
             ),
         }
     return out
