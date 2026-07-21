@@ -1801,6 +1801,7 @@
           <input id="profit-end" type="date">
         </label>
         <button id="profit-refresh">Apply</button>
+        <input type="text" id="profit-search" placeholder="Filter by SKU or ASIN" style="min-width:180px;padding:4px 8px;font-size:12px;border:1px solid #cbd5e1;border-radius:4px;">
       </div>
       <div id="profit-kpis"></div>
       <div id="profit-caveats"></div>
@@ -2429,7 +2430,21 @@
       profitStartEl.value = back7.toISOString().slice(0, 10);
     })();
     const profitRefreshBtn = document.getElementById('profit-refresh');
+    const profitSearchEl = document.getElementById('profit-search');
     let profitLoaded = false;
+
+    function applyProfitSearchFilter() {
+      const q = (profitSearchEl.value || '').trim().toLowerCase();
+      profitBodyEl.querySelectorAll('tr[data-sku]').forEach(tr => {
+        const hit = !q || tr.dataset.sku.includes(q) || tr.dataset.asin.includes(q);
+        tr.style.display = hit ? '' : 'none';
+      });
+    }
+    let profitSearchTimer = null;
+    profitSearchEl.addEventListener('input', () => {
+      clearTimeout(profitSearchTimer);
+      profitSearchTimer = setTimeout(applyProfitSearchFilter, 120);
+    });
 
     const cogsViewEl = document.getElementById('cogs-view');
     const cogsBodyEl = document.getElementById('cogs-body');
@@ -3004,7 +3019,7 @@
               ? `<strong>${escapeHtml(r.sku)}</strong>`
               : `<strong>${escapeHtml(r.sku)}</strong> <span title="No COGS uploaded" style="color:#b35200;">⚠</span>`;
             return `
-              <tr title="ASIN ${escapeHtml(r.asin || '—')}">
+              <tr title="ASIN ${escapeHtml(r.asin || '—')}" data-sku="${escapeHtml((r.sku || '').toLowerCase())}" data-asin="${escapeHtml((r.asin || '').toLowerCase())}">
                 <td>${skuLabel}</td>
                 <td title="${escapeHtml(r.asin || '')}">${escapeHtml(r.asin || '—')}</td>
                 <td class="num">${r.units}</td>
@@ -3025,6 +3040,7 @@
                 <td class="num ${marginClass(r.margin)}">${r.margin}%</td>
               </tr>`;
           }).join('');
+          applyProfitSearchFilter();
           if (t) {
             profitFootEl.innerHTML = `
               <tr class="profit-totals-row">
