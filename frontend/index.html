@@ -1658,7 +1658,8 @@
               <th class="num" title="Damaged or customer-returned units currently unsellable">Unfulfillable</th>
               <!-- <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th> -->
               <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next arrival</th>
-              <th class="num" title="Weighted sales velocity — 0.5×v3d + 0.3×v7d + 0.2×v30d (out-of-stock days excluded)">Orders/day</th>
+              <th class="num" title="Weighted sales velocity — 0.5×v3d + 0.3×v7d + 0.2×v30d (out-of-stock days excluded)">Orders Velocity</th>
+              <th class="num" title="Units sold in the last 30 days (Aurora orders, cancelled/pending excluded)">Orders per Day</th>
               <!-- <th class="num" title="Total units sold in the selected window (Aurora orders, cancelled/pending excluded)"><span id="restock-units-header">Units (30d)</span></th> -->
               <th class="num">30-day forecast</th>
               <th>Days of cover</th>
@@ -2599,6 +2600,7 @@
           <!-- <td class="num" title="${inboundTip}">${fmtRestockNum(row.inbound ?? 0)}</td> -->
           <td title="${inboundTip}">${nextArrivalCell}</td>
           <td class="num">${fmtRestockNum(row.weighted_velocity ?? 0, 2)}</td>
+          <td class="num">${fmtRestockNum(row.orders_30d ?? 0)}</td>
           <!-- <td class="num restock-units-cell">${fmtRestockNum(row.units_30d ?? 0)}</td> -->
           <td class="num">${fmtRestockNum(row.next_30_day_forecast ?? 0, 1)}</td>
           <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>
