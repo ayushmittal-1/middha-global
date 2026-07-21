@@ -1036,8 +1036,19 @@ async def compute_profitability_data(
         placement_meta["source"] = "finances_fallback"
 
     aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
+    # Force a refetch when the cache pre-dates the HDoS / recommended-ship-qty
+    # extraction — an old-shape cache is technically fresh (< 24h) but missing
+    # the fields the Restock table needs. Detect it by looking for any entry
+    # carrying the new keys; if none do, treat as stale.
+    aged_needs_refresh = bool(aged_cache_meta) and not any(
+        (
+            "historical_days_of_supply" in v
+            or "recommended_ship_in_quantity" in v
+        )
+        for v in (aged_cache_meta.get("per_sku") or {}).values()
+    )
     try:
-        if aged_cache_meta:
+        if aged_cache_meta and not aged_needs_refresh:
             aged_per_sku = aged_cache_meta.get("per_sku") or {}
         else:
             aged_per_sku = await amazon_sp.fetch_aged_inventory_fees_per_sku()
