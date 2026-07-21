@@ -1528,6 +1528,17 @@
       background: #fee; color: #b71c1c; padding: 8px 12px;
       border-radius: 4px; font-size: 13px; display: none;
     }
+
+    /* Global dark mode — invert the whole page, then counter-invert
+       raster/vector assets so photos and icons still read normally. The
+       hue-rotate keeps accent colors close to their intended hue. */
+    html {
+      background: #0f172a;
+      filter: invert(0.92) hue-rotate(180deg);
+    }
+    img, video, svg, canvas, iframe, .no-dark-invert {
+      filter: invert(1) hue-rotate(180deg);
+    }
   </style>
 </head>
 <body>
