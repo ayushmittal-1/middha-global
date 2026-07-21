@@ -1131,10 +1131,18 @@ async def compute_profitability_data(
             placement_meta["source"] = "finances_fallback"
 
     aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
+    # Force a refetch when the cache pre-dates the HDoS extraction — an
+    # old-shape cache is technically fresh (< 24h) but missing the keys
+    # the Restock table needs. Detect it by looking for any entry carrying
+    # the new key; if none do, treat as stale.
+    aged_needs_refresh = bool(aged_cache_meta) and not any(
+        "historical_days_of_supply" in v
+        for v in (aged_cache_meta.get("per_sku") or {}).values()
+    )
     try:
         aged_per_sku: dict = {}
         need_aged_fetch = False
-        if aged_cache_meta:
+        if aged_cache_meta and not aged_needs_refresh:
             aged_per_sku = aged_cache_meta.get("per_sku") or {}
             # Refresh once so ASIN keys are available for cross-SKU matching.
             if aged_per_sku and not any(
@@ -1154,6 +1162,20 @@ async def compute_profitability_data(
             await put_aged_inventory_cache({})
         aged_monthly_per_sku = None
         aged_monthly_per_asin = {}
+
+    # Warm the Restock Recommendations cache so the Restock tab's
+    # "Amz rec qty" column has data. Separate SP-API report from the
+    # Inventory Planning one, so cache and fetch it independently.
+    from database import get_restock_rec_cache, put_restock_rec_cache
+    try:
+        rec_cache = await get_restock_rec_cache(max_age_hours=24)
+        if not rec_cache:
+            rec_per_sku = await amazon_sp.fetch_restock_recommendations_per_sku()
+            await put_restock_rec_cache(rec_per_sku)
+    except Exception as e:
+        warnings.append(_sp_report_warning("Restock recommendations", e))
+        if _is_sp_access_denied(e):
+            await put_restock_rec_cache({})
 
     # products.fees is primary (same as Aurora Products). Fees API only for SKUs
     # missing that sync — do not prefer stale order-line fees.

@@ -357,6 +357,16 @@ async def forecasting_restock(user: dict = Depends(protect)):
     cogs_by_sku: dict[str, dict] = {r["sku"]: r for r in cogs_rows}
     settings_by_sku = await all_product_settings_for_user(user_id)
     ordered_by_sku = await open_ordered_qty_by_sku(user_id)
+    # Amazon's own historical-days-of-supply comes from the FBA Inventory
+    # Planning report (aged inventory cache); its recommended restock qty
+    # comes from a separate report (restock recommendations cache). Both
+    # are read-only here — the reports take 30-120s to generate, so we let
+    # /profitability warm them and just consume the fresh copy when available.
+    from database import get_aged_inventory_cache, get_restock_rec_cache
+    aged_cache = await get_aged_inventory_cache(max_age_hours=24)
+    aged_supplements: dict[str, dict] = (aged_cache or {}).get("per_sku", {})
+    rec_cache = await get_restock_rec_cache(max_age_hours=24)
+    rec_supplements: dict[str, dict] = (rec_cache or {}).get("per_sku", {})
     # Fresh read — buyability can flip Active/Inactive between forecast
     # refreshes, and we want the UI to reflect that instantly rather than
     # waiting for the next cache rebuild.
@@ -505,6 +515,12 @@ async def forecasting_restock(user: dict = Depends(protect)):
             except ValueError:
                 pass
 
+        aged_sup = aged_supplements.get(sku) or {}
+        historical_dos = aged_sup.get("historical_days_of_supply")
+        rec_sup = rec_supplements.get(sku) or {}
+        amazon_rec_qty = rec_sup.get("recommended_replenishment_qty")
+        amazon_rec_date = rec_sup.get("recommended_ship_date")
+
         ps = settings_by_sku.get(sku) or {}
         is_buyable = bool(inv_row.get("is_buyable", True))
         # For non-buyable SKUs, zero the reorder recommendation regardless
@@ -548,6 +564,9 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "next_shipment_eta": reorder.get("next_shipment_eta"),
             "next_shipment_qty": reorder.get("next_shipment_qty"),
             "recommended_po_qty": recommended_po_qty,
+            "amazon_recommended_ship_qty": amazon_rec_qty,
+            "amazon_recommended_ship_date": amazon_rec_date,
+            "historical_days_of_supply": historical_dos,
             "unit_cost": unit_cost,
             "landed_cost": round(landed_cost, 4),
             "stock_value": stock_value,

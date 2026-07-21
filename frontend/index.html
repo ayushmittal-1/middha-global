@@ -1689,11 +1689,13 @@
               <!-- <th class="num" title="Total units sold in the selected window (Aurora orders, cancelled/pending excluded)"><span id="restock-units-header">Units (30d)</span></th> -->
               <th class="num">30-day forecast</th>
               <th>Days of cover</th>
+              <th class="num" title="Amazon's own metric: ratio of avg. daily sellable on-hand inventory to avg. daily shipped units (max of 30d and 90d ratios). Low-inventory-level fee doesn't apply when HDOS > 28. Source: FBA Inventory Planning report.">Historical DoS</th>
               <th title="Projected stockout date given on-hand + inbound shipments − daily demand">Stockout on</th>
               <th title="Latest date to dispatch a shipment via air freight (~10d transit to Amazon FC)">Ship by (Air)</th>
               <th title="Latest date to dispatch a shipment via ocean freight (~45d transit to Amazon FC)">Ship by (Ocean)</th>
               <th class="num" title="Days until you need to dispatch by air (delta from today to Ship by Air). Negative = you're late.">Days until next order</th>
               <th class="num">Suggested qty</th>
+              <th class="num" title="Amazon's own recommended restock quantity from the FBA Inventory Planning report (recommended-ship-in-quantity). Compare against our Suggested qty for a sanity check.">Amz rec qty</th>
               <th class="num" title="Units on your open purchase orders that haven't arrived at your warehouse / prep center yet">Ordered</th>
               <th class="num" title="(Available to sell + Reserved + Sent to FBA + Inbound working) × landed cost from your COGS">Stock value</th>
               <th class="num" title="Rough estimate of profit lost during stockout days over the last 90d, using ~25% margin on landed cost">Missed profit (est.)</th>
@@ -2651,11 +2653,13 @@
           <!-- <td class="num restock-units-cell">${fmtRestockNum(row.units_30d ?? 0)}</td> -->
           <td class="num">${fmtRestockNum(row.next_30_day_forecast ?? 0, 1)}</td>
           <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>
+          <td class="num" title="Historical days of supply (Amazon). Grey when the Inventory Planning report hasn't been generated in the last 24h — open the Profitability tab to warm the cache.">${row.historical_days_of_supply == null ? '<span style="color:#888;">—</span>' : fmtRestockNum(row.historical_days_of_supply, 1)}</td>
           <td class="date-cell">${fmtRestockDate(row.stockout_date)}</td>
           <td class="date-cell" title="${airTip}">${fmtRestockDate(row.reorder_by_date_air)}</td>
           <td class="date-cell" title="${oceanTip}">${fmtRestockDate(row.reorder_by_date_ocean ?? row.reorder_by_date_sea)}</td>
           <td class="num">${fmtDaysUntil(row.days_until_next_order)}</td>
           <td class="num num-strong">${isBuyable ? fmtRestockNum(row.recommended_po_qty ?? 0) : '—'}</td>
+          <td class="num" title="Amazon's recommended ship-in quantity${row.amazon_recommended_ship_date ? ' (by ' + row.amazon_recommended_ship_date + ')' : ''}. Blank when the Inventory Planning report hasn't been generated in the last 24h.">${row.amazon_recommended_ship_qty == null ? '<span style="color:#888;">—</span>' : fmtRestockNum(row.amazon_recommended_ship_qty)}</td>
           <td class="num">${fmtRestockNum(row.ordered ?? 0)}</td>
           <td class="num">${row.stock_value > 0 ? '$' + fmtRestockNum(row.stock_value, 2) : '—'}</td>
           <td class="num">${row.missed_profit_est > 0 ? '$' + fmtRestockNum(row.missed_profit_est, 2) : '$0.00'}</td>
