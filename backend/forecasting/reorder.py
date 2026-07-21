@@ -198,8 +198,9 @@ def compute_reorder(
     shipments = shipments or []
 
     inv = inv_snapshot or {}
-    # Sellable units drive the depletion math; the reported `on_hand` is the
-    # Seller Central-style physical count (available + reserved + unfulfillable).
+    # Sellable units drive the depletion math; the reported `on_hand` is
+    # Seller Central's "On-hand (FBA)" (Amazon's totalQuantity = available
+    # + inbound + reserved + unfulfillable).
     available = int(inv.get("fulfillable", 0))
     reserved = int(inv.get("reserved", 0))
     # Amazon-side "sent to FBA" — units checked in / in-transit at Amazon,
@@ -207,8 +208,10 @@ def compute_reorder(
     sent_to_fba = int(inv.get("inbound_shipped", 0))
     inbound_working = int(inv.get("inbound_working", 0))
     unfulfillable = int(inv.get("unfulfillable", 0))
-    # Seller Central-style physical on-hand for display.
-    on_hand = int(inv.get("on_hand") or (available + reserved + unfulfillable))
+    on_hand = int(
+        inv.get("on_hand")
+        or (available + reserved + unfulfillable + sent_to_fba + inbound_working)
+    )
     inbound_outstanding = sum(int(s.get("qty_outstanding", 0)) for s in shipments)
 
     horizon_p50 = [float(r.get("p50", 0)) for r in forecast]

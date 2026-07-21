@@ -438,13 +438,13 @@ async def forecasting_restock(user: dict = Depends(protect)):
         sent_to_fba = int(inv_row.get("inbound_shipped", reorder.get("sent_to_fba", 0)) or 0)
         inbound_working = int(inv_row.get("inbound_working", reorder.get("inbound_working", 0)) or 0)
         unfulfillable = int(inv_row.get("unfulfillable", reorder.get("unfulfillable", 0)) or 0)
-        # "On hand" = units physically at Amazon FCs: available + reserved
-        # + unfulfillable (matches Seller Central FBA inventory). NOT
-        # totalQuantity — that includes inbound-shipped units, which are
-        # already shown in the Sent to FBA column and would double-count.
+        # Seller Central "On-hand (FBA)" = available + inbound + reserved +
+        # unfulfillable (Amazon's totalQuantity) — computed in
+        # latest_inventory_for_user. Verified against a live Manage Inventory
+        # screenshot: On-hand 107 = Available 101 + Inbound 6.
         on_hand = int(
             inv_row.get("on_hand")
-            or (available + reserved + unfulfillable)
+            or (available + reserved + unfulfillable + sent_to_fba + inbound_working)
             or reorder.get("on_hand", 0)
             or 0
         )
@@ -627,11 +627,10 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
     sent_to_fba = int(inv_row.get("inbound_shipped", reorder.get("sent_to_fba", 0)) or 0)
     inbound_working = int(inv_row.get("inbound_working", reorder.get("inbound_working", 0)) or 0)
     unfulfillable = int(inv_row.get("unfulfillable", reorder.get("unfulfillable", 0)) or 0)
-    # "On hand" = available + reserved + unfulfillable (physical FC units,
-    # excluding inbound) — see /forecasting/restock for the same fix.
+    # Seller Central "On-hand (FBA)" = totalQuantity — see /forecasting/restock.
     on_hand = int(
         inv_row.get("on_hand")
-        or (available + reserved + unfulfillable)
+        or (available + reserved + unfulfillable + sent_to_fba + inbound_working)
         or reorder.get("on_hand", 0)
         or 0
     )
