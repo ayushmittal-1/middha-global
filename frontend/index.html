@@ -898,6 +898,12 @@
     table.restock.profit tbody td.num {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
+    .profit-cogs-cell { cursor: pointer; }
+    .profit-cogs-cell:not(.editing):hover {
+      background: #eef2ff;
+      outline: 1px dashed #93c5fd;
+    }
+    .profit-cogs-cell.editing { background: #fff8e1; }
     #profit-table-wrap tfoot .profit-totals-label {
       font-weight: 700;
       color: #0f172a;
@@ -3012,7 +3018,7 @@
                 <td class="num">${money(r.storage_fee)}</td>
                 <td class="num">${money(r.aged_inventory_fee)}</td>
                 <td class="num">${money(r.ad_cost)}</td>
-                <td class="num">${money(r.cogs_total)}</td>
+                <td class="num profit-cogs-cell" data-sku="${escapeHtml(r.sku)}" data-unit-cost="${r.unit_cost ?? ''}" data-inbound-per-unit="${r.inbound_shipping_per_unit ?? ''}" data-units="${r.units}" title="Click to edit COGS">${money(r.cogs_total)}${r.cogs_uploaded ? '' : ' <span style=\"color:#b35200;\">⚠</span>'}</td>
                 <td class="num">${money(r.return_processing_fee)}</td>
                 <td class="num">${money(r.removal_fee)}</td>
                 <td class="num ${marginClass(r.margin)}">${money(r.net)}</td>
@@ -3153,10 +3159,66 @@
     }
     profitBodyEl.addEventListener('click', (e) => {
       const a = e.target.closest('.profit-price-link');
-      if (!a) return;
-      e.preventDefault();
-      openPricesModal(a.dataset.sku);
+      if (a) {
+        e.preventDefault();
+        openPricesModal(a.dataset.sku);
+        return;
+      }
+      const cogsCell = e.target.closest('.profit-cogs-cell');
+      if (cogsCell && !cogsCell.classList.contains('editing')) {
+        openProfitCogsEditor(cogsCell);
+      }
     });
+
+    function openProfitCogsEditor(cell) {
+      const sku = cell.dataset.sku;
+      const unitCost = cell.dataset.unitCost !== '' ? parseFloat(cell.dataset.unitCost) : '';
+      const inbound = cell.dataset.inboundPerUnit !== '' ? parseFloat(cell.dataset.inboundPerUnit) : '';
+      const originalHTML = cell.innerHTML;
+      cell.classList.add('editing');
+      cell.innerHTML = `
+        <div style="display:flex;flex-direction:column;gap:3px;align-items:stretch;min-width:110px;">
+          <input type="number" class="pcogs-unit"    step="0.01" min="0.01" placeholder="Unit $" value="${unitCost}" style="width:100%;padding:2px 4px;font-size:11px;">
+          <input type="number" class="pcogs-inbound" step="0.01" min="0"    placeholder="Ship $/unit" value="${inbound}" style="width:100%;padding:2px 4px;font-size:11px;">
+          <div style="display:flex;gap:3px;">
+            <button type="button" class="pcogs-save" style="flex:1;font-size:11px;padding:2px;">Save</button>
+            <button type="button" class="pcogs-cancel" style="flex:1;font-size:11px;padding:2px;">Cancel</button>
+          </div>
+        </div>`;
+      const unitInp = cell.querySelector('.pcogs-unit');
+      unitInp.focus();
+      unitInp.select();
+      const restore = () => {
+        cell.classList.remove('editing');
+        cell.innerHTML = originalHTML;
+      };
+      cell.querySelector('.pcogs-cancel').addEventListener('click', restore);
+      cell.querySelector('.pcogs-save').addEventListener('click', async () => {
+        const unit_cost = parseFloat(cell.querySelector('.pcogs-unit').value);
+        const inbound_shipping_per_unit = parseFloat(cell.querySelector('.pcogs-inbound').value || 0);
+        if (!(unit_cost > 0)) {
+          alert('Unit cost must be > 0');
+          return;
+        }
+        try {
+          const r = await fetch(`/cogs/${encodeURIComponent(sku)}`, {
+            method: 'PUT',
+            headers: authHeaders({ 'content-type': 'application/json' }),
+            body: JSON.stringify({ unit_cost, inbound_shipping_per_unit }),
+          });
+          const j = await r.json();
+          if (j.error) throw new Error(j.error);
+          await loadProfitability();
+        } catch (err) {
+          alert(`Save failed: ${err.message || err}`);
+          restore();
+        }
+      });
+      cell.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') restore();
+        if (e.key === 'Enter') cell.querySelector('.pcogs-save').click();
+      });
+    }
 
     // ── COGS editor ─────────────────────────────────────
     let cogsFlashTimer = null;
