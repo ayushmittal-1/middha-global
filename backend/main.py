@@ -357,6 +357,13 @@ async def forecasting_restock(user: dict = Depends(protect)):
     cogs_by_sku: dict[str, dict] = {r["sku"]: r for r in cogs_rows}
     settings_by_sku = await all_product_settings_for_user(user_id)
     ordered_by_sku = await open_ordered_qty_by_sku(user_id)
+    # Amazon's own historical-days-of-supply and recommended-ship-in-quantity
+    # come from the FBA Inventory Planning report. Read-only from cache here —
+    # the report takes 30-120s to generate, so we let /profitability warm it
+    # and just consume the fresh copy when it's available.
+    from database import get_aged_inventory_cache
+    aged_cache = await get_aged_inventory_cache(max_age_hours=24)
+    aged_supplements: dict[str, dict] = (aged_cache or {}).get("per_sku", {})
     # Fresh read — buyability can flip Active/Inactive between forecast
     # refreshes, and we want the UI to reflect that instantly rather than
     # waiting for the next cache rebuild.
@@ -491,6 +498,11 @@ async def forecasting_restock(user: dict = Depends(protect)):
             except ValueError:
                 pass
 
+        aged_sup = aged_supplements.get(sku) or {}
+        historical_dos = aged_sup.get("historical_days_of_supply")
+        amazon_rec_qty = aged_sup.get("recommended_ship_in_quantity")
+        amazon_rec_date = aged_sup.get("recommended_ship_in_date")
+
         ps = settings_by_sku.get(sku) or {}
         is_buyable = bool(inv_row.get("is_buyable", True))
         # For non-buyable SKUs, zero the reorder recommendation regardless
@@ -533,6 +545,9 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "next_shipment_eta": reorder.get("next_shipment_eta"),
             "next_shipment_qty": reorder.get("next_shipment_qty"),
             "recommended_po_qty": recommended_po_qty,
+            "amazon_recommended_ship_qty": amazon_rec_qty,
+            "amazon_recommended_ship_date": amazon_rec_date,
+            "historical_days_of_supply": historical_dos,
             "unit_cost": unit_cost,
             "landed_cost": round(landed_cost, 4),
             "stock_value": stock_value,

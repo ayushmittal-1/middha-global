@@ -1243,19 +1243,52 @@ async def fetch_aged_inventory_fees_per_sku() -> dict:
             continue
         monthly_fee = sum(_f(row.get(c)) for c in ais_fee_cols)
         aged_units = sum(_i(row.get(c)) for c in ais_qty_cols)
-        if monthly_fee == 0 and aged_units == 0:
+        # Amazon's own restock signals from the same report — used by the
+        # Restock dashboard's HDOS and "recommended ship qty" columns.
+        hdos_raw = row.get("historical-days-of-supply")
+        rec_qty_raw = row.get("recommended-ship-in-quantity")
+        rec_date_raw = (row.get("recommended-ship-in-date") or "").strip() or None
+        has_supplement = any(
+            v not in (None, "") for v in (hdos_raw, rec_qty_raw, rec_date_raw)
+        )
+        if monthly_fee == 0 and aged_units == 0 and not has_supplement:
             continue
         bucket = per_sku.setdefault(
-            sku, {"monthly_fee": 0.0, "total_aged_units": 0}
+            sku,
+            {
+                "monthly_fee": 0.0,
+                "total_aged_units": 0,
+                "historical_days_of_supply": None,
+                "recommended_ship_in_quantity": None,
+                "recommended_ship_in_date": None,
+            },
         )
-        # A SKU can appear once per (fnsku, marketplace) — sum defensively.
+        # A SKU can appear once per (fnsku, marketplace) — sum defensively
+        # for fees/units. Take the max HDOS and the sum of recommended-ship
+        # quantities so a multi-FC SKU still surfaces a sensible signal.
         bucket["monthly_fee"] += monthly_fee
         bucket["total_aged_units"] += aged_units
+        if hdos_raw not in (None, ""):
+            v = _f(hdos_raw)
+            prev = bucket["historical_days_of_supply"]
+            bucket["historical_days_of_supply"] = v if prev is None else max(prev, v)
+        if rec_qty_raw not in (None, ""):
+            v = _i(rec_qty_raw)
+            prev = bucket["recommended_ship_in_quantity"] or 0
+            bucket["recommended_ship_in_quantity"] = prev + v
+        if rec_date_raw and not bucket["recommended_ship_in_date"]:
+            bucket["recommended_ship_in_date"] = rec_date_raw
 
     return {
         sku: {
             "monthly_fee": round(v["monthly_fee"], 2),
             "total_aged_units": v["total_aged_units"],
+            "historical_days_of_supply": (
+                round(v["historical_days_of_supply"], 1)
+                if v["historical_days_of_supply"] is not None else None
+            ),
+            "recommended_ship_in_quantity": v["recommended_ship_in_quantity"],
+            "recommended_ship_in_date": v["recommended_ship_in_date"],
         }
         for sku, v in per_sku.items()
     }
