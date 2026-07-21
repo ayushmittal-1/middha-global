@@ -1385,6 +1385,8 @@ async def compute_profitability_data(
             "product_cost": product_cost,
             "inbound_shipping": inbound,
             "cogs_total": round(product_cost + inbound, 2),
+            "unit_cost": float(cogs_row["unit_cost"]) if cogs_row else None,
+            "inbound_shipping_per_unit": float(cogs_row["inbound_shipping_per_unit"]) if cogs_row else None,
             "return_processing_fee": return_processing_fee,
             "low_inventory_fee": low_inventory_fee,
             "inbound_placement_fee": inbound_placement_fee,

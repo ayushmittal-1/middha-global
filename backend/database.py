@@ -614,7 +614,7 @@ async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
     """
     cursor = _db().products.find(
         {"sellerId": user_id},
-        {"sku": 1, "asin": 1, "inventory": 1, "lastSynced": 1,
+        {"sku": 1, "asin": 1, "fnSku": 1, "inventory": 1, "lastSynced": 1,
          "status": 1, "listingStatus": 1, "_id": 0},
     )
     out: dict[str, dict] = {}
@@ -638,6 +638,7 @@ async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
         out[sku] = {
             "sku": sku,
             "asin": (p.get("asin") or "").strip() or None,
+            "fnsku": (p.get("fnSku") or "").strip() or None,
             "date": p.get("lastSynced"),
             "status": status or None,
             "listing_status": listing_status or None,

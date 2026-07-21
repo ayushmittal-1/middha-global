@@ -898,6 +898,12 @@
     table.restock.profit tbody td.num {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
+    .profit-cogs-cell { cursor: pointer; }
+    .profit-cogs-cell:not(.editing):hover {
+      background: #eef2ff;
+      outline: 1px dashed #93c5fd;
+    }
+    .profit-cogs-cell.editing { background: #fff8e1; }
     #profit-table-wrap tfoot .profit-totals-label {
       font-weight: 700;
       color: #0f172a;
@@ -1528,6 +1534,17 @@
       background: #fee; color: #b71c1c; padding: 8px 12px;
       border-radius: 4px; font-size: 13px; display: none;
     }
+
+    /* Global dark mode — invert the whole page, then counter-invert
+       raster/vector assets so photos and icons still read normally. The
+       hue-rotate keeps accent colors close to their intended hue. */
+    html {
+      background: #0f172a;
+      filter: invert(0.92) hue-rotate(180deg);
+    }
+    img, video, svg, canvas, iframe, .no-dark-invert {
+      filter: invert(1) hue-rotate(180deg);
+    }
   </style>
 </head>
 <body>
@@ -1610,6 +1627,14 @@
           <input type="checkbox" id="restock-hide-non-buyable"> Hide non-buyable
         </label>
         <input type="text" id="restock-search" placeholder="Filter by SKU or ASIN" style="min-width:180px;padding:4px 8px;font-size:12px;border:1px solid #cbd5e1;border-radius:4px;">
+        <label title="Trailing window for the Orders column (units sold, Aurora orders, cancelled/pending excluded)" style="font-size:12px;">
+          Orders window
+          <select id="restock-orders-window" style="margin-left:4px;padding:4px 6px;font-size:12px;border:1px solid #cbd5e1;border-radius:4px;">
+            <option value="7">7 days</option>
+            <option value="30" selected>30 days</option>
+            <option value="60">60 days</option>
+          </select>
+        </label>
 
         <!--
         <label title="Trailing window used to compute the Orders/day column (Aurora sales, out-of-stock days excluded)">
@@ -1651,6 +1676,7 @@
             <tr>
               <th>SKU</th>
               <th title="Amazon Standard Identification Number">ASIN</th>
+              <th title="Fulfillment Network SKU — Amazon's internal barcode ID for FBA units">FNSKU</th>
               <th class="num">On hand</th>
               <th class="num" title="Units set aside by Amazon for pending customer orders / FC transfers / processing — not sellable right now">Reserved</th>
               <th class="num" title="Units Amazon has received into the network but not yet checked into the destination FC (inboundShippedQuantity)">Sent to FBA</th>
@@ -1658,7 +1684,8 @@
               <th class="num" title="Damaged or customer-returned units currently unsellable">Unfulfillable</th>
               <!-- <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th> -->
               <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next arrival</th>
-              <th class="num" title="Weighted sales velocity — 0.5×v3d + 0.3×v7d + 0.2×v30d (out-of-stock days excluded)">Orders/day</th>
+              <th class="num" title="Weighted sales velocity — 0.5×v3d + 0.3×v7d + 0.2×v30d (out-of-stock days excluded)">Orders Velocity</th>
+              <th class="num" title="Average units sold per day over the selected window (units sold ÷ window size; Aurora orders, cancelled/pending excluded)"><span id="restock-orders-header">Orders/day (30d)</span></th>
               <!-- <th class="num" title="Total units sold in the selected window (Aurora orders, cancelled/pending excluded)"><span id="restock-units-header">Units (30d)</span></th> -->
               <th class="num">30-day forecast</th>
               <th>Days of cover</th>
@@ -1774,6 +1801,7 @@
           <input id="profit-end" type="date">
         </label>
         <button id="profit-refresh">Apply</button>
+        <input type="text" id="profit-search" placeholder="Filter by SKU or ASIN" style="min-width:180px;padding:4px 8px;font-size:12px;border:1px solid #cbd5e1;border-radius:4px;">
       </div>
       <div id="profit-kpis"></div>
       <div id="profit-caveats"></div>
@@ -2341,6 +2369,8 @@
     const restockShowNoDemandEl = document.getElementById('restock-show-no-demand');
     const restockHideNonBuyableEl = document.getElementById('restock-hide-non-buyable');
     const restockSearchEl = document.getElementById('restock-search');
+    const restockOrdersWindowEl = document.getElementById('restock-orders-window');
+    const restockOrdersHeaderEl = document.getElementById('restock-orders-header');
     // Velocity window selector was replaced with a single weighted-velocity
     // column (0.5/0.3/0.2/0/0). Elements below no longer exist.
     // const restockVelocityWindowEl = document.getElementById('restock-velocity-window');
@@ -2400,7 +2430,21 @@
       profitStartEl.value = back7.toISOString().slice(0, 10);
     })();
     const profitRefreshBtn = document.getElementById('profit-refresh');
+    const profitSearchEl = document.getElementById('profit-search');
     let profitLoaded = false;
+
+    function applyProfitSearchFilter() {
+      const q = (profitSearchEl.value || '').trim().toLowerCase();
+      profitBodyEl.querySelectorAll('tr[data-sku]').forEach(tr => {
+        const hit = !q || tr.dataset.sku.includes(q) || tr.dataset.asin.includes(q);
+        tr.style.display = hit ? '' : 'none';
+      });
+    }
+    let profitSearchTimer = null;
+    profitSearchEl.addEventListener('input', () => {
+      clearTimeout(profitSearchTimer);
+      profitSearchTimer = setTimeout(applyProfitSearchFilter, 120);
+    });
 
     const cogsViewEl = document.getElementById('cogs-view');
     const cogsBodyEl = document.getElementById('cogs-body');
@@ -2533,6 +2577,9 @@
       const showAll = restockShowNoDemandEl.checked;
       const hideNonBuyable = restockHideNonBuyableEl.checked;
       const q = (restockSearchEl.value || '').trim().toLowerCase();
+      const ordersWindow = parseInt(restockOrdersWindowEl.value, 10) || 30;
+      const ordersField = `orders_${ordersWindow}d`;
+      if (restockOrdersHeaderEl) restockOrdersHeaderEl.textContent = `Orders/day (${ordersWindow}d)`;
 
       let visible = showAll
         ? restockCache
@@ -2591,6 +2638,7 @@
             <span class="sku-name">${escapeHtml(truncateSku(row.sku))}</span>${notBuyableBadge}
           </td>
           <td title="${escapeHtml(row.asin || '')}">${escapeHtml(row.asin || '—')}</td>
+          <td title="${escapeHtml(row.fnsku || '')}">${escapeHtml(row.fnsku || '—')}</td>
           <td class="num">${fmtRestockNum(row.on_hand ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.reserved ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.sent_to_fba ?? 0)}</td>
@@ -2599,6 +2647,7 @@
           <!-- <td class="num" title="${inboundTip}">${fmtRestockNum(row.inbound ?? 0)}</td> -->
           <td title="${inboundTip}">${nextArrivalCell}</td>
           <td class="num">${fmtRestockNum(row.weighted_velocity ?? 0, 2)}</td>
+          <td class="num">${fmtRestockNum((row[ordersField] ?? 0) / ordersWindow, 2)}</td>
           <!-- <td class="num restock-units-cell">${fmtRestockNum(row.units_30d ?? 0)}</td> -->
           <td class="num">${fmtRestockNum(row.next_30_day_forecast ?? 0, 1)}</td>
           <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>
@@ -2659,6 +2708,7 @@
 
     restockShowNoDemandEl.addEventListener('change', renderRestockRows);
     restockHideNonBuyableEl.addEventListener('change', renderRestockRows);
+    restockOrdersWindowEl.addEventListener('change', renderRestockRows);
     // Debounce search input so we don't rerender on every keystroke.
     let restockSearchTimer = null;
     restockSearchEl.addEventListener('input', () => {
@@ -2969,7 +3019,7 @@
               ? `<strong>${escapeHtml(r.sku)}</strong>`
               : `<strong>${escapeHtml(r.sku)}</strong> <span title="No COGS uploaded" style="color:#b35200;">⚠</span>`;
             return `
-              <tr>
+              <tr data-sku="${escapeHtml((r.sku || '').toLowerCase())}" data-asin="${escapeHtml((r.asin || '').toLowerCase())}">
                 <td>${skuLabel}</td>
                 <td title="ASIN ${escapeHtml(r.asin || '—')}">${escapeHtml(r.asin || '—')}</td>
                 <td class="num">${r.units}</td>
@@ -2983,13 +3033,14 @@
                 <td class="num">${money(r.storage_fee)}</td>
                 <td class="num">${money(r.aged_inventory_fee)}</td>
                 <td class="num">${money(r.ad_cost)}</td>
-                <td class="num">${money(r.cogs_total)}</td>
+                <td class="num profit-cogs-cell" data-sku="${escapeHtml(r.sku)}" data-unit-cost="${r.unit_cost ?? ''}" data-inbound-per-unit="${r.inbound_shipping_per_unit ?? ''}" data-units="${r.units}" title="Click to edit COGS">${money(r.cogs_total)}${r.cogs_uploaded ? '' : ' <span style=\"color:#b35200;\">⚠</span>'}</td>
                 <td class="num">${money(r.return_processing_fee)}</td>
                 <td class="num">${money(r.removal_fee)}</td>
                 <td class="num ${marginClass(r.margin)}">${money(r.net)}</td>
                 <td class="num ${marginClass(r.margin)}">${r.margin}%</td>
               </tr>`;
           }).join('');
+          applyProfitSearchFilter();
           if (t) {
             profitFootEl.innerHTML = `
               <tr class="profit-totals-row">
@@ -3124,10 +3175,66 @@
     }
     profitBodyEl.addEventListener('click', (e) => {
       const a = e.target.closest('.profit-price-link');
-      if (!a) return;
-      e.preventDefault();
-      openPricesModal(a.dataset.sku);
+      if (a) {
+        e.preventDefault();
+        openPricesModal(a.dataset.sku);
+        return;
+      }
+      const cogsCell = e.target.closest('.profit-cogs-cell');
+      if (cogsCell && !cogsCell.classList.contains('editing')) {
+        openProfitCogsEditor(cogsCell);
+      }
     });
+
+    function openProfitCogsEditor(cell) {
+      const sku = cell.dataset.sku;
+      const unitCost = cell.dataset.unitCost !== '' ? parseFloat(cell.dataset.unitCost) : '';
+      const inbound = cell.dataset.inboundPerUnit !== '' ? parseFloat(cell.dataset.inboundPerUnit) : '';
+      const originalHTML = cell.innerHTML;
+      cell.classList.add('editing');
+      cell.innerHTML = `
+        <div style="display:flex;flex-direction:column;gap:3px;align-items:stretch;min-width:110px;">
+          <input type="number" class="pcogs-unit"    step="0.01" min="0.01" placeholder="Unit $" value="${unitCost}" style="width:100%;padding:2px 4px;font-size:11px;">
+          <input type="number" class="pcogs-inbound" step="0.01" min="0"    placeholder="Ship $/unit" value="${inbound}" style="width:100%;padding:2px 4px;font-size:11px;">
+          <div style="display:flex;gap:3px;">
+            <button type="button" class="pcogs-save" style="flex:1;font-size:11px;padding:2px;">Save</button>
+            <button type="button" class="pcogs-cancel" style="flex:1;font-size:11px;padding:2px;">Cancel</button>
+          </div>
+        </div>`;
+      const unitInp = cell.querySelector('.pcogs-unit');
+      unitInp.focus();
+      unitInp.select();
+      const restore = () => {
+        cell.classList.remove('editing');
+        cell.innerHTML = originalHTML;
+      };
+      cell.querySelector('.pcogs-cancel').addEventListener('click', restore);
+      cell.querySelector('.pcogs-save').addEventListener('click', async () => {
+        const unit_cost = parseFloat(cell.querySelector('.pcogs-unit').value);
+        const inbound_shipping_per_unit = parseFloat(cell.querySelector('.pcogs-inbound').value || 0);
+        if (!(unit_cost > 0)) {
+          alert('Unit cost must be > 0');
+          return;
+        }
+        try {
+          const r = await fetch(`/cogs/${encodeURIComponent(sku)}`, {
+            method: 'PUT',
+            headers: authHeaders({ 'content-type': 'application/json' }),
+            body: JSON.stringify({ unit_cost, inbound_shipping_per_unit }),
+          });
+          const j = await r.json();
+          if (j.error) throw new Error(j.error);
+          await loadProfitability();
+        } catch (err) {
+          alert(`Save failed: ${err.message || err}`);
+          restore();
+        }
+      });
+      cell.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') restore();
+        if (e.key === 'Enter') cell.querySelector('.pcogs-save').click();
+      });
+    }
 
     // ── COGS editor ─────────────────────────────────────
     let cogsFlashTimer = null;
