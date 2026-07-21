@@ -377,7 +377,9 @@ async def forecasting_restock(user: dict = Depends(protect)):
     now_utc = datetime.now(timezone.utc)
     default_weights = DEFAULT_PRODUCT_SETTINGS["velocity_weights"]
     weighted_by_sku: dict[str, float] = {}
+    orders_7d_by_sku: dict[str, int] = {}
     orders_30d_by_sku: dict[str, int] = {}
+    orders_60d_by_sku: dict[str, int] = {}
     stockout_days_by_sku: dict[str, int] = {}
     # Mongo returns naive UTC datetimes — strip the tz on the cutoff so
     # `date >= cutoff_90d` doesn't blow up on the naive/aware mismatch.
@@ -389,9 +391,14 @@ async def forecasting_restock(user: dict = Depends(protect)):
         wv = weighted_velocity(windows, default_weights)
         weighted_by_sku[sku_key] = float(wv) if wv is not None else 0.0
         for w in windows:
-            if int(w.get("period_days") or 0) == 30:
-                orders_30d_by_sku[sku_key] = int(w.get("units_sold") or 0)
-                break
+            pd_val = int(w.get("period_days") or 0)
+            units = int(w.get("units_sold") or 0)
+            if pd_val == 7:
+                orders_7d_by_sku[sku_key] = units
+            elif pd_val == 30:
+                orders_30d_by_sku[sku_key] = units
+            elif pd_val == 60:
+                orders_60d_by_sku[sku_key] = units
         # Live count of stockout-corrected days in the trailing 90d —
         # get_sales_daily runs `_flag_stockout_runs` on read, so any row
         # inside the window with the flag set is a missed-sales day.
@@ -508,7 +515,9 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "ordered": int(ordered_by_sku.get(sku) or 0),
             "avg_daily_demand": reorder.get("avg_daily_demand", 0),
             "weighted_velocity": round(weighted_by_sku.get(sku, 0.0), 2),
+            "orders_7d": int(orders_7d_by_sku.get(sku, 0)),
             "orders_30d": int(orders_30d_by_sku.get(sku, 0)),
+            "orders_60d": int(orders_60d_by_sku.get(sku, 0)),
             "next_30_day_forecast": round(next30, 1),
             "days_of_cover": days_of_cover_val,
             "stockout_date": stockout_date_iso,
