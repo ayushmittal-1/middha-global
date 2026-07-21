@@ -872,6 +872,8 @@ _FEE_TYPE_BUCKETS = [
     # Finances API FeeType strings, which have drifted over time)
     ("return_processing", ("returnfee", "refundcommission", "returnprocessingfee")),
     ("low_inventory", ("lowinventorylevelfee", "lowinventoryfee", "lowinventory")),
+    # FBAInboundConvenienceFee is how the inbound placement service fee posts
+    # in the Finances API — a shipment-level lump sum with NO SellerSKU.
     ("inbound_placement", ("inboundplacement", "inboundconvenience",
                            "inboundtransportationfee", "inboundplacementservice",
                            "fbainboundplacementservice", "placementservice",
@@ -1027,13 +1029,10 @@ async def get_financial_events(
         for evt in events.get("AdjustmentEventList") or []:
             adj_type = (evt.get("AdjustmentType") or "").lower()
             if any(h in adj_type for h in _PLACEMENT_ADJUSTMENT_HINTS):
-                adj_amt = evt.get("AdjustmentAmount") or {}
-                try:
-                    amt = float(adj_amt.get("CurrencyAmount", 0) or 0)
-                except (TypeError, ValueError, AttributeError):
-                    amt = 0.0
-                if amt:
-                    unattributed["inbound_placement"] += abs(amt)
+                # Prefer per-item amounts (may carry a SellerSKU); only fall
+                # back to the event-level total when no item amounts exist —
+                # counting both double-counts the same charge.
+                item_total = 0.0
                 for item in evt.get("AdjustmentItemList") or []:
                     sku = (item.get("SellerSKU") or "").strip()
                     amt_obj = item.get("PerUnitAmount") or item.get("TotalAmount") or {}
@@ -1044,15 +1043,18 @@ async def get_financial_events(
                     if item_amt:
                         target = by_sku[sku] if sku else unattributed
                         target["inbound_placement"] += abs(item_amt)
+                        item_total += abs(item_amt)
+                if item_total == 0.0:
+                    adj_amt = evt.get("AdjustmentAmount") or {}
+                    try:
+                        amt = float(adj_amt.get("CurrencyAmount", 0) or 0)
+                    except (TypeError, ValueError, AttributeError):
+                        amt = 0.0
+                    if amt:
+                        unattributed["inbound_placement"] += abs(amt)
                 continue
             if any(h in adj_type for h in _AGED_ADJUSTMENT_HINTS):
-                adj_amt = evt.get("AdjustmentAmount") or {}
-                try:
-                    amt = float(adj_amt.get("CurrencyAmount", 0) or 0)
-                except (TypeError, ValueError, AttributeError):
-                    amt = 0.0
-                if amt:
-                    unattributed["aged_inventory"] += abs(amt)
+                item_total = 0.0
                 for item in evt.get("AdjustmentItemList") or []:
                     sku = (item.get("SellerSKU") or "").strip()
                     amt_obj = item.get("PerUnitAmount") or item.get("TotalAmount") or {}
@@ -1063,6 +1065,15 @@ async def get_financial_events(
                     if item_amt:
                         target = by_sku[sku] if sku else unattributed
                         target["aged_inventory"] += abs(item_amt)
+                        item_total += abs(item_amt)
+                if item_total == 0.0:
+                    adj_amt = evt.get("AdjustmentAmount") or {}
+                    try:
+                        amt = float(adj_amt.get("CurrencyAmount", 0) or 0)
+                    except (TypeError, ValueError, AttributeError):
+                        amt = 0.0
+                    if amt:
+                        unattributed["aged_inventory"] += abs(amt)
                 continue
             if not any(h in adj_type for h in _REMOVAL_ADJUSTMENT_HINTS):
                 continue
@@ -1099,6 +1110,49 @@ async def get_financial_events(
         "pages": pages,
         "posted_after": posted_after,
     }
+
+
+async def fetch_placement_service_fees_by_shipment(
+    days_back: int = 365,
+    max_pages: int = 40,
+) -> dict[str, float]:
+    """Scan Finances ServiceFeeEventList for inbound placement service fees
+    (posted as FBAInboundConvenienceFee) grouped by FBA shipment id.
+
+    Placement fees post ~45 days after receipt as shipment-level lump sums
+    with NO SellerSKU — AmazonOrderId holds the FBA shipment id instead.
+    The caller joins these against Aurora's `shipments` collection (which
+    has per-SKU units received) to rebuild the per-SKU per-unit rates shown
+    in Seller Central's placement fee report.
+
+    Slow (Finances is 0.5 req/s); caller must cache the derived rates.
+    """
+    posted_after = (
+        datetime.now(timezone.utc) - timedelta(days=days_back)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    params: dict = {"PostedAfter": posted_after, "MaxResultsPerPage": 100}
+    by_shipment: dict[str, float] = defaultdict(float)
+    pages = 0
+    while pages < max_pages:
+        resp = await _sp_request(
+            "GET", "/finances/v0/financialEvents", params=params,
+        )
+        pages += 1
+        payload = resp.get("payload") or {}
+        events = payload.get("FinancialEvents") or {}
+        for evt in events.get("ServiceFeeEventList") or []:
+            if (evt.get("SellerSKU") or "").strip():
+                continue  # SKU-attributed fees flow through get_financial_events
+            shipment_id = (evt.get("AmazonOrderId") or "").strip()
+            for ftype, amt in _fees_from_lists(evt.get("FeeList")):
+                if _classify_fee_type(ftype) == "inbound_placement" and amt:
+                    by_shipment[shipment_id or "_unknown"] += abs(amt)
+        next_token = payload.get("NextToken")
+        if not next_token:
+            break
+        params = {"NextToken": next_token}
+        await asyncio.sleep(2.1)
+    return {k: round(v, 2) for k, v in by_shipment.items()}
 
 
 async def fetch_inbound_placement_fees_per_sku(

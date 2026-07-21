@@ -652,9 +652,21 @@ def _build_placement_rates(placement_per_sku: dict) -> tuple[dict[str, float], d
         by_sku[psku] = rate
         asin = (b.get("asin") or "").strip().upper()
         if asin:
-            # Prefer higher rate if multiple SKUs share an ASIN.
             by_asin[asin] = max(by_asin.get(asin, 0.0), rate)
     return by_sku, by_asin
+
+
+async def _placement_rates_from_finances_join(use_db: bool) -> dict:
+    """When the placement report is blocked (403), rebuild per-SKU rates from
+    Finances shipment-level placement charges joined with Aurora shipments."""
+    if not use_db:
+        return {}
+    fees_by_shipment = await amazon_sp.fetch_placement_service_fees_by_shipment()
+    placement_per_sku = await aurora_data.placement_rates_from_shipments(
+        require_user(), fees_by_shipment,
+    )
+    await put_placement_fee_cache(placement_per_sku, [], access_denied=True)
+    return placement_per_sku
 
 
 def _build_aged_monthly(aged_per_sku: dict) -> tuple[dict[str, float], dict[str, float]]:
@@ -1032,13 +1044,26 @@ async def compute_profitability_data(
         placement_per_sku: dict = {}
         need_placement_fetch = False
         if placement_cache_meta and placement_cache_meta.get("access_denied"):
-            placement_meta["source"] = "finances_fallback"
             placement_meta["access_denied"] = True
-            warnings.append(
-                "Inbound placement report unavailable — Amazon denied access (403). "
-                "Reconnect Amazon in Aurora Integration after enabling Reports access "
-                "in Seller Central. Using Finances API for this window."
-            )
+            # Report blocked (403) — rebuild per-SKU rates from Finances
+            # shipment-level placement fees joined with Aurora shipments.
+            placement_per_sku = placement_cache_meta.get("per_sku") or {}
+            if not placement_per_sku and use_db:
+                placement_per_sku = await _placement_rates_from_finances_join(use_db)
+            if placement_per_sku:
+                placement_meta["source"] = "finances_shipment_join"
+                placement_meta["sku_count"] = len(placement_per_sku)
+                placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
+                    placement_per_sku
+                )
+                placement_meta["resolved_skus"] = len(placement_avg_per_unit)
+            else:
+                placement_meta["source"] = "finances_fallback"
+                warnings.append(
+                    "Inbound placement report unavailable — Amazon denied access "
+                    "(403) and no placement fee events were found in Finances. "
+                    "Placement fees may show as 0."
+                )
         elif placement_cache_meta:
             placement_per_sku = placement_cache_meta.get("per_sku") or {}
             # Old cache lacked fee_bearing_units / asin — refresh for correct rates.
@@ -1076,11 +1101,34 @@ async def compute_profitability_data(
     except Exception as e:
         warnings.append(_sp_report_warning("Inbound placement", e))
         if _is_sp_access_denied(e):
-            await put_placement_fee_cache({}, [], access_denied=True)
             placement_meta["access_denied"] = True
-        placement_avg_per_unit = None
-        placement_avg_per_asin = {}
-        placement_meta["source"] = "finances_fallback"
+            placement_per_sku = {}
+            if use_db:
+                try:
+                    placement_per_sku = await _placement_rates_from_finances_join(use_db)
+                except Exception as join_err:
+                    warnings.append(
+                        f"Inbound placement Finances join failed ({join_err}); "
+                        "placement fees may show as 0."
+                    )
+                    await put_placement_fee_cache({}, [], access_denied=True)
+            else:
+                await put_placement_fee_cache({}, [], access_denied=True)
+            if placement_per_sku:
+                placement_meta["source"] = "finances_shipment_join"
+                placement_meta["sku_count"] = len(placement_per_sku)
+                placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
+                    placement_per_sku
+                )
+                placement_meta["resolved_skus"] = len(placement_avg_per_unit)
+            else:
+                placement_avg_per_unit = None
+                placement_avg_per_asin = {}
+                placement_meta["source"] = "finances_fallback"
+        else:
+            placement_avg_per_unit = None
+            placement_avg_per_asin = {}
+            placement_meta["source"] = "finances_fallback"
 
     aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
     try:
@@ -1262,36 +1310,43 @@ async def compute_profitability_data(
             (fin_sku.get("low_inventory", 0.0)
              + unattr_per_unit["low_inventory"] * units), 2)
 
-        # Inbound placement: report rate (fee-bearing units) × units sold, with
-        # Finances fallback when this SKU/ASIN is missing from the report.
-        # Use max(report, finance) so we never hide posted settlement fees.
+        # Inbound placement: per-unit rate × units sold — matches the rate
+        # column in Amazon's placement fee export. Rates come from the
+        # placement report, or from Finances shipment lump sums joined with
+        # Aurora shipments when the report is blocked. NEVER spread the
+        # unattributed Finances pool per unit sold: placement fees belong to
+        # inbound shipments, not to this window's sales, and doing so
+        # inflated per-unit placement ~60× (e.g. $10.03 vs $0.16).
         report_rate = _lookup_rate(
             placement_avg_per_unit, placement_avg_per_asin, sku, asin,
         )
-        report_placement = float(report_rate or 0) * units if report_rate else 0.0
-        finance_placement = (
-            float(fin_sku.get("inbound_placement", 0.0) or 0)
-            + unattr_per_unit["inbound_placement"] * units
-        )
-        if placement_avg_per_unit is None and not placement_avg_per_asin:
-            inbound_placement_fee = round(finance_placement, 2)
+        if report_rate:
+            inbound_placement_fee = round(float(report_rate) * units, 2)
         else:
-            inbound_placement_fee = round(max(report_placement, finance_placement), 2)
+            # Only fees Amazon explicitly attributed to this SKU.
+            inbound_placement_fee = round(
+                float(fin_sku.get("inbound_placement", 0.0) or 0), 2,
+            )
 
-        # Aged inventory: planning-report monthly projection × months in window,
-        # with Finances fallback when this SKU/ASIN has no projected AIS.
-        finance_aged = (
-            float(fin_sku.get("aged_inventory", 0.0) or 0)
-            + unattr_per_unit["aged_inventory"] * units
-        )
+        # Aged inventory: planning-report monthly projection × months in window.
+        # Same rule as placement — the unattributed Finances pool is only
+        # spread per unit when the report is unavailable, otherwise it
+        # inflates SKUs that never incurred the surcharge.
         if aged_monthly_per_sku is None:
-            aged_inventory_fee = round(finance_aged, 2)
+            aged_inventory_fee = round(
+                float(fin_sku.get("aged_inventory", 0.0) or 0)
+                + unattr_per_unit["aged_inventory"] * units, 2,
+            )
         else:
             monthly = _lookup_rate(
                 aged_monthly_per_sku, aged_monthly_per_asin, sku, asin,
             )
-            report_aged = float(monthly or 0) * months_in_window if monthly else 0.0
-            aged_inventory_fee = round(max(report_aged, finance_aged), 2)
+            if monthly:
+                aged_inventory_fee = round(float(monthly) * months_in_window, 2)
+            else:
+                aged_inventory_fee = round(
+                    float(fin_sku.get("aged_inventory", 0.0) or 0), 2,
+                )
 
         removal_fee = round(
             (fin_sku.get("removal", 0.0)
@@ -1368,9 +1423,10 @@ async def compute_profitability_data(
         f"Date range uses marketplace timezone ({mp_tz}) — same day boundaries as Aurora Orders.",
         "Units and revenue exclude Canceled, Cancelled, and Unfulfillable orders "
         "(same rules as the Aurora dashboard).",
-        "Inbound placement uses the 12-month placement report (fee ÷ units "
-        "received × units sold in this window). Finances API is only used when "
-        "that report is unavailable. Amazon often posts placement ~45 days "
+        "Inbound placement is per-unit rate × units sold — the rate comes from "
+        "Amazon's placement fee charges (report or Finances shipment charges "
+        "joined with your FBA shipments), matching the per-unit rate in the "
+        "Seller Central placement fee report. Amazon posts these ~45 days "
         "after inbound receipt.",
         "Storage uses GET_FBA_STORAGE_FEE_CHARGES_DATA: estimated monthly "
         "storage fee ÷ average quantity on hand × units sold (Revenue Calculator).",
@@ -1385,10 +1441,10 @@ async def compute_profitability_data(
     placement_total = totals_out.get("inbound_placement_fee", 0)
     if placement_total == 0:
         src = placement_meta.get("source")
-        if placement_meta.get("access_denied"):
+        if placement_meta.get("access_denied") and placement_meta.get("source") != "finances_shipment_join":
             caveats.append(
-                "Inbound placement: the 12-month placement report is blocked (403). "
-                "Finances API shows $0 for this window — either no placement was "
+                "Inbound placement: the placement report is blocked (403) and no "
+                "placement charges were found in Finances — either no placement was "
                 "charged yet (~45 days after inbound) or your inbound split had "
                 "$0 placement fees."
             )

@@ -362,8 +362,10 @@ async def get_placement_fee_cache(max_age_hours: int = 24) -> dict | None:
     per_sku = doc.get("perSku", {})
     months = doc.get("monthsCovered", [])
     if doc.get("accessDenied"):
+        # per_sku may still hold rates derived from Finances shipment-level
+        # placement fees joined with Aurora shipments (see agent.py).
         return {
-            "per_sku": {},
+            "per_sku": per_sku,
             "months_covered": months,
             "updated_at": updated.isoformat(),
             "access_denied": True,
