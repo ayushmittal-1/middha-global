@@ -648,6 +648,16 @@ async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
             "inbound_working": int(inv.get("inboundWorkingQuantity") or 0),
             "reserved": int(inv.get("reservedQuantity") or 0),
             "unfulfillable": int(inv.get("unfulfillableQuantity") or 0),
+            # Seller Central's Manage Inventory page displays "On-hand (FBA)"
+            # equal to "Available" (fulfillableQuantity) — Reserved,
+            # Unfulfillable, and Inbound are shown as separate, non-additive
+            # columns, NOT summed into on-hand. Verified directly against a
+            # live Seller Central export (2026-07-21): SKU ASG-KIWI Liquid
+            # Polish Black -TA8 showed On-hand 687 == Available 687 with
+            # Reserved 4 / Unfulfillable 0 tracked separately — confirming
+            # fulfillableQuantity is the correct on-hand value, not
+            # fulfillable + reserved + unfulfillable.
+            "on_hand": int(inv.get("fulfillableQuantity") or 0),
         }
     return out
 

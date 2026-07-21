@@ -198,18 +198,23 @@ def compute_reorder(
     shipments = shipments or []
 
     inv = inv_snapshot or {}
-    on_hand = int(inv.get("fulfillable", 0))
+    # Sellable units drive the depletion math; the reported `on_hand` is the
+    # Seller Central-style physical count (available + reserved + unfulfillable).
+    available = int(inv.get("fulfillable", 0))
     reserved = int(inv.get("reserved", 0))
     # Amazon-side "sent to FBA" — units checked in / in-transit at Amazon,
     # distinct from our own shipments-collection `inbound` sum.
     sent_to_fba = int(inv.get("inbound_shipped", 0))
     inbound_working = int(inv.get("inbound_working", 0))
     unfulfillable = int(inv.get("unfulfillable", 0))
+    # Seller Central-style physical on-hand for display.
+    on_hand = int(inv.get("on_hand") or (available + reserved + unfulfillable))
     inbound_outstanding = sum(int(s.get("qty_outstanding", 0)) for s in shipments)
 
     horizon_p50 = [float(r.get("p50", 0)) for r in forecast]
     empty_response = {
         "on_hand": on_hand,
+        "available": available,
         "reserved": reserved,
         "sent_to_fba": sent_to_fba,
         "inbound_working": inbound_working,
@@ -245,10 +250,10 @@ def compute_reorder(
 
     days_of_cover: float | None = None
     if avg_daily_overall > 0:
-        days_of_cover = (on_hand + inbound_outstanding) / avg_daily_overall
+        days_of_cover = (available + inbound_outstanding) / avg_daily_overall
 
     stockout_dt = _simulate_stockout_date(
-        on_hand=on_hand,
+        on_hand=available,
         daily_demand=avg_daily_overall,
         shipments=shipments,
         today=today,
@@ -272,7 +277,7 @@ def compute_reorder(
     # arrives, net of what's already inbound. Rough model — good enough
     # to drive the "how much to ship" column.
     target_units = target_cover * avg_daily_overall
-    raw_po = target_units - (on_hand + inbound_outstanding)
+    raw_po = target_units - (available + inbound_outstanding)
 
     # Sanity ceiling — same guard as before. Prophet on sparse SKUs can
     # balloon the projection; cap against recent 28-day rate × 180 days.
@@ -286,6 +291,7 @@ def compute_reorder(
 
     return {
         "on_hand": on_hand,
+        "available": available,
         "reserved": reserved,
         "sent_to_fba": sent_to_fba,
         "inbound_working": inbound_working,
