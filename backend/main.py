@@ -438,18 +438,32 @@ async def forecasting_restock(user: dict = Depends(protect)):
         # (e.g. delisted from Aurora but still in forecast_cache). `inbound`
         # comes from the shipments collection and stays on `reorder`.
         inv_row = inv_map.get(sku) or {}
-        on_hand = int(inv_row.get("fulfillable", reorder.get("on_hand", 0)) or 0)
+        # `available` = Amazon's fulfillable (currently sellable) quantity.
+        # Reorder/days-of-cover math below wants this — it explicitly adds
+        # `reserved` back on top to reconstruct total forward-looking stock.
+        available = int(
+            inv_row.get("fulfillable", reorder.get("available", reorder.get("on_hand", 0))) or 0
+        )
         reserved = int(inv_row.get("reserved", reorder.get("reserved", 0)) or 0)
         sent_to_fba = int(inv_row.get("inbound_shipped", reorder.get("sent_to_fba", 0)) or 0)
         inbound_working = int(inv_row.get("inbound_working", reorder.get("inbound_working", 0)) or 0)
         unfulfillable = int(inv_row.get("unfulfillable", reorder.get("unfulfillable", 0)) or 0)
+        # Seller Central "On-hand (FBA)" = Available + FC Transfer
+        # (pendingTransshipment). See latest_inventory_for_user.
+        fc_transfer = int(inv_row.get("fc_transfer") or 0)
+        on_hand = int(
+            inv_row.get("on_hand")
+            or (available + fc_transfer)
+            or reorder.get("on_hand", 0)
+            or 0
+        )
 
-        # Stock value = (on_hand + reserved + inbound + sent_to_fba) × unit landed cost.
+        # Stock value = (available + reserved + inbound + sent_to_fba) × unit landed cost.
         cogs = cogs_by_sku.get(sku) or {}
         unit_cost = float(cogs.get("unit_cost") or 0)
         unit_ship = float(cogs.get("inbound_shipping_per_unit") or 0)
         landed_cost = unit_cost + unit_ship
-        stock_units = on_hand + reserved + sent_to_fba + inbound_working
+        stock_units = available + reserved + sent_to_fba + inbound_working
         stock_value = round(stock_units * landed_cost, 2) if landed_cost > 0 else 0.0
 
         # Missed profit estimate — count stockout-corrected days in the
@@ -472,7 +486,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
         # cached values so we don't clobber a legitimate horizon-based
         # forecast with zeros.
         wv = weighted_by_sku.get(sku, 0.0)
-        stock_forward = on_hand + reserved + sent_to_fba + inbound_working
+        stock_forward = available + reserved + sent_to_fba + inbound_working
         days_of_cover_val = reorder.get("days_of_cover")
         stockout_date_iso = reorder.get("stockout_date")
         reorder_by_date_air_iso = reorder.get("reorder_by_date_air")
@@ -524,6 +538,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "listing_status": inv_row.get("listing_status"),
             "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
             "on_hand": on_hand,
+            "available": available,
             "reserved": reserved,
             "sent_to_fba": sent_to_fba,
             "inbound_working": inbound_working,
@@ -623,11 +638,22 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
     reorder = dict(c.get("reorder") or {})
     inv_map = await latest_inventory_for_user(_OID(str(user["_id"])))
     inv_row = inv_map.get(sku) or {}
-    on_hand = int(inv_row.get("fulfillable", reorder.get("on_hand", 0)) or 0)
+    available = int(
+        inv_row.get("fulfillable", reorder.get("available", reorder.get("on_hand", 0))) or 0
+    )
     reserved = int(inv_row.get("reserved", reorder.get("reserved", 0)) or 0)
     sent_to_fba = int(inv_row.get("inbound_shipped", reorder.get("sent_to_fba", 0)) or 0)
     inbound_working = int(inv_row.get("inbound_working", reorder.get("inbound_working", 0)) or 0)
-    stock_forward = on_hand + reserved + sent_to_fba + inbound_working
+    unfulfillable = int(inv_row.get("unfulfillable", reorder.get("unfulfillable", 0)) or 0)
+    # Seller Central "On-hand (FBA)" = Available + FC Transfer.
+    fc_transfer = int(inv_row.get("fc_transfer") or 0)
+    on_hand = int(
+        inv_row.get("on_hand")
+        or (available + fc_transfer)
+        or reorder.get("on_hand", 0)
+        or 0
+    )
+    stock_forward = available + reserved + sent_to_fba + inbound_working
     today_date = now_utc.date()
     if wv > 0 and stock_forward > 0:
         reorder["days_of_cover"] = round(stock_forward / wv, 1)
@@ -642,6 +668,7 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
             today_date, stockout_dt - _td(days=ocean_transit),
         ).isoformat()
     reorder["on_hand"] = on_hand
+    reorder["available"] = available
     reorder["reserved"] = reserved
     reorder["sent_to_fba"] = sent_to_fba
     reorder["inbound_working"] = inbound_working

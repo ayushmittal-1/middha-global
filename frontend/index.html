@@ -1677,7 +1677,7 @@
               <th>SKU</th>
               <th title="Amazon Standard Identification Number">ASIN</th>
               <th title="Fulfillment Network SKU — Amazon's internal barcode ID for FBA units">FNSKU</th>
-              <th class="num">On hand</th>
+              <th class="num" title="Seller Central On-hand (FBA) = Available + FC Transfer (pendingTransshipment). Reserved / Unfulfillable / Inbound are separate columns.">On hand</th>
               <th class="num" title="Units set aside by Amazon for pending customer orders / FC transfers / processing — not sellable right now">Reserved</th>
               <th class="num" title="Units Amazon has received into the network but not yet checked into the destination FC (inboundShippedQuantity)">Sent to FBA</th>
               <th class="num" title="Units on an inbound shipment plan you've created but not yet shipped (inboundWorkingQuantity)">Inbound working</th>
@@ -1697,7 +1697,7 @@
               <th class="num">Suggested qty</th>
               <th class="num" title="Amazon's own recommended restock quantity from the FBA Inventory Planning report (recommended-ship-in-quantity). Compare against our Suggested qty for a sanity check.">Amz rec qty</th>
               <th class="num" title="Units on your open purchase orders that haven't arrived at your warehouse / prep center yet">Ordered</th>
-              <th class="num" title="(On hand + Reserved + Sent to FBA + Inbound working) × landed cost from your COGS">Stock value</th>
+              <th class="num" title="(Available to sell + Reserved + Sent to FBA + Inbound working) × landed cost from your COGS">Stock value</th>
               <th class="num" title="Rough estimate of profit lost during stockout days over the last 90d, using ~25% margin on landed cost">Missed profit (est.)</th>
               <th title="Free-text notes for this SKU (set via the Actions menu)">Comment</th>
               <th title="Per-SKU manufacturing / forecast / packing / supplier settings">Actions</th>
@@ -1819,7 +1819,7 @@
               <th class="num" title="Selling Price × category referral fee % (Product Fees API)">Referral</th>
               <th class="num" title="FBA size-tier fulfillment fee per unit × units (Product Fees API)">FBA</th>
               <th class="num" title="Fuel and inflation surcharge from Product Fees API (split from fulfillment when bundled)">Fuel</th>
-              <th class="num" title="12-month inbound placement report: total fee ÷ units received × units sold">Inbound Placement</th>
+              <th class="num" title="Amazon placement charges ÷ units received × units sold — matches the per-unit rate in the Seller Central placement fee report">Inbound Placement</th>
               <th class="num" title="Low Inventory Level Fee from Finances API (45-day lookback)">Low Inv</th>
               <th class="num" title="FBA storage report: monthly fee ÷ avg units on hand × units sold">Storage</th>
               <th class="num" title="Aged Inventory Surcharge on inventory 181+ days (Finances API)">Aged Inv</th>
@@ -3023,9 +3023,9 @@
               ? `<strong>${escapeHtml(r.sku)}</strong>`
               : `<strong>${escapeHtml(r.sku)}</strong> <span title="No COGS uploaded" style="color:#b35200;">⚠</span>`;
             return `
-              <tr title="ASIN ${escapeHtml(r.asin || '—')}" data-sku="${escapeHtml((r.sku || '').toLowerCase())}" data-asin="${escapeHtml((r.asin || '').toLowerCase())}">
+              <tr data-sku="${escapeHtml((r.sku || '').toLowerCase())}" data-asin="${escapeHtml((r.asin || '').toLowerCase())}">
                 <td>${skuLabel}</td>
-                <td title="${escapeHtml(r.asin || '')}">${escapeHtml(r.asin || '—')}</td>
+                <td title="ASIN ${escapeHtml(r.asin || '—')}">${escapeHtml(r.asin || '—')}</td>
                 <td class="num">${r.units}</td>
                 <td class="num"><a href="#" class="profit-price-link" data-sku="${escapeHtml(r.sku)}" title="Click to see every unit's price">${money(r.avg_price)}</a></td>
                 <td class="num">${money(r.revenue)}</td>

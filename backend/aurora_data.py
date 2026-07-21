@@ -173,6 +173,68 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
     return out
 
 
+async def placement_rates_from_shipments(
+    user: dict,
+    fees_by_shipment: dict[str, float],
+) -> dict[str, dict]:
+    """Rebuild per-SKU inbound placement fees from shipment-level Finances
+    lump sums (FBAInboundConvenienceFee, keyed by FBA shipment id) joined
+    with Aurora `shipments.lineItems` units received.
+
+    Returns the same shape as amazon_sp.fetch_inbound_placement_fees_per_sku:
+    {sku: {fee_total, units_received, fee_bearing_units, asin}} so the
+    caller's rate-building and cache format are unchanged.
+    """
+    if not fees_by_shipment:
+        return {}
+    seller_id = ObjectId(str(user["_id"]))
+    ship_ids = [sid for sid in fees_by_shipment if sid and sid != "_unknown"]
+    if not ship_ids:
+        return {}
+    cursor = _db().shipments.find(
+        {"sellerId": seller_id, "shipmentId": {"$in": ship_ids}},
+        {"shipmentId": 1, "lineItems": 1},
+    )
+    per_sku: dict[str, dict] = {}
+    async for doc in cursor:
+        fee = float(fees_by_shipment.get(doc.get("shipmentId")) or 0)
+        items = doc.get("lineItems") or []
+        total_units = sum(
+            max(int(it.get("unitsReceived") or 0), 0) for it in items
+        )
+        if fee <= 0 or total_units <= 0:
+            continue
+        # Allocate the shipment's lump sum across SKUs by units received —
+        # the per-unit rate within one shipment is near-uniform (size tier).
+        for it in items:
+            units = max(int(it.get("unitsReceived") or 0), 0)
+            sku = (it.get("sku") or "").strip()
+            if units <= 0 or not sku:
+                continue
+            bucket = per_sku.setdefault(
+                sku,
+                {"fee_total": 0.0, "units_received": 0,
+                 "fee_bearing_units": 0, "asin": None},
+            )
+            bucket["fee_total"] += fee * units / total_units
+            bucket["units_received"] += units
+            bucket["fee_bearing_units"] += units
+    if not per_sku:
+        return {}
+    prod_cursor = _db().products.find(
+        {"sellerId": seller_id, "sku": {"$in": list(per_sku.keys())}},
+        {"sku": 1, "asin": 1},
+    )
+    async for doc in prod_cursor:
+        bucket = per_sku.get(doc.get("sku"))
+        if bucket is not None and doc.get("asin"):
+            bucket["asin"] = str(doc["asin"]).upper()
+    return {
+        sku: {**b, "fee_total": round(b["fee_total"], 2)}
+        for sku, b in per_sku.items()
+    }
+
+
 def list_user_marketplaces(user: dict) -> list[dict]:
     ids = user.get("amazonMarketplaceIds") or []
     if not ids:

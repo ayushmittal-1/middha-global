@@ -369,8 +369,10 @@ async def get_placement_fee_cache(max_age_hours: int = 24) -> dict | None:
     per_sku = doc.get("perSku", {})
     months = doc.get("monthsCovered", [])
     if doc.get("accessDenied"):
+        # per_sku may still hold rates derived from Finances shipment-level
+        # placement fees joined with Aurora shipments (see agent.py).
         return {
-            "per_sku": {},
+            "per_sku": per_sku,
             "months_covered": months,
             "updated_at": updated.isoformat(),
             "access_denied": True,
@@ -690,6 +692,17 @@ async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
             "inbound_working": int(inv.get("inboundWorkingQuantity") or 0),
             "reserved": int(inv.get("reservedQuantity") or 0),
             "unfulfillable": int(inv.get("unfulfillableQuantity") or 0),
+            # Seller Central "On-hand (FBA)" = Available + FC Transfer
+            # (pendingTransshipment). Reserved (customer orders + FC
+            # processing), Unfulfillable, and Inbound are separate columns
+            # and are NOT part of on-hand. Verified 2026-07-21 against live
+            # Manage Inventory: Liquid Polish Brown 555+4=559; Shoe Shine
+            # Sponge Black 88+1=89; Sponge Combo 101+6=107.
+            "fc_transfer": int(inv.get("reservedPendingTransshipment") or 0),
+            "on_hand": (
+                int(inv.get("fulfillableQuantity") or 0)
+                + int(inv.get("reservedPendingTransshipment") or 0)
+            ),
         }
     return out
 
