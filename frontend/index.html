@@ -1670,6 +1670,7 @@
             <tr>
               <th>SKU</th>
               <th title="Amazon Standard Identification Number">ASIN</th>
+              <th title="Fulfillment Network SKU — Amazon's internal barcode ID for FBA units">FNSKU</th>
               <th class="num">On hand</th>
               <th class="num" title="Units set aside by Amazon for pending customer orders / FC transfers / processing — not sellable right now">Reserved</th>
               <th class="num" title="Units Amazon has received into the network but not yet checked into the destination FC (inboundShippedQuantity)">Sent to FBA</th>
@@ -1678,7 +1679,7 @@
               <!-- <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th> -->
               <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next arrival</th>
               <th class="num" title="Weighted sales velocity — 0.5×v3d + 0.3×v7d + 0.2×v30d (out-of-stock days excluded)">Orders Velocity</th>
-              <th class="num" title="Units sold in the selected window (Aurora orders, cancelled/pending excluded)"><span id="restock-orders-header">Orders (30d)</span></th>
+              <th class="num" title="Average units sold per day over the selected window (units sold ÷ window size; Aurora orders, cancelled/pending excluded)"><span id="restock-orders-header">Orders/day (30d)</span></th>
               <!-- <th class="num" title="Total units sold in the selected window (Aurora orders, cancelled/pending excluded)"><span id="restock-units-header">Units (30d)</span></th> -->
               <th class="num">30-day forecast</th>
               <th>Days of cover</th>
@@ -2557,7 +2558,7 @@
       const q = (restockSearchEl.value || '').trim().toLowerCase();
       const ordersWindow = parseInt(restockOrdersWindowEl.value, 10) || 30;
       const ordersField = `orders_${ordersWindow}d`;
-      if (restockOrdersHeaderEl) restockOrdersHeaderEl.textContent = `Orders (${ordersWindow}d)`;
+      if (restockOrdersHeaderEl) restockOrdersHeaderEl.textContent = `Orders/day (${ordersWindow}d)`;
 
       let visible = showAll
         ? restockCache
@@ -2616,6 +2617,7 @@
             <span class="sku-name">${escapeHtml(truncateSku(row.sku))}</span>${notBuyableBadge}
           </td>
           <td title="${escapeHtml(row.asin || '')}">${escapeHtml(row.asin || '—')}</td>
+          <td title="${escapeHtml(row.fnsku || '')}">${escapeHtml(row.fnsku || '—')}</td>
           <td class="num">${fmtRestockNum(row.on_hand ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.reserved ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.sent_to_fba ?? 0)}</td>
@@ -2624,7 +2626,7 @@
           <!-- <td class="num" title="${inboundTip}">${fmtRestockNum(row.inbound ?? 0)}</td> -->
           <td title="${inboundTip}">${nextArrivalCell}</td>
           <td class="num">${fmtRestockNum(row.weighted_velocity ?? 0, 2)}</td>
-          <td class="num">${fmtRestockNum(row[ordersField] ?? 0)}</td>
+          <td class="num">${fmtRestockNum((row[ordersField] ?? 0) / ordersWindow, 2)}</td>
           <!-- <td class="num restock-units-cell">${fmtRestockNum(row.units_30d ?? 0)}</td> -->
           <td class="num">${fmtRestockNum(row.next_30_day_forecast ?? 0, 1)}</td>
           <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>

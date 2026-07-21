@@ -501,6 +501,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
         rows.append({
             "sku": sku,
             "asin": c.get("asin"),
+            "fnsku": inv_row.get("fnsku"),
             "method": c.get("method"),
             "is_buyable": is_buyable,
             "status": inv_row.get("status"),
