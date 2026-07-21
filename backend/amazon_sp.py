@@ -1243,14 +1243,12 @@ async def fetch_aged_inventory_fees_per_sku() -> dict:
             continue
         monthly_fee = sum(_f(row.get(c)) for c in ais_fee_cols)
         aged_units = sum(_i(row.get(c)) for c in ais_qty_cols)
-        # Amazon's own restock signals from the same report — used by the
-        # Restock dashboard's HDOS and "recommended ship qty" columns.
+        # HDOS is a bonus surfaced from this same report — the Restock
+        # tab uses it. `recommended-ship-in-quantity` used to live here
+        # too but it's actually in GET_RESTOCK_INVENTORY_RECOMMENDATIONS_REPORT;
+        # see fetch_restock_recommendations_per_sku().
         hdos_raw = row.get("historical-days-of-supply")
-        rec_qty_raw = row.get("recommended-ship-in-quantity")
-        rec_date_raw = (row.get("recommended-ship-in-date") or "").strip() or None
-        has_supplement = any(
-            v not in (None, "") for v in (hdos_raw, rec_qty_raw, rec_date_raw)
-        )
+        has_supplement = hdos_raw not in (None, "")
         if monthly_fee == 0 and aged_units == 0 and not has_supplement:
             continue
         bucket = per_sku.setdefault(
@@ -1259,25 +1257,16 @@ async def fetch_aged_inventory_fees_per_sku() -> dict:
                 "monthly_fee": 0.0,
                 "total_aged_units": 0,
                 "historical_days_of_supply": None,
-                "recommended_ship_in_quantity": None,
-                "recommended_ship_in_date": None,
             },
         )
         # A SKU can appear once per (fnsku, marketplace) — sum defensively
-        # for fees/units. Take the max HDOS and the sum of recommended-ship
-        # quantities so a multi-FC SKU still surfaces a sensible signal.
+        # for fees/units. Take the max HDOS across duplicate rows.
         bucket["monthly_fee"] += monthly_fee
         bucket["total_aged_units"] += aged_units
         if hdos_raw not in (None, ""):
             v = _f(hdos_raw)
             prev = bucket["historical_days_of_supply"]
             bucket["historical_days_of_supply"] = v if prev is None else max(prev, v)
-        if rec_qty_raw not in (None, ""):
-            v = _i(rec_qty_raw)
-            prev = bucket["recommended_ship_in_quantity"] or 0
-            bucket["recommended_ship_in_quantity"] = prev + v
-        if rec_date_raw and not bucket["recommended_ship_in_date"]:
-            bucket["recommended_ship_in_date"] = rec_date_raw
 
     return {
         sku: {
@@ -1287,11 +1276,73 @@ async def fetch_aged_inventory_fees_per_sku() -> dict:
                 round(v["historical_days_of_supply"], 1)
                 if v["historical_days_of_supply"] is not None else None
             ),
-            "recommended_ship_in_quantity": v["recommended_ship_in_quantity"],
-            "recommended_ship_in_date": v["recommended_ship_in_date"],
         }
         for sku, v in per_sku.items()
     }
+
+
+async def fetch_restock_recommendations_per_sku() -> dict:
+    """Pull GET_RESTOCK_INVENTORY_RECOMMENDATIONS_REPORT — Amazon's own
+    per-SKU recommended restock quantity and ship-by date.
+
+    Returns {sku: {"recommended_replenishment_qty": N,
+                    "recommended_ship_date": "YYYY-MM-DD"}}.
+    Caller is responsible for caching — the report takes 30-120 s to
+    generate.
+    """
+    create_resp = await create_report(
+        "GET_RESTOCK_INVENTORY_RECOMMENDATIONS_REPORT",
+        single_marketplace=True,
+    )
+    report_id = create_resp.get("reportId")
+    if not report_id:
+        raise RuntimeError(
+            f"Restock recommendations report create returned no id: {create_resp}"
+        )
+    text = await download_report_raw(report_id, max_polls=30, poll_interval=10)
+
+    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+
+    def _i(v):
+        try:
+            return int(float(v)) if v not in (None, "") else 0
+        except (TypeError, ValueError):
+            return 0
+
+    per_sku: dict[str, dict] = {}
+    for row in reader:
+        # Column name varies: "merchant-sku" in v2, "sku" in older versions.
+        sku = (
+            row.get("merchant-sku")
+            or row.get("sku")
+            or row.get("seller-sku")
+            or ""
+        ).strip()
+        if not sku:
+            continue
+        # Amazon's actual restock recommendation columns.
+        qty_raw = (
+            row.get("recommended-replenishment-qty-for-amazon")
+            or row.get("recommended-inbound-qty-for-amazon")
+        )
+        date_raw = (row.get("recommended-ship-date-for-amazon") or "").strip() or None
+        if qty_raw in (None, "") and not date_raw:
+            continue
+        bucket = per_sku.setdefault(
+            sku,
+            {"recommended_replenishment_qty": 0, "recommended_ship_date": None},
+        )
+        # A SKU can appear across FCs / marketplaces — sum quantities and
+        # keep the earliest ship-by date.
+        if qty_raw not in (None, ""):
+            bucket["recommended_replenishment_qty"] += _i(qty_raw)
+        if date_raw and (
+            bucket["recommended_ship_date"] is None
+            or date_raw < bucket["recommended_ship_date"]
+        ):
+            bucket["recommended_ship_date"] = date_raw
+
+    return per_sku
 
 
 # ── FBA Inventory API (v1) ───────────────────────────────────────────────────
