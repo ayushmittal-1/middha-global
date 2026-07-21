@@ -1695,7 +1695,9 @@
               <th title="Latest date to dispatch a shipment via ocean freight (~45d transit to Amazon FC)">Ship by (Ocean)</th>
               <th class="num" title="Days until you need to dispatch by air (delta from today to Ship by Air). Negative = you're late.">Days until next order</th>
               <th class="num">Suggested qty</th>
-              <th class="num" title="Amazon's own recommended restock quantity from the FBA Inventory Planning report (recommended-ship-in-quantity). Compare against our Suggested qty for a sanity check.">Amz rec qty</th>
+              <!-- Amz rec qty temporarily hidden — Restock Recommendations report column names need normalization before values will fill. Uncomment once the fix ships.
+              <th class="num" title="Amazon's own recommended restock quantity from the Restock Recommendations report. Compare against our Suggested qty for a sanity check.">Amz rec qty</th>
+              -->
               <th class="num" title="Units on your open purchase orders that haven't arrived at your warehouse / prep center yet">Ordered</th>
               <th class="num" title="(Available to sell + Reserved + Sent to FBA + Inbound working) × landed cost from your COGS">Stock value</th>
               <th class="num" title="Rough estimate of profit lost during stockout days over the last 90d, using ~25% margin on landed cost">Missed profit (est.)</th>
@@ -2659,7 +2661,7 @@
           <td class="date-cell" title="${oceanTip}">${fmtRestockDate(row.reorder_by_date_ocean ?? row.reorder_by_date_sea)}</td>
           <td class="num">${fmtDaysUntil(row.days_until_next_order)}</td>
           <td class="num num-strong">${isBuyable ? fmtRestockNum(row.recommended_po_qty ?? 0) : '—'}</td>
-          <td class="num" title="Amazon's recommended ship-in quantity${row.amazon_recommended_ship_date ? ' (by ' + row.amazon_recommended_ship_date + ')' : ''}. Blank when the Inventory Planning report hasn't been generated in the last 24h.">${row.amazon_recommended_ship_qty == null ? '<span style="color:#888;">—</span>' : fmtRestockNum(row.amazon_recommended_ship_qty)}</td>
+          <!-- <td class="num">${row.amazon_recommended_ship_qty == null ? '—' : fmtRestockNum(row.amazon_recommended_ship_qty)}</td> -->
           <td class="num">${fmtRestockNum(row.ordered ?? 0)}</td>
           <td class="num">${row.stock_value > 0 ? '$' + fmtRestockNum(row.stock_value, 2) : '—'}</td>
           <td class="num">${row.missed_profit_est > 0 ? '$' + fmtRestockNum(row.missed_profit_est, 2) : '$0.00'}</td>
