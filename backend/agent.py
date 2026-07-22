@@ -1031,14 +1031,20 @@ async def compute_profitability_data(
         except Exception as e:
             warnings.append(_sp_report_warning("Storage", e))
 
-    # Finances fees (low inv, placement settlements, returns) often post weeks
-    # after the related sale/inbound event — look back 45 days before the window.
+    # Finances fees (low inv, placement settlements) often post weeks
+    # after the related sale/inbound event — look back 45 days before
+    # the window for those. But refunds must be bounded to the actual
+    # window: counting May's refund events against a June 1–10 window
+    # inflates return_processing_fee and returned_units for pre-window
+    # sales that the seller doesn't see as returns "in" the window.
     fin_posted_after = utc_instant_to_iso_z(start_dt - timedelta(days=45))
+    refund_posted_after = utc_instant_to_iso_z(start_dt)
     try:
         fin = await amazon_sp.get_financial_events(
             posted_after=fin_posted_after,
             posted_before=created_before,
             paginate=True,
+            refund_posted_after=refund_posted_after,
         )
         fin_by_sku = fin.get("by_sku") or {}
         unattributed_fees = fin.get("unattributed") or unattributed_fees

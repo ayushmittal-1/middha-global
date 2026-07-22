@@ -951,6 +951,7 @@ async def get_financial_events(
     posted_before: str | None = None,
     paginate: bool = True,
     max_pages: int = 20,
+    refund_posted_after: str | None = None,
 ) -> dict:
     """Pull ListFinancialEvents for the window and normalize into per-SKU
     fee buckets. Returns:
@@ -1011,6 +1012,15 @@ async def get_financial_events(
                     target[bucket] += abs(amt)
 
         for evt in events.get("RefundEventList") or []:
+            # Bound refund aggregation to the caller's true window. The
+            # outer 45-day pre-window is meant for late-posting fees like
+            # placement/aged (which post ~45d after shipment receipt),
+            # NOT refunds — a return posted in mid-May shouldn't inflate
+            # the June profitability row's return_processing_fee.
+            if refund_posted_after:
+                posted = evt.get("PostedDate") or ""
+                if posted and posted < refund_posted_after:
+                    continue
             for item in (evt.get("ShipmentItemAdjustmentList")
                          or evt.get("ShipmentItemList") or []):
                 sku = (item.get("SellerSKU") or "").strip()
