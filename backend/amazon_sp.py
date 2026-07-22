@@ -909,6 +909,12 @@ def _empty_fee_bucket() -> dict:
         "inbound_placement": 0.0,
         "aged_inventory": 0.0,
         "removal": 0.0,
+        # Count of units Amazon posted a refund for in the window. Sourced
+        # from RefundEventList[].ShipmentItemAdjustmentList[].QuantityShipped.
+        # Used by /profitability to compute return_processing_fee as
+        # 20% × referral_per_unit × returned_units, matching the standard
+        # FBA Returns Processing Fee policy (client-confirmed).
+        "returned_units": 0,
     }
 
 
@@ -1001,6 +1007,25 @@ async def get_financial_events(
             for item in (evt.get("ShipmentItemAdjustmentList")
                          or evt.get("ShipmentItemList") or []):
                 sku = (item.get("SellerSKU") or "").strip()
+                # Count returned units per SKU so /profitability can apply
+                # the 20% × referral_per_unit × returned_units rule.
+                # ShipmentItemAdjustmentList entries can carry negative
+                # QuantityShipped (Amazon reports refunds as negative);
+                # abs() and int() so we always get a positive count.
+                qty_raw = (
+                    item.get("QuantityShipped")
+                    or item.get("QuantityAdjusted")
+                    or 0
+                )
+                try:
+                    returned_qty = abs(int(qty_raw))
+                except (TypeError, ValueError):
+                    returned_qty = 0
+                if sku and returned_qty > 0:
+                    by_sku[sku]["returned_units"] += returned_qty
+                elif returned_qty > 0:
+                    unattributed["returned_units"] += returned_qty
+
                 for ftype, amt in _fees_from_lists(
                     item.get("ItemFeeAdjustmentList") or item.get("ItemFeeList"),
                 ):
