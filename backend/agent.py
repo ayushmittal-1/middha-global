@@ -1214,16 +1214,17 @@ async def compute_profitability_data(
             await put_aged_surcharge_charges_cache(
                 {}, charges_start_iso, charges_end_iso, access_denied=True,
             )
-        # Prefer planning estimated-ais (SKU-only) over Finances — Finances
-        # often posts AIS without SellerSKU, which previously left Aged Inv
-        # at $0 for every row after a FATAL charges report.
+        # Prefer planning estimated-ais (SKU-only) over Finances only when
+        # BOTH create and DONE-report reuse failed. Finances posts AIS as a
+        # lumped unattributed total (no SellerSKU), which left every row at $0.
         if planning_aged_by_sku:
             aged_charges_by_sku = dict(planning_aged_by_sku)
             aged_charges_meta["source"] = "planning_estimate_fallback"
             warnings.append(
-                "Aged Inv: using Inventory Planning estimated-ais totals "
-                "(charges report unavailable). These are Amazon's projections, "
-                "not the final amount-charged from the Aged Inventory Surcharge report."
+                "Aged Inv: could not load the Aged Inventory Surcharge charges "
+                "report (create FATAL and no reusable DONE report). Showing "
+                "Inventory Planning estimated-ais totals — these will NOT match "
+                "Seller Central amount-charged. Retry later."
             )
         else:
             aged_charges_by_sku = None
