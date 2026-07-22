@@ -173,6 +173,77 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
     return out
 
 
+async def fba_aged_inventory_by_sku(user: dict) -> Optional[dict[str, dict]]:
+    """Read Aurora's `fbaagedinventoryfees` snapshot for this seller.
+
+    Aurora's fbaAgedInventorySyncService runs from inventorySyncService and
+    persists per-SKU projections from GET_FBA_INVENTORY_PLANNING_DATA:
+      { monthlyFee, totalAgedUnits, asin, historicalDaysOfSupply }.
+
+    Returns None when the collection has no doc for this seller (Aurora
+    hasn't synced yet). Returns an empty dict when the doc exists but is
+    empty (Aurora synced, no aged inventory) — caller can distinguish
+    "not synced" from "no charges" by the None vs {} return.
+    """
+    seller_id = ObjectId(str(user["_id"]))
+    doc = await _db().fbaagedinventoryfees.find_one({"sellerId": seller_id})
+    if not doc:
+        return None
+    per_sku_raw = doc.get("perSku") or {}
+    # Normalize the JS camelCase to Python snake_case so consumers don't
+    # need to know which side wrote the doc.
+    out: dict[str, dict] = {}
+    for sku, v in per_sku_raw.items():
+        if not isinstance(v, dict):
+            continue
+        out[sku] = {
+            "monthly_fee": float(v.get("monthlyFee") or 0.0),
+            "total_aged_units": int(v.get("totalAgedUnits") or 0),
+            "asin": v.get("asin"),
+            "historical_days_of_supply": (
+                float(v["historicalDaysOfSupply"])
+                if v.get("historicalDaysOfSupply") is not None else None
+            ),
+        }
+    return out
+
+
+async def fba_inbound_placement_by_sku(user: dict) -> Optional[dict[str, dict]]:
+    """Read Aurora's `fbainboundplacementfees` snapshot for this seller.
+
+    Aurora's fbaInboundPlacementSyncService persists per-SKU inbound
+    placement fees:
+      { totalUnits, totalFee, avgFeePerUnit, asin }
+    plus a top-level `source: 'report' | 'finances_join'` marker.
+
+    Returns the shape used by agent._build_placement_rates:
+      {sku: {fee_total, units_received, fee_bearing_units, asin}}
+    so the caller's rate-building code is unchanged.
+
+    Returns None when the collection has no doc for this seller.
+    """
+    seller_id = ObjectId(str(user["_id"]))
+    doc = await _db().fbainboundplacementfees.find_one({"sellerId": seller_id})
+    if not doc:
+        return None
+    per_sku_raw = doc.get("perSku") or {}
+    out: dict[str, dict] = {}
+    for sku, v in per_sku_raw.items():
+        if not isinstance(v, dict):
+            continue
+        units = int(v.get("totalUnits") or 0)
+        fee = float(v.get("totalFee") or 0.0)
+        if units <= 0 or fee <= 0:
+            continue
+        out[sku] = {
+            "fee_total": fee,
+            "units_received": units,
+            "fee_bearing_units": units,
+            "asin": v.get("asin"),
+        }
+    return out
+
+
 async def placement_rates_from_shipments(
     user: dict,
     fees_by_shipment: dict[str, float],

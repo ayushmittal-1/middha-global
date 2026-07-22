@@ -361,9 +361,21 @@ async def forecasting_restock(user: dict = Depends(protect)):
     # come from the FBA Inventory Planning report. Read-only from cache here —
     # the report takes 30-120s to generate, so we let /profitability warm it
     # and just consume the fresh copy when it's available.
-    from database import get_aged_inventory_cache
-    aged_cache = await get_aged_inventory_cache(max_age_hours=24)
-    aged_supplements: dict[str, dict] = (aged_cache or {}).get("per_sku", {})
+    # Prefer Aurora's fbaagedinventoryfees snapshot when populated — it
+    # carries the same fields (monthly_fee, historical_days_of_supply) as
+    # our legacy cache. Falls back to the SP-API-driven cache otherwise.
+    import aurora_data
+    aged_supplements: dict[str, dict] = {}
+    try:
+        aurora_aged = await aurora_data.fba_aged_inventory_by_sku(user)
+    except Exception:
+        aurora_aged = None
+    if aurora_aged:
+        aged_supplements = aurora_aged
+    else:
+        from database import get_aged_inventory_cache
+        aged_cache = await get_aged_inventory_cache(max_age_hours=24)
+        aged_supplements = (aged_cache or {}).get("per_sku", {})
     # Fresh read — buyability can flip Active/Inactive between forecast
     # refreshes, and we want the UI to reflect that instantly rather than
     # waiting for the next cache rebuild.
