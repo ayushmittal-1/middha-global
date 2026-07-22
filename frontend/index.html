@@ -904,6 +904,20 @@
       outline: 1px dashed #93c5fd;
     }
     .profit-cogs-cell.editing { background: #fff8e1; }
+    /* Ads column: Amazon's Ads API doesn't expose per-SKU spend, so we
+       don't fake per-row attribution. Total lives on the top KPI tile.
+       Cells stack a small "BLENDED" tag vertically so the column reads
+       as intentionally not-per-SKU rather than empty. */
+    .profit-ads-blended {
+      color: #94a3b8;
+      font-size: 10px;
+      letter-spacing: 2px;
+      font-weight: 600;
+      writing-mode: vertical-rl;
+      transform: rotate(180deg);
+      display: inline-block;
+      padding: 4px 0;
+    }
     #profit-table-wrap tfoot .profit-totals-label {
       font-weight: 700;
       color: #0f172a;
@@ -1825,7 +1839,7 @@
               <th class="num" title="Low Inventory Level Fee from Finances API (45-day lookback)">Low Inv</th>
               <th class="num" title="FBA storage report: monthly fee ÷ avg units on hand × units sold">Storage</th>
               <th class="num" title="Seller Central Aged Inventory Surcharge report: sum of amount-charged per SKU for months in the window">Aged Inv</th>
-              <th class="num" title="Ad spend pro-rated to window, allocated per unit">Ads</th>
+              <th class="num" title="Amazon's Ads API doesn't expose per-SKU spend, so ads are blended across the account. See the account-level total in the top 'Ad spend' KPI tile.">Ads</th>
               <th class="num" title="Product cost + your inbound shipping to Amazon (from your CSV)">COGS</th>
               <th class="num" title="20% of referral fee, on returned orders (Finances API)">Return Proc</th>
               <th class="num" title="Amazon removal / disposal fees allocated per unit (Finances API)">Removal</th>
@@ -3038,7 +3052,7 @@
                 <td class="num">${money(r.low_inventory_fee)}</td>
                 <td class="num">${money(r.storage_fee)}</td>
                 <td class="num">${money(r.aged_inventory_fee)}</td>
-                <td class="num">${money(r.ad_cost)}</td>
+                <td class="num" title="Ads are blended across the account — see the top KPI tile"><span class="profit-ads-blended">BLENDED</span></td>
                 <td class="num profit-cogs-cell" data-sku="${escapeHtml(r.sku)}" data-unit-cost="${r.unit_cost ?? ''}" data-inbound-per-unit="${r.inbound_shipping_per_unit ?? ''}" data-units="${r.units}" title="Click to edit COGS">${money(r.cogs_total)}${r.cogs_uploaded ? '' : ' <span style=\"color:#b35200;\">⚠</span>'}</td>
                 <td class="num">${money(r.return_processing_fee)}</td>
                 <td class="num">${money(r.removal_fee)}</td>
@@ -3062,7 +3076,7 @@
                 <td class="num">${money(t.low_inventory_fee)}</td>
                 <td class="num">${money(t.storage_fee)}</td>
                 <td class="num">${money(t.aged_inventory_fee)}</td>
-                <td class="num">${money(t.ad_cost)}</td>
+                <td class="num" title="Account-level total — same as the 'Ad spend' KPI tile"><span class="profit-ads-blended">${money(t.ad_cost)}</span></td>
                 <td class="num">${money(t.cogs_total)}</td>
                 <td class="num">${money(t.return_processing_fee)}</td>
                 <td class="num">${money(t.removal_fee)}</td>
