@@ -1399,39 +1399,31 @@ async def fetch_aged_surcharge_charges_per_sku(
     age tier for the event month. Sum those into a per-SKU total so
     Profitability can match Seller Central dollar-for-dollar.
 
+    Amazon requires dataStartTime→dataEndTime to equal **exactly one
+    calendar month** per request (otherwise the report goes FATAL). We
+    issue one request per overlapping month and merge.
+
     Returns {sku: {charged_total, qty_charged, asin}}.
     """
-    # AIS posts mid-month (typically the 15th). Expand to full calendar
-    # months that overlap the profitability window so a short window that
-    # includes the charge date still picks up the month's charges.
-    start_month = start.astimezone(timezone.utc).replace(
-        day=1, hour=0, minute=0, second=0, microsecond=0,
-    )
-    end_utc = end.astimezone(timezone.utc)
-    if end_utc.month == 12:
-        end_month_exclusive = end_utc.replace(
-            year=end_utc.year + 1, month=1, day=1,
-            hour=0, minute=0, second=0, microsecond=0,
-        )
-    else:
-        end_month_exclusive = end_utc.replace(
-            month=end_utc.month + 1, day=1,
-            hour=0, minute=0, second=0, microsecond=0,
-        )
-    create_resp = await create_report(
-        "GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA",
-        start_date=start_month.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        end_date=end_month_exclusive.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        single_marketplace=True,
-    )
-    report_id = create_resp.get("reportId")
-    if not report_id:
-        raise RuntimeError(
-            f"Aged surcharge charges report create returned no id: {create_resp}"
-        )
-    text = await download_report_raw(report_id, max_polls=30, poll_interval=10)
+    from calendar import monthrange
 
-    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+    start_utc = start.astimezone(timezone.utc)
+    end_utc = end.astimezone(timezone.utc)
+    # Walk inclusive calendar months that overlap [start, end].
+    months: list[tuple[datetime, datetime]] = []
+    cursor = start_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end_month = end_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    while cursor <= end_month:
+        last_day = monthrange(cursor.year, cursor.month)[1]
+        month_start = cursor
+        month_end = cursor.replace(
+            day=last_day, hour=23, minute=59, second=59, microsecond=0,
+        )
+        months.append((month_start, month_end))
+        if cursor.month == 12:
+            cursor = cursor.replace(year=cursor.year + 1, month=1)
+        else:
+            cursor = cursor.replace(month=cursor.month + 1)
 
     def _f(row: dict, *keys: str) -> float:
         for k in keys:
@@ -1447,41 +1439,69 @@ async def fetch_aged_surcharge_charges_per_sku(
     def _i(row: dict, *keys: str) -> int:
         return int(_f(row, *keys))
 
-    per_sku: dict[str, dict] = {}
-    for row in reader:
-        sku = (
-            row.get("sku")
-            or row.get("seller-sku")
-            or row.get("merchant-sku")
-            or ""
-        ).strip()
-        if not sku:
-            continue
-        # Prefer the post-2023 AIS columns; fall back to legacy LTSF names.
-        charged = _f(row, "amount-charged", "amount_charged")
-        if charged <= 0:
-            charged = _f(row, "long-time-range-long-term-storage-fee") + _f(
-                row, "short-time-range-long-term-storage-fee",
+    def _accumulate(text: str, per_sku: dict[str, dict]) -> None:
+        reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+        for row in reader:
+            sku = (
+                row.get("sku")
+                or row.get("seller-sku")
+                or row.get("merchant-sku")
+                or ""
+            ).strip()
+            if not sku:
+                continue
+            charged = _f(row, "amount-charged", "amount_charged")
+            if charged <= 0:
+                charged = _f(row, "long-time-range-long-term-storage-fee") + _f(
+                    row, "short-time-range-long-term-storage-fee",
+                )
+            qty = _i(
+                row,
+                "qty-charged",
+                "qty_charged",
+                "qty-charged-long-time-range-long-term-storage-fee",
+                "qty-charged-short-time-range-long-term-storage-fee",
             )
-        qty = _i(
-            row,
-            "qty-charged",
-            "qty_charged",
-            "qty-charged-long-time-range-long-term-storage-fee",
-            "qty-charged-short-time-range-long-term-storage-fee",
-        )
-        if charged <= 0 and qty <= 0:
-            continue
-        asin = (row.get("asin") or row.get("ASIN") or "").strip().upper() or None
-        bucket = per_sku.setdefault(
-            sku,
-            {"charged_total": 0.0, "qty_charged": 0, "asin": asin},
-        )
-        bucket["charged_total"] += charged
-        bucket["qty_charged"] += max(qty, 0)
-        if asin and not bucket.get("asin"):
-            bucket["asin"] = asin
+            if charged <= 0 and qty <= 0:
+                continue
+            asin = (row.get("asin") or row.get("ASIN") or "").strip().upper() or None
+            bucket = per_sku.setdefault(
+                sku,
+                {"charged_total": 0.0, "qty_charged": 0, "asin": asin},
+            )
+            bucket["charged_total"] += charged
+            bucket["qty_charged"] += max(qty, 0)
+            if asin and not bucket.get("asin"):
+                bucket["asin"] = asin
 
+    per_sku: dict[str, dict] = {}
+    errors: list[str] = []
+    for month_start, month_end in months:
+        try:
+            create_resp = await create_report(
+                "GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA",
+                start_date=month_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                end_date=month_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                single_marketplace=True,
+            )
+            report_id = create_resp.get("reportId")
+            if not report_id:
+                errors.append(
+                    f"{month_start.strftime('%Y-%m')}: create returned no id"
+                )
+                continue
+            text = await download_report_raw(
+                report_id, max_polls=30, poll_interval=10,
+            )
+            _accumulate(text, per_sku)
+        except Exception as e:
+            errors.append(f"{month_start.strftime('%Y-%m')}: {e}")
+
+    if not per_sku and errors:
+        raise RuntimeError(
+            "Aged surcharge charges report failed for every month: "
+            + "; ".join(errors)
+        )
     return {
         sku: {
             "charged_total": round(v["charged_total"], 2),

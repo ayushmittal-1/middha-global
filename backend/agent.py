@@ -662,6 +662,7 @@ async def _placement_rates_from_finances_join(use_db: bool) -> dict:
     Finances shipment-level placement charges joined with Aurora shipments."""
     if not use_db:
         return {}
+    from database import put_placement_fee_cache
     fees_by_shipment = await amazon_sp.fetch_placement_service_fees_by_shipment()
     placement_per_sku = await aurora_data.placement_rates_from_shipments(
         require_user(), fees_by_shipment,
@@ -1143,6 +1144,7 @@ async def compute_profitability_data(
             placement_avg_per_asin = {}
             placement_meta["source"] = "finances_fallback"
 
+    planning_aged_by_sku: dict[str, float] = {}
     aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
     # Force a refetch when the cache pre-dates the HDoS / recommended-ship-qty
     # extraction — an old-shape cache is technically fresh (< 24h) but missing
@@ -1171,6 +1173,12 @@ async def compute_profitability_data(
         if need_aged_fetch:
             aged_per_sku = await amazon_sp.fetch_aged_inventory_fees_per_sku()
             await put_aged_inventory_cache(aged_per_sku)
+        for psku, b in (aged_per_sku or {}).items():
+            if not isinstance(b, dict):
+                continue
+            fee = float(b.get("monthly_fee") or 0)
+            if fee > 0:
+                planning_aged_by_sku[psku] = fee
         # Planning report is cached for Restock (HDOS / recommended qty).
         # Profitability uses the actual AIS charges report below.
     except Exception as e:
@@ -1206,8 +1214,20 @@ async def compute_profitability_data(
             await put_aged_surcharge_charges_cache(
                 {}, charges_start_iso, charges_end_iso, access_denied=True,
             )
-        aged_charges_by_sku = None
-        aged_charges_meta["source"] = "finances_fallback"
+        # Prefer planning estimated-ais (SKU-only) over Finances — Finances
+        # often posts AIS without SellerSKU, which previously left Aged Inv
+        # at $0 for every row after a FATAL charges report.
+        if planning_aged_by_sku:
+            aged_charges_by_sku = dict(planning_aged_by_sku)
+            aged_charges_meta["source"] = "planning_estimate_fallback"
+            warnings.append(
+                "Aged Inv: using Inventory Planning estimated-ais totals "
+                "(charges report unavailable). These are Amazon's projections, "
+                "not the final amount-charged from the Aged Inventory Surcharge report."
+            )
+        else:
+            aged_charges_by_sku = None
+            aged_charges_meta["source"] = "finances_fallback"
 
     # products.fees is primary (same as Aurora Products). Fees API only for SKUs
     # missing that sync — do not prefer stale order-line fees.
@@ -1503,13 +1523,20 @@ async def compute_profitability_data(
     if aged_charges_meta.get("access_denied"):
         caveats.append(
             "Aged Inv: the Aged Inventory Surcharge charges report is blocked "
-            "(403) for this SP-API app — falling back to Finances API amounts "
-            "attributed to each SKU (may lag or miss charges)."
+            "(403) for this SP-API app — using Inventory Planning estimated-ais "
+            "or Finances SKU amounts as fallback."
+        )
+    elif aged_charges_meta.get("source") == "planning_estimate_fallback":
+        caveats.append(
+            "Aged Inv: charges report failed (FATAL/unavailable); showing "
+            "Inventory Planning estimated-ais monthly totals by SKU. Re-check "
+            "against Seller Central's Aged Inventory Surcharge report once the "
+            "charges report succeeds."
         )
     elif aged_charges_meta.get("source") == "finances_fallback":
         caveats.append(
-            "Aged Inv: charges report unavailable; using Finances API "
-            "SKU-attributed aged-inventory amounts only."
+            "Aged Inv: charges report unavailable and no planning estimates; "
+            "using Finances API SKU-attributed aged-inventory amounts only."
         )
     placement_total = totals_out.get("inbound_placement_fee", 0)
     if placement_total == 0:
