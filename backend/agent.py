@@ -1053,11 +1053,31 @@ async def compute_profitability_data(
                   "aged_inventory", "removal")
     }
 
+    # Prefer Aurora's fbainboundplacementfees collection (populated by
+    # auroraBackend's fbaInboundPlacementSyncService which handles both the
+    # report and the Finances-join fallback). When Aurora has a snapshot,
+    # skip our own SP-API + Finances-join path entirely.
+    placement_from_aurora: dict | None = None
+    if use_db:
+        try:
+            placement_from_aurora = await aurora_data.fba_inbound_placement_by_sku(require_user())
+        except Exception as e:
+            warnings.append(_sp_report_warning("Inbound placement (Aurora)", e))
+
     placement_cache_meta = await get_placement_fee_cache(max_age_hours=24)
     try:
         placement_per_sku: dict = {}
         need_placement_fetch = False
-        if placement_cache_meta and placement_cache_meta.get("access_denied"):
+        if placement_from_aurora:
+            # Aurora synced — use it, skip the SP-API/Finances rebuild.
+            placement_per_sku = placement_from_aurora
+            placement_meta["source"] = "aurora_db"
+            placement_meta["sku_count"] = len(placement_per_sku)
+            placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
+                placement_per_sku
+            )
+            placement_meta["resolved_skus"] = len(placement_avg_per_unit)
+        elif placement_cache_meta and placement_cache_meta.get("access_denied"):
             placement_meta["access_denied"] = True
             # Report blocked (403) — rebuild per-SKU rates from Finances
             # shipment-level placement fees joined with Aurora shipments.
@@ -1145,6 +1165,20 @@ async def compute_profitability_data(
             placement_meta["source"] = "finances_fallback"
 
     planning_aged_by_sku: dict[str, float] = {}
+    # Prefer Aurora's fbaagedinventoryfees snapshot (populated by
+    # auroraBackend's fbaAgedInventorySyncService from the FBA Inventory
+    # Planning report). This is the SAME source the legacy planning path
+    # uses — Aurora just runs it on its side and hands us the result.
+    # NOTE: this feeds planning_aged_by_sku only. The actual Aged Inventory
+    # Surcharge dollars used in /profitability come from the CHARGES report
+    # (further below), which Aurora doesn't ingest.
+    aged_from_aurora: dict | None = None
+    if use_db:
+        try:
+            aged_from_aurora = await aurora_data.fba_aged_inventory_by_sku(require_user())
+        except Exception as e:
+            warnings.append(_sp_report_warning("Aged inventory (Aurora)", e))
+
     aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
     # Force a refetch when the cache pre-dates the HDoS / recommended-ship-qty
     # extraction — an old-shape cache is technically fresh (< 24h) but missing
@@ -1159,20 +1193,18 @@ async def compute_profitability_data(
     )
     try:
         aged_per_sku: dict = {}
-        need_aged_fetch = False
-        if aged_cache_meta and not aged_needs_refresh:
-            aged_per_sku = aged_cache_meta.get("per_sku") or {}
-            # Refresh once so ASIN keys are available for cross-SKU matching.
-            if aged_per_sku and not any(
-                isinstance(b, dict) and b.get("asin")
-                for b in aged_per_sku.values()
-            ):
-                need_aged_fetch = True
+        if aged_from_aurora is not None:
+            # Aurora synced this planning report — use it, skip our fetch.
+            aged_per_sku = aged_from_aurora
         else:
             need_aged_fetch = True
-        if need_aged_fetch:
-            aged_per_sku = await amazon_sp.fetch_aged_inventory_fees_per_sku()
-            await put_aged_inventory_cache(aged_per_sku)
+            if aged_cache_meta and not aged_needs_refresh:
+                aged_per_sku = aged_cache_meta.get("per_sku") or {}
+                if aged_per_sku:
+                    need_aged_fetch = False
+            if need_aged_fetch:
+                aged_per_sku = await amazon_sp.fetch_aged_inventory_fees_per_sku()
+                await put_aged_inventory_cache(aged_per_sku)
         for psku, b in (aged_per_sku or {}).items():
             if not isinstance(b, dict):
                 continue
