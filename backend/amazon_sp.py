@@ -909,12 +909,19 @@ def _empty_fee_bucket() -> dict:
         "inbound_placement": 0.0,
         "aged_inventory": 0.0,
         "removal": 0.0,
-        # Count of units Amazon posted a refund for in the window. Sourced
-        # from RefundEventList[].ShipmentItemAdjustmentList[].QuantityShipped.
-        # Used by /profitability to compute return_processing_fee as
-        # 20% × referral_per_unit × returned_units, matching the standard
-        # FBA Returns Processing Fee policy (client-confirmed).
+        # Count of units Amazon posted a refund for in the window (from
+        # RefundEventList[].ShipmentItemAdjustmentList[].QuantityShipped).
+        # Kept for reporting / diagnostics.
         "returned_units": 0,
+        # Sum of the referral commission Amazon posted on refund events for
+        # this SKU (Commission entries in RefundEventList[].ShipmentItem
+        # AdjustmentList[].ItemFeeAdjustmentList). This is the actual
+        # referral fee that was reversed on the returned units — client's
+        # rule computes return_processing_fee = 20% × this value.
+        # Independent of the current window's average price, which is why
+        # the earlier `0.20 × window_referral_per_unit × returned_units`
+        # formulation was wrong for refunds of pre-window sales.
+        "refunded_referral": 0.0,
     }
 
 
@@ -1029,6 +1036,16 @@ async def get_financial_events(
                 for ftype, amt in _fees_from_lists(
                     item.get("ItemFeeAdjustmentList") or item.get("ItemFeeList"),
                 ):
+                    # `Commission` (exact) inside a refund event is Amazon
+                    # reversing the ORIGINAL referral fee back to the seller.
+                    # That's the referral-per-returned-unit input to the
+                    # client's 20% return-proc rule — capture it separately
+                    # from the bucketed fee categories. Distinguish from
+                    # `RefundCommission` (the return-proc fee itself).
+                    if (ftype or "").strip().lower() == "commission":
+                        target = by_sku[sku] if sku else unattributed
+                        target["refunded_referral"] += abs(amt)
+                        continue
                     bucket = _classify_fee_type(ftype)
                     if not bucket:
                         continue
