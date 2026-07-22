@@ -1409,9 +1409,18 @@ async def compute_profitability_data(
                 (v for k, v in fin_by_sku.items() if str(k).lower() == sku.lower()),
                 {},
             )
-        return_processing_fee = round(
-            (fin_sku.get("return_processing", 0.0)
-             + unattr_per_unit["return_processing"] * units), 2)
+        # Return processing fee = 20% × referral_fee_per_unit × returned_units
+        # in the window. Amazon's standard FBA Returns Processing Fee policy
+        # for the categories this seller sells (client-confirmed). Deterministic
+        # and doesn't depend on Finances attributing every `returnfee` correctly.
+        returned_units = int(fin_sku.get("returned_units", 0) or 0)
+        if units > 0 and returned_units > 0 and referral_total > 0:
+            referral_per_unit = referral_total / units
+            return_processing_fee = round(
+                0.20 * referral_per_unit * returned_units, 2,
+            )
+        else:
+            return_processing_fee = 0.0
         low_inventory_fee = round(
             (fin_sku.get("low_inventory", 0.0)
              + unattr_per_unit["low_inventory"] * units), 2)
