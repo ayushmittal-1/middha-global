@@ -1387,6 +1387,112 @@ async def fetch_aged_inventory_fees_per_sku() -> dict:
     }
 
 
+async def fetch_aged_surcharge_charges_per_sku(
+    start: datetime,
+    end: datetime,
+) -> dict[str, dict]:
+    """Pull GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA — the same
+    report Seller Central shows as "Aged Inventory Surcharge report".
+
+    Unlike GET_FBA_INVENTORY_PLANNING_DATA (estimated-ais-* projections),
+    this report has the actual `amount-charged` Amazon billed per SKU /
+    age tier for the event month. Sum those into a per-SKU total so
+    Profitability can match Seller Central dollar-for-dollar.
+
+    Returns {sku: {charged_total, qty_charged, asin}}.
+    """
+    # AIS posts mid-month (typically the 15th). Expand to full calendar
+    # months that overlap the profitability window so a short window that
+    # includes the charge date still picks up the month's charges.
+    start_month = start.astimezone(timezone.utc).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0,
+    )
+    end_utc = end.astimezone(timezone.utc)
+    if end_utc.month == 12:
+        end_month_exclusive = end_utc.replace(
+            year=end_utc.year + 1, month=1, day=1,
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+    else:
+        end_month_exclusive = end_utc.replace(
+            month=end_utc.month + 1, day=1,
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+    create_resp = await create_report(
+        "GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA",
+        start_date=start_month.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        end_date=end_month_exclusive.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        single_marketplace=True,
+    )
+    report_id = create_resp.get("reportId")
+    if not report_id:
+        raise RuntimeError(
+            f"Aged surcharge charges report create returned no id: {create_resp}"
+        )
+    text = await download_report_raw(report_id, max_polls=30, poll_interval=10)
+
+    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+
+    def _f(row: dict, *keys: str) -> float:
+        for k in keys:
+            raw = row.get(k)
+            if raw in (None, ""):
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    def _i(row: dict, *keys: str) -> int:
+        return int(_f(row, *keys))
+
+    per_sku: dict[str, dict] = {}
+    for row in reader:
+        sku = (
+            row.get("sku")
+            or row.get("seller-sku")
+            or row.get("merchant-sku")
+            or ""
+        ).strip()
+        if not sku:
+            continue
+        # Prefer the post-2023 AIS columns; fall back to legacy LTSF names.
+        charged = _f(row, "amount-charged", "amount_charged")
+        if charged <= 0:
+            charged = _f(row, "long-time-range-long-term-storage-fee") + _f(
+                row, "short-time-range-long-term-storage-fee",
+            )
+        qty = _i(
+            row,
+            "qty-charged",
+            "qty_charged",
+            "qty-charged-long-time-range-long-term-storage-fee",
+            "qty-charged-short-time-range-long-term-storage-fee",
+        )
+        if charged <= 0 and qty <= 0:
+            continue
+        asin = (row.get("asin") or row.get("ASIN") or "").strip().upper() or None
+        bucket = per_sku.setdefault(
+            sku,
+            {"charged_total": 0.0, "qty_charged": 0, "asin": asin},
+        )
+        bucket["charged_total"] += charged
+        bucket["qty_charged"] += max(qty, 0)
+        if asin and not bucket.get("asin"):
+            bucket["asin"] = asin
+
+    return {
+        sku: {
+            "charged_total": round(v["charged_total"], 2),
+            "qty_charged": int(v["qty_charged"]),
+            "asin": v.get("asin"),
+        }
+        for sku, v in per_sku.items()
+        if v["charged_total"] > 0
+    }
+
+
 # ── FBA Inventory API (v1) ───────────────────────────────────────────────────
 
 
