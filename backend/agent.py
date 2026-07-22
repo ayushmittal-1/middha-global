@@ -70,7 +70,8 @@ SYSTEM_PROMPT = (
     "- **get_report**: Generate and download an Amazon report. Use when the user asks for sales reports, settlement reports, "
     "or other data exports. Profitability-relevant types: GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE (actual fees deducted), "
     "GET_FBA_ESTIMATED_FBA_FEES_TXT_DATA (per-SKU referral + FBA fee estimates), "
-    "GET_FBA_STORAGE_FEE_CHARGES_DATA (monthly storage), GET_FBA_INVENTORY_AGED_DATA (aged surcharge), "
+    "GET_FBA_STORAGE_FEE_CHARGES_DATA (monthly storage), "
+    "GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA (aged surcharge charges), "
     "GET_FBA_FULFILLMENT_REMOVAL_ORDER_DETAIL_DATA (removal fees).\n\n"
     "## Profitability analysis\n"
     "When the user asks about profit, margin, P&L — or asks for BOTH 'performance AND profitability' (or 'performance AND profit') — "
@@ -661,6 +662,7 @@ async def _placement_rates_from_finances_join(use_db: bool) -> dict:
     Finances shipment-level placement charges joined with Aurora shipments."""
     if not use_db:
         return {}
+    from database import put_placement_fee_cache
     fees_by_shipment = await amazon_sp.fetch_placement_service_fees_by_shipment()
     placement_per_sku = await aurora_data.placement_rates_from_shipments(
         require_user(), fees_by_shipment,
@@ -669,24 +671,34 @@ async def _placement_rates_from_finances_join(use_db: bool) -> dict:
     return placement_per_sku
 
 
-def _build_aged_monthly(aged_per_sku: dict) -> tuple[dict[str, float], dict[str, float]]:
-    """Return (by_sku, by_asin) maps of projected monthly aged-inventory $."""
+def _build_aged_charges(charges_per_sku: dict) -> dict[str, float]:
+    """SKU → actual amount-charged from the Aged Inventory Surcharge report.
+
+    SKU-only (no ASIN map): applying the same ASIN total to every listing
+    SKU (e.g. merchant + amzn.gr.*) double-counts the fee in Profitability.
+    """
     by_sku: dict[str, float] = {}
-    by_asin: dict[str, float] = {}
-    for asku, b in (aged_per_sku or {}).items():
+    for asku, b in (charges_per_sku or {}).items():
         if not isinstance(b, dict):
             fee = float(b or 0)
-            if fee > 0:
-                by_sku[asku] = fee
-            continue
-        fee = float(b.get("monthly_fee") or 0)
-        if fee <= 0:
-            continue
-        by_sku[asku] = fee
-        asin = (b.get("asin") or "").strip().upper()
-        if asin:
-            by_asin[asin] = by_asin.get(asin, 0.0) + fee
-    return by_sku, by_asin
+        else:
+            fee = float(b.get("charged_total") or 0)
+        if fee > 0:
+            by_sku[asku] = fee
+    return by_sku
+
+
+def _lookup_sku_amount(by_sku: dict[str, float] | None, sku: str) -> float:
+    """Case-insensitive SKU lookup for absolute fee amounts."""
+    if not by_sku:
+        return 0.0
+    if sku in by_sku:
+        return float(by_sku[sku] or 0)
+    sku_l = sku.lower()
+    for key, val in by_sku.items():
+        if str(key).lower() == sku_l:
+            return float(val or 0)
+    return 0.0
 
 
 def _sp_item_line_revenue(item: dict) -> float | None:
@@ -816,9 +828,11 @@ async def compute_profitability_data(
     from campaigns import get_ad_spend_for_range
     from database import (
         get_aged_inventory_cache,
+        get_aged_surcharge_charges_cache,
         get_placement_fee_cache,
         get_storage_cache,
         put_aged_inventory_cache,
+        put_aged_surcharge_charges_cache,
         put_placement_fee_cache,
         put_storage_cache,
     )
@@ -996,8 +1010,8 @@ async def compute_profitability_data(
     placement_avg_per_unit: dict[str, float] | None = None
     placement_avg_per_asin: dict[str, float] = {}
     placement_meta: dict[str, object] = {"source": "none", "sku_count": 0}
-    aged_monthly_per_sku: dict[str, float] | None = {}
-    aged_monthly_per_asin: dict[str, float] = {}
+    aged_charges_by_sku: dict[str, float] | None = {}
+    aged_charges_meta: dict = {"source": None, "access_denied": False}
     fees_by_asin: dict[str, dict] = {}
     fee_errors_pre: list[str] = []
 
@@ -1130,6 +1144,7 @@ async def compute_profitability_data(
             placement_avg_per_asin = {}
             placement_meta["source"] = "finances_fallback"
 
+    planning_aged_by_sku: dict[str, float] = {}
     aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
     # Force a refetch when the cache pre-dates the HDoS / recommended-ship-qty
     # extraction — an old-shape cache is technically fresh (< 24h) but missing
@@ -1158,13 +1173,62 @@ async def compute_profitability_data(
         if need_aged_fetch:
             aged_per_sku = await amazon_sp.fetch_aged_inventory_fees_per_sku()
             await put_aged_inventory_cache(aged_per_sku)
-        aged_monthly_per_sku, aged_monthly_per_asin = _build_aged_monthly(aged_per_sku)
+        for psku, b in (aged_per_sku or {}).items():
+            if not isinstance(b, dict):
+                continue
+            fee = float(b.get("monthly_fee") or 0)
+            if fee > 0:
+                planning_aged_by_sku[psku] = fee
+        # Planning report is cached for Restock (HDOS / recommended qty).
+        # Profitability uses the actual AIS charges report below.
     except Exception as e:
-        warnings.append(_sp_report_warning("Aged inventory", e))
+        warnings.append(_sp_report_warning("Aged inventory planning", e))
         if _is_sp_access_denied(e):
             await put_aged_inventory_cache({})
-        aged_monthly_per_sku = None
-        aged_monthly_per_asin = {}
+
+    # Actual Aged Inventory Surcharge charges (Seller Central report).
+    charges_start_iso = utc_instant_to_iso_z(start_dt)
+    charges_end_iso = utc_instant_to_iso_z(end_dt)
+    try:
+        charges_cache = await get_aged_surcharge_charges_cache(
+            charges_start_iso, charges_end_iso, max_age_hours=24,
+        )
+        if charges_cache and not charges_cache.get("access_denied"):
+            aged_charges_by_sku = _build_aged_charges(
+                charges_cache.get("per_sku") or {}
+            )
+            aged_charges_meta["source"] = "charges_cache"
+        else:
+            charges_per_sku = await amazon_sp.fetch_aged_surcharge_charges_per_sku(
+                start_dt, end_dt,
+            )
+            await put_aged_surcharge_charges_cache(
+                charges_per_sku, charges_start_iso, charges_end_iso,
+            )
+            aged_charges_by_sku = _build_aged_charges(charges_per_sku)
+            aged_charges_meta["source"] = "charges_report"
+    except Exception as e:
+        warnings.append(_sp_report_warning("Aged inventory surcharge charges", e))
+        if _is_sp_access_denied(e):
+            aged_charges_meta["access_denied"] = True
+            await put_aged_surcharge_charges_cache(
+                {}, charges_start_iso, charges_end_iso, access_denied=True,
+            )
+        # Prefer planning estimated-ais (SKU-only) over Finances only when
+        # BOTH create and DONE-report reuse failed. Finances posts AIS as a
+        # lumped unattributed total (no SellerSKU), which left every row at $0.
+        if planning_aged_by_sku:
+            aged_charges_by_sku = dict(planning_aged_by_sku)
+            aged_charges_meta["source"] = "planning_estimate_fallback"
+            warnings.append(
+                "Aged Inv: could not load the Aged Inventory Surcharge charges "
+                "report (create FATAL and no reusable DONE report). Showing "
+                "Inventory Planning estimated-ais totals — these will NOT match "
+                "Seller Central amount-charged. Retry later."
+            )
+        else:
+            aged_charges_by_sku = None
+            aged_charges_meta["source"] = "finances_fallback"
 
     # products.fees is primary (same as Aurora Products). Fees API only for SKUs
     # missing that sync — do not prefer stale order-line fees.
@@ -1220,7 +1284,6 @@ async def compute_profitability_data(
     )
 
     # ── Per-SKU enrichment ────────────────────────────────────────────────
-    months_in_window = max(window_days / 30.0, 0.01)
     rows: list[dict] = []
     totals = defaultdict(float)
     missing_cogs: list[dict] = []
@@ -1339,25 +1402,29 @@ async def compute_profitability_data(
                 float(fin_sku.get("inbound_placement", 0.0) or 0), 2,
             )
 
-        # Aged inventory: planning-report monthly projection × months in window.
-        # Same rule as placement — the unattributed Finances pool is only
-        # spread per unit when the report is unavailable, otherwise it
-        # inflates SKUs that never incurred the surcharge.
-        if aged_monthly_per_sku is None:
-            aged_inventory_fee = round(
-                float(fin_sku.get("aged_inventory", 0.0) or 0)
-                + unattr_per_unit["aged_inventory"] * units, 2,
-            )
-        else:
-            monthly = _lookup_rate(
-                aged_monthly_per_sku, aged_monthly_per_asin, sku, asin,
-            )
-            if monthly:
-                aged_inventory_fee = round(float(monthly) * months_in_window, 2)
+        # Aged inventory: actual amount-charged from Seller Central's Aged
+        # Inventory Surcharge report (GET_FBA_FULFILLMENT_LONGTERM_STORAGE_
+        # FEE_CHARGES_DATA), matched by seller SKU only. Do NOT fall back to
+        # ASIN — that double-counts when merchant + amzn.gr.* SKUs share an
+        # ASIN. Do NOT use planning-report estimated-ais × months_in_window
+        # (those are forward projections, not billed amounts).
+        if aged_charges_by_sku is not None:
+            charged = _lookup_sku_amount(aged_charges_by_sku, sku)
+            if charged > 0:
+                aged_inventory_fee = round(charged, 2)
             else:
+                # SKU had no AIS charge this month — don't invent one from
+                # Finances unattributed pool.
                 aged_inventory_fee = round(
                     float(fin_sku.get("aged_inventory", 0.0) or 0), 2,
                 )
+        else:
+            # Charges report unavailable (403 / error) — Finances attributed
+            # only; never spread the unattributed pool (inflates SKUs that
+            # never incurred AIS).
+            aged_inventory_fee = round(
+                float(fin_sku.get("aged_inventory", 0.0) or 0), 2,
+            )
 
         removal_fee = round(
             (fin_sku.get("removal", 0.0)
@@ -1443,14 +1510,35 @@ async def compute_profitability_data(
         "after inbound receipt.",
         "Storage uses GET_FBA_STORAGE_FEE_CHARGES_DATA: estimated monthly "
         "storage fee ÷ average quantity on hand × units sold (Revenue Calculator).",
-        "Return processing, low-inventory, aged-inventory, and removal fees "
-        "come from the Finances API (45-day lookback before the window start) — "
-        "recent orders may not have them yet.",
+        "Aged Inv uses GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA "
+        "(Seller Central Aged Inventory Surcharge report): sum of "
+        "amount-charged per seller SKU for months overlapping the window.",
+        "Return processing, low-inventory, and removal fees come from the "
+        "Finances API (45-day lookback before the window start) — recent "
+        "orders may not have them yet.",
         "Ads are allocated uniformly per unit — per-SKU PPC attribution requires productAd joins.",
         "Fees posted without a SellerSKU (typically removals) are spread across units proportionally.",
     ]
     if not storage_per_asin:
         caveats.append("Storage fees: report unavailable for this window; values are 0.")
+    if aged_charges_meta.get("access_denied"):
+        caveats.append(
+            "Aged Inv: the Aged Inventory Surcharge charges report is blocked "
+            "(403) for this SP-API app — using Inventory Planning estimated-ais "
+            "or Finances SKU amounts as fallback."
+        )
+    elif aged_charges_meta.get("source") == "planning_estimate_fallback":
+        caveats.append(
+            "Aged Inv: charges report failed (FATAL/unavailable); showing "
+            "Inventory Planning estimated-ais monthly totals by SKU. Re-check "
+            "against Seller Central's Aged Inventory Surcharge report once the "
+            "charges report succeeds."
+        )
+    elif aged_charges_meta.get("source") == "finances_fallback":
+        caveats.append(
+            "Aged Inv: charges report unavailable and no planning estimates; "
+            "using Finances API SKU-attributed aged-inventory amounts only."
+        )
     placement_total = totals_out.get("inbound_placement_fee", 0)
     if placement_total == 0:
         src = placement_meta.get("source")

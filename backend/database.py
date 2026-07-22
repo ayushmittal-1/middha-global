@@ -72,6 +72,11 @@ def _aged_inventory_cache():
     return _db().agedInventoryFeeCache
 
 
+def _aged_surcharge_charges_cache():
+    """Actual AIS charged amounts (LONGTERM_STORAGE_FEE_CHARGES report)."""
+    return _db().agedSurchargeChargesCache
+
+
 def _product_settings():
     return _db().productSettings
 
@@ -108,6 +113,9 @@ async def init_db():
         [("userId", 1)], unique=True
     )
     await _aged_inventory_cache().create_index(
+        [("userId", 1)], unique=True
+    )
+    await _aged_surcharge_charges_cache().create_index(
         [("userId", 1)], unique=True
     )
     await _product_settings().create_index(
@@ -440,9 +448,62 @@ async def put_aged_inventory_cache(per_sku: dict) -> None:
     )
 
 
+async def get_aged_surcharge_charges_cache(
+    start_iso: str,
+    end_iso: str,
+    max_age_hours: int = 24,
+) -> dict | None:
+    """Cached actual AIS charged amounts for a profitability window.
+
+    Invalidates when the window changes or the doc is older than TTL —
+    different date ranges must not reuse each other's charge totals.
+    """
+    user_id = _user_oid()
+    doc = await _aged_surcharge_charges_cache().find_one({"userId": user_id})
+    if not doc:
+        return None
+    if doc.get("startIso") != start_iso or doc.get("endIso") != end_iso:
+        return None
+    updated = doc.get("updatedAt")
+    if not updated:
+        return None
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
+    if age_hours > max_age_hours:
+        return None
+    return {
+        "per_sku": doc.get("perSku", {}),
+        "updated_at": updated.isoformat(),
+        "access_denied": bool(doc.get("accessDenied")),
+    }
+
+
+async def put_aged_surcharge_charges_cache(
+    per_sku: dict,
+    start_iso: str,
+    end_iso: str,
+    access_denied: bool = False,
+) -> None:
+    user_id = _user_oid()
+    await _aged_surcharge_charges_cache().update_one(
+        {"userId": user_id},
+        {
+            "$set": {
+                "perSku": per_sku,
+                "startIso": start_iso,
+                "endIso": end_iso,
+                "accessDenied": access_denied,
+                "updatedAt": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {"userId": user_id},
+        },
+        upsert=True,
+    )
+
+
 # ── Forecasting: salesDaily / inventorySnapshot / forecastCache ───────────
-#
-# These helpers take an explicit `user_id` because they are also called from
+## These helpers take an explicit `user_id` because they are also called from
 # the APScheduler nightly job, which has no request context (no ContextVar).
 # The agent / UI surface uses the request-scoped wrappers further below.
 

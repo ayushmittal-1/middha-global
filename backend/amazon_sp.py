@@ -1387,6 +1387,229 @@ async def fetch_aged_inventory_fees_per_sku() -> dict:
     }
 
 
+async def _list_aged_surcharge_reports(created_since: datetime) -> list[dict]:
+    """Recent GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA reports."""
+    resp = await _sp_request(
+        "GET",
+        "/reports/2021-06-30/reports",
+        params={
+            "reportTypes": "GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA",
+            "pageSize": "50",
+            "createdSince": created_since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+    )
+    return list(resp.get("reports") or [])
+
+
+def _parse_report_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _report_covers_month(
+    report: dict, month_start: datetime, month_end_excl: datetime,
+) -> bool:
+    """True if the report's data window overlaps [month_start, month_end_excl)."""
+    ds = _parse_report_dt(report.get("dataStartTime"))
+    de = _parse_report_dt(report.get("dataEndTime"))
+    if ds is None or de is None:
+        return False
+    if ds.tzinfo is None:
+        ds = ds.replace(tzinfo=timezone.utc)
+    if de.tzinfo is None:
+        de = de.replace(tzinfo=timezone.utc)
+    return ds < month_end_excl and de > month_start
+
+
+def _accumulate_aged_surcharge_rows(text: str, per_sku: dict[str, dict]) -> None:
+    """Parse amount-charged rows from an AIS charges report into per_sku."""
+
+    def _f(row: dict, *keys: str) -> float:
+        for k in keys:
+            raw = row.get(k)
+            if raw in (None, ""):
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    def _i(row: dict, *keys: str) -> int:
+        return int(_f(row, *keys))
+
+    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+    for row in reader:
+        sku = (
+            row.get("sku")
+            or row.get("seller-sku")
+            or row.get("merchant-sku")
+            or ""
+        ).strip()
+        if not sku:
+            continue
+        charged = _f(row, "amount-charged", "amount_charged")
+        if charged <= 0:
+            charged = _f(row, "long-time-range-long-term-storage-fee") + _f(
+                row, "short-time-range-long-term-storage-fee",
+            )
+        qty = _i(
+            row,
+            "qty-charged",
+            "qty_charged",
+            "qty-charged-long-time-range-long-term-storage-fee",
+            "qty-charged-short-time-range-long-term-storage-fee",
+        )
+        if charged <= 0 and qty <= 0:
+            continue
+        asin = (row.get("asin") or row.get("ASIN") or "").strip().upper() or None
+        bucket = per_sku.setdefault(
+            sku,
+            {"charged_total": 0.0, "qty_charged": 0, "asin": asin},
+        )
+        bucket["charged_total"] += charged
+        bucket["qty_charged"] += max(qty, 0)
+        if asin and not bucket.get("asin"):
+            bucket["asin"] = asin
+
+
+async def fetch_aged_surcharge_charges_per_sku(
+    start: datetime,
+    end: datetime,
+) -> dict[str, dict]:
+    """Pull GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA — the same
+    report Seller Central shows as "Aged Inventory Surcharge report".
+
+    Strategy (critical — Amazon FATALS duplicate creates):
+      1. Prefer an existing DONE report that already covers each calendar
+         month (via getReports). Re-creating the same month often returns
+         FATAL after a few requests even when a DONE copy exists.
+      2. Only create a new report when none is available.
+      3. Date span must be exactly one month as Amazon docs require —
+         use 1st-of-month 00:00Z → 1st-of-next-month 00:00Z (the shape
+         that consistently completes DONE for this report type).
+
+    Returns {sku: {charged_total, qty_charged, asin}}.
+    """
+    start_utc = start.astimezone(timezone.utc)
+    end_utc = end.astimezone(timezone.utc)
+
+    months: list[tuple[datetime, datetime]] = []
+    cursor = start_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end_month = end_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    while cursor <= end_month:
+        if cursor.month == 12:
+            nxt = cursor.replace(year=cursor.year + 1, month=1)
+        else:
+            nxt = cursor.replace(month=cursor.month + 1)
+        months.append((cursor, nxt))
+        cursor = nxt
+
+    # Pull recent reports once — covers reuse across all months in the window.
+    # getReports rejects createdSince older than 90 days.
+    now = datetime.now(timezone.utc)
+    lookback = now - timedelta(days=89)
+    try:
+        existing = await _list_aged_surcharge_reports(lookback)
+    except Exception:
+        existing = []
+    existing_done = [
+        r for r in existing
+        if r.get("processingStatus") == "DONE" and r.get("reportDocumentId")
+    ]
+
+    per_sku: dict[str, dict] = {}
+    errors: list[str] = []
+    for month_start, month_end_excl in months:
+        label = month_start.strftime("%Y-%m")
+        # Newest DONE report covering this month first.
+        candidates = [
+            r for r in existing_done
+            if _report_covers_month(r, month_start, month_end_excl)
+        ]
+        candidates.sort(
+            key=lambda r: r.get("createdTime") or "",
+            reverse=True,
+        )
+        text: str | None = None
+        if candidates:
+            try:
+                text = await download_report_raw(
+                    candidates[0]["reportId"], max_polls=3, poll_interval=5,
+                )
+            except Exception as e:
+                errors.append(f"{label}: reuse {candidates[0].get('reportId')} failed ({e})")
+                text = None
+
+        if text is None:
+            # Create only when no reusable DONE report exists.
+            try:
+                create_resp = await create_report(
+                    "GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA",
+                    start_date=month_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    end_date=month_end_excl.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    single_marketplace=True,
+                )
+                report_id = create_resp.get("reportId")
+                if not report_id:
+                    errors.append(f"{label}: create returned no id")
+                else:
+                    text = await download_report_raw(
+                        report_id, max_polls=36, poll_interval=10,
+                    )
+            except Exception as e:
+                errors.append(f"{label}: create/download failed ({e})")
+                # Last chance: refresh the report list — another DONE may
+                # have appeared, or an older one we missed.
+                try:
+                    existing = await _list_aged_surcharge_reports(lookback)
+                    existing_done = [
+                        r for r in existing
+                        if r.get("processingStatus") == "DONE"
+                        and r.get("reportDocumentId")
+                    ]
+                    candidates = [
+                        r for r in existing_done
+                        if _report_covers_month(r, month_start, month_end_excl)
+                    ]
+                    candidates.sort(
+                        key=lambda r: r.get("createdTime") or "",
+                        reverse=True,
+                    )
+                    if candidates:
+                        text = await download_report_raw(
+                            candidates[0]["reportId"], max_polls=3, poll_interval=5,
+                        )
+                        errors.append(
+                            f"{label}: recovered via existing DONE "
+                            f"{candidates[0].get('reportId')}"
+                        )
+                except Exception as e2:
+                    errors.append(f"{label}: recovery failed ({e2})")
+
+        if text:
+            _accumulate_aged_surcharge_rows(text, per_sku)
+
+    if not per_sku and errors:
+        raise RuntimeError(
+            "Aged surcharge charges report failed for every month: "
+            + "; ".join(errors)
+        )
+    return {
+        sku: {
+            "charged_total": round(v["charged_total"], 2),
+            "qty_charged": int(v["qty_charged"]),
+            "asin": v.get("asin"),
+        }
+        for sku, v in per_sku.items()
+        if v["charged_total"] > 0
+    }
+
+
 # ── FBA Inventory API (v1) ───────────────────────────────────────────────────
 
 
