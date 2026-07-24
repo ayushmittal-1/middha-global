@@ -1246,26 +1246,32 @@ def _placement_row_int(row: dict, *needles: str) -> int:
         return 0
 
 
-def parse_inbound_placement_fee_report(text: str) -> tuple[dict, list[str]]:
+def parse_inbound_placement_fee_report(
+    text: str,
+) -> tuple[dict, list[str], list[dict]]:
     """Parse Seller Central / SP-API inbound placement fee report text.
 
     Seller Central Reports → Fulfillment → FBA inbound placement service fees
-    (`/reportcentral/INBOUND_PLACEMENT_FEES_CHARGES/1`) exports CSV rows keyed
-    by **FNSKU + ASIN** (no seller SKU). Prefer the explicit per-unit fee-rate
-    column — that is the value shown in Seller Central.
+    exports CSV rows keyed by **FNSKU + ASIN** with a Transaction date.
+    Profitability must sum `fee_total` for events whose transaction date
+    falls in the selected filter window (same as SC Event Date filter) —
+    not fee_rate × units sold.
 
-    Returns ({key: {fee_total, units_received, fee_bearing_units, fee_rate,
-    asin, fnsku, sku}}, months_covered). Keys may be seller SKU, FNSKU, or ASIN;
-    callers should resolve FNSKU→SKU via products.
+    Returns (
+      {key: {fee_total, units_received, fee_bearing_units, fee_rate, asin, fnsku, sku}},
+      months_covered,
+      events: [{transaction_date, shipment_id, fnsku, asin, sku, units, fee_rate, fee_total}],
+    ).
     """
     if not (text or "").strip():
-        return {}, []
+        return {}, [], []
 
     first = text.splitlines()[0]
     delim = "\t" if "\t" in first else ","
     reader = csv.DictReader(io.StringIO(text), delimiter=delim)
     acc: dict[str, dict] = {}
     months: set[str] = set()
+    events: list[dict] = []
 
     for row in reader:
         sku = (
@@ -1279,7 +1285,6 @@ def parse_inbound_placement_fee_report(text: str) -> tuple[dict, list[str]]:
             or ""
         ).strip().upper()
         asin = (_placement_row_get(row, "asin") or "").strip().upper()
-        # SC CSV has no seller SKU — key by FNSKU then ASIN.
         key = sku or fnsku or asin
         if not key:
             continue
@@ -1323,6 +1328,19 @@ def parse_inbound_placement_fee_report(text: str) -> tuple[dict, list[str]]:
         if weight <= 0:
             continue
 
+        dt = (
+            _placement_row_get(
+                row, "transaction date", "event date", "charge date", "date"
+            )
+            or ""
+        ).strip()
+        shipment_id = (
+            _placement_row_get(
+                row, "fba shipment id", "shipment id", "amazon shipment id"
+            )
+            or ""
+        ).strip()
+
         bucket = acc.setdefault(
             key,
             {
@@ -1336,7 +1354,8 @@ def parse_inbound_placement_fee_report(text: str) -> tuple[dict, list[str]]:
                 "sku": sku or None,
             },
         )
-        bucket["fee_total"] += fee if fee > 0 else rate * weight
+        row_fee = fee if fee > 0 else rate * weight
+        bucket["fee_total"] += row_fee
         bucket["units_received"] += units
         if rate > 0:
             bucket["fee_bearing_units"] += weight
@@ -1349,14 +1368,25 @@ def parse_inbound_placement_fee_report(text: str) -> tuple[dict, list[str]]:
         if sku and not bucket.get("sku"):
             bucket["sku"] = sku
 
-        dt = (
-            _placement_row_get(
-                row, "transaction date", "event date", "charge date", "date"
-            )
-            or ""
-        ).strip()
         if len(dt) >= 7:
             months.add(dt[:7])
+
+        # Normalize to ISO-ish for window compares: "2026-04-27 17:13:02" → date
+        tx_date = dt.replace("/", "-")
+        if "T" not in tx_date and " " in tx_date:
+            tx_date = tx_date.replace(" ", "T", 1)
+        events.append(
+            {
+                "transaction_date": tx_date,
+                "shipment_id": shipment_id or None,
+                "fnsku": fnsku or None,
+                "asin": asin or None,
+                "sku": sku or None,
+                "units": units,
+                "fee_rate": round(rate, 6) if rate > 0 else 0.0,
+                "fee_total": round(row_fee, 4),
+            }
+        )
 
     per_sku: dict[str, dict] = {}
     for key, v in acc.items():
@@ -1379,19 +1409,20 @@ def parse_inbound_placement_fee_report(text: str) -> tuple[dict, list[str]]:
             "fnsku": v.get("fnsku"),
             "sku": v.get("sku"),
         }
-    return per_sku, sorted(months)
+    return per_sku, sorted(months), events
 
 
 async def fetch_inbound_placement_fees_per_sku(
     months_back: int = 3,
-) -> tuple[dict, list[str]]:
+) -> tuple[dict, list[str], list[dict]]:
     """Pull GET_FBA_INBOUND_PLACEMENT_FEES_CHARGES_DATA — same report as
     Seller Central Reports → Fulfillment → FBA inbound placement service fees.
 
     Many Draft SP-API apps receive 403 for this type. Rows are FNSKU-keyed;
     callers should resolve to seller SKUs via products.
 
-    Date window defaults to ~90 days (SC "Last 90 days"). Caller caches.
+    Returns (per_sku, months_covered, events) — events carry transaction_date
+    so profitability can filter by the same Event Date window as Seller Central.
     """
     now = datetime.now(timezone.utc)
     days = max(1, min(int(months_back * 30), 90))
