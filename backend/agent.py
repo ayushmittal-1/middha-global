@@ -1607,6 +1607,18 @@ async def compute_profitability_data(
             "inside the selected filter — same as SC Event Date on FBA inbound "
             "placement service fees."
         )
+        if float(placement_window_total or 0) <= 0:
+            ev_range = ""
+            ws = placement_meta.get("window_start")
+            we = placement_meta.get("window_end")
+            n_ev = placement_meta.get("event_count") or 0
+            caveats.append(
+                f"Inbound placement Totals is $0 because no Seller Central placement "
+                f"charges have a Transaction date in {ws} → {we}. "
+                f"({n_ev} charge rows are loaded for this account, but none fall "
+                f"in this filter — try a month that appears on the SC placement "
+                f"report, e.g. June 2026.)"
+            )
     else:
         caveats.append(
             "Inbound placement uses fee_rate × units sold when dated Seller Central "
