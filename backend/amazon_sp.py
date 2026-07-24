@@ -1207,31 +1207,196 @@ async def fetch_placement_service_fees_by_shipment(
     return {k: round(v, 2) for k, v in by_shipment.items()}
 
 
+def _placement_row_get(row: dict, *needles: str) -> str | None:
+    """Case/space-insensitive column lookup for Amazon placement exports."""
+    if not row:
+        return None
+    lowered = {
+        str(k).strip().lower().replace("_", " "): v for k, v in row.items()
+    }
+    for needle in needles:
+        key = needle.strip().lower().replace("_", " ")
+        if key in lowered and lowered[key] not in (None, ""):
+            return str(lowered[key]).strip()
+    # Substring match only for long headers — never for "sku" (matches fnsku).
+    for needle in needles:
+        key = needle.strip().lower().replace("_", " ")
+        if len(key) < 10 and " " not in key:
+            continue
+        for rk, rv in lowered.items():
+            if key in rk and rv not in (None, ""):
+                return str(rv).strip()
+    return None
+
+
+def _placement_row_float(row: dict, *needles: str) -> float:
+    raw = _placement_row_get(row, *needles)
+    if raw is None:
+        return 0.0
+    try:
+        return float(str(raw).replace(",", "").replace("$", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _placement_row_int(row: dict, *needles: str) -> int:
+    try:
+        return int(float(_placement_row_float(row, *needles)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_inbound_placement_fee_report(text: str) -> tuple[dict, list[str]]:
+    """Parse Seller Central / SP-API inbound placement fee report text.
+
+    Seller Central Reports → Fulfillment → FBA inbound placement service fees
+    (`/reportcentral/INBOUND_PLACEMENT_FEES_CHARGES/1`) exports CSV rows keyed
+    by **FNSKU + ASIN** (no seller SKU). Prefer the explicit per-unit fee-rate
+    column — that is the value shown in Seller Central.
+
+    Returns ({key: {fee_total, units_received, fee_bearing_units, fee_rate,
+    asin, fnsku, sku}}, months_covered). Keys may be seller SKU, FNSKU, or ASIN;
+    callers should resolve FNSKU→SKU via products.
+    """
+    if not (text or "").strip():
+        return {}, []
+
+    first = text.splitlines()[0]
+    delim = "\t" if "\t" in first else ","
+    reader = csv.DictReader(io.StringIO(text), delimiter=delim)
+    acc: dict[str, dict] = {}
+    months: set[str] = set()
+
+    for row in reader:
+        sku = (
+            _placement_row_get(
+                row, "sku", "seller sku", "seller-sku", "msku", "merchant sku"
+            )
+            or ""
+        ).strip()
+        fnsku = (
+            _placement_row_get(row, "fnsku", "fn sku", "fulfillment network sku")
+            or ""
+        ).strip().upper()
+        asin = (_placement_row_get(row, "asin") or "").strip().upper()
+        # SC CSV has no seller SKU — key by FNSKU then ASIN.
+        key = sku or fnsku or asin
+        if not key:
+            continue
+
+        units = _placement_row_int(
+            row,
+            "actual received quantity",
+            "received quantity",
+            "quantity shipped",
+            "unit quantity",
+            "units",
+            "quantity",
+            "unit-count",
+        )
+        rate = _placement_row_float(
+            row,
+            "fba inbound placement service fee rate (per unit)",
+            "fba inbound placement service fee rate",
+            "placement service fee rate",
+            "fee rate",
+            "fee_rate",
+            "inbound placement fee rate",
+        )
+        fee = _placement_row_float(
+            row,
+            "total fba inbound placement service fee charge",
+            "total charge",
+            "total charges",
+            "placement fee",
+            "placement service fee",
+            "fee amount",
+            "total fee",
+        )
+        if rate <= 0 and fee > 0 and units > 0:
+            rate = fee / units
+        if rate <= 0 and fee <= 0:
+            continue
+        if fee <= 0 and rate > 0 and units > 0:
+            fee = rate * units
+        weight = units if units > 0 else (1 if rate > 0 else 0)
+        if weight <= 0:
+            continue
+
+        bucket = acc.setdefault(
+            key,
+            {
+                "fee_total": 0.0,
+                "units_received": 0,
+                "fee_bearing_units": 0,
+                "rate_weight": 0.0,
+                "rate_weighted_sum": 0.0,
+                "asin": asin or None,
+                "fnsku": fnsku or None,
+                "sku": sku or None,
+            },
+        )
+        bucket["fee_total"] += fee if fee > 0 else rate * weight
+        bucket["units_received"] += units
+        if rate > 0:
+            bucket["fee_bearing_units"] += weight
+            bucket["rate_weight"] += weight
+            bucket["rate_weighted_sum"] += rate * weight
+        if asin and not bucket.get("asin"):
+            bucket["asin"] = asin
+        if fnsku and not bucket.get("fnsku"):
+            bucket["fnsku"] = fnsku
+        if sku and not bucket.get("sku"):
+            bucket["sku"] = sku
+
+        dt = (
+            _placement_row_get(
+                row, "transaction date", "event date", "charge date", "date"
+            )
+            or ""
+        ).strip()
+        if len(dt) >= 7:
+            months.add(dt[:7])
+
+    per_sku: dict[str, dict] = {}
+    for key, v in acc.items():
+        if v["rate_weight"] > 0:
+            fee_rate = v["rate_weighted_sum"] / v["rate_weight"]
+        elif v["fee_bearing_units"] > 0:
+            fee_rate = v["fee_total"] / v["fee_bearing_units"]
+        elif v["units_received"] > 0:
+            fee_rate = v["fee_total"] / v["units_received"]
+        else:
+            fee_rate = 0.0
+        if fee_rate <= 0:
+            continue
+        per_sku[key] = {
+            "fee_total": round(v["fee_total"], 4),
+            "units_received": int(v["units_received"]),
+            "fee_bearing_units": int(v["fee_bearing_units"]),
+            "fee_rate": round(fee_rate, 6),
+            "asin": v.get("asin"),
+            "fnsku": v.get("fnsku"),
+            "sku": v.get("sku"),
+        }
+    return per_sku, sorted(months)
+
+
 async def fetch_inbound_placement_fees_per_sku(
-    months_back: int = 12,
+    months_back: int = 3,
 ) -> tuple[dict, list[str]]:
-    """Pull GET_FBA_INBOUND_PLACEMENT_SERVICE_FEE_INVOICE_DATA for the
-    last `months_back` months and return
-    ({sku: {"fee_total": $, "units_received": N}}, months_covered).
+    """Pull GET_FBA_INBOUND_PLACEMENT_FEES_CHARGES_DATA — same report as
+    Seller Central Reports → Fulfillment → FBA inbound placement service fees.
 
-    This is the same data the seller sees in their Amazon dashboard
-    (SKU × units received × per-unit rate × total charge). We accumulate
-    fees + units per SKU across all inbound shipments in the window so
-    the caller can compute a weighted per-unit rate and amortize like
-    COGS: units_sold_in_window × avg_fee_per_unit.
+    Many Draft SP-API apps receive 403 for this type. Rows are FNSKU-keyed;
+    callers should resolve to seller SKUs via products.
 
-    We avoid the Finances API / shipment-items reconstruction path
-    because it double-counts non-fee-qualifying SKUs in the same
-    shipment's denominator, diluting the per-unit rate 15-20×.
-
-    Caller is responsible for caching — the report takes 30-120 s to
-    generate.
+    Date window defaults to ~90 days (SC "Last 90 days"). Caller caches.
     """
     now = datetime.now(timezone.utc)
-    start = (now.replace(day=1) - timedelta(days=months_back * 31)).replace(day=1)
+    days = max(1, min(int(months_back * 30), 90))
+    start = now - timedelta(days=days)
     end = now
-    # Report ID matches the Seller Central Report Central path
-    # (/reportcentral/INBOUND_PLACEMENT_FEES_CHARGES/1).
     create_resp = await create_report(
         "GET_FBA_INBOUND_PLACEMENT_FEES_CHARGES_DATA",
         start_date=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1244,73 +1409,7 @@ async def fetch_inbound_placement_fees_per_sku(
             f"Placement fee report create returned no id: {create_resp}"
         )
     text = await download_report_raw(report_id, max_polls=24, poll_interval=10)
-
-    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
-    per_sku: dict[str, dict] = {}
-    months: set[str] = set()
-    # Amazon exports have drifted between snake_case and "friendly" column
-    # names; accept common variants so we don't break if they rename.
-    sku_keys = ("sku", "seller_sku", "SKU")
-    asin_keys = ("asin", "ASIN", "Asin")
-    qty_keys = ("actual_received_quantity", "received_quantity",
-                "Actual received quantity")
-    fee_keys = ("total_fba_inbound_placement_service_fee_charge",
-                "total_charge", "total_charges",
-                "Total FBA inbound placement service fee charge")
-    date_keys = ("transaction_date", "Transaction date")
-    for row in reader:
-        def _get(keys):
-            for k in keys:
-                v = row.get(k)
-                if v is not None and v != "":
-                    return v
-            return None
-        sku = (_get(sku_keys) or "").strip()
-        asin = (_get(asin_keys) or "").strip().upper()
-        if not sku:
-            continue
-        try:
-            units = int(float(_get(qty_keys) or 0))
-        except (TypeError, ValueError):
-            units = 0
-        try:
-            fee = float(_get(fee_keys) or 0)
-        except (TypeError, ValueError):
-            fee = 0.0
-        if units <= 0 and fee == 0:
-            continue
-        bucket = per_sku.setdefault(
-            sku,
-            {
-                "fee_total": 0.0,
-                "units_received": 0,
-                # Only units that incurred a placement charge — used for the
-                # Revenue Calculator-style per-unit rate. Including $0-fee
-                # Amazon-optimized inbound units diluted the rate ~4×+.
-                "fee_bearing_units": 0,
-                "asin": asin or None,
-            },
-        )
-        bucket["fee_total"] += fee
-        bucket["units_received"] += units
-        if fee > 0 and units > 0:
-            bucket["fee_bearing_units"] += units
-        if asin and not bucket.get("asin"):
-            bucket["asin"] = asin
-        dt = (_get(date_keys) or "").strip()
-        if dt:
-            months.add(dt[:7])  # YYYY-MM prefix
-
-    per_sku_rounded = {
-        sku: {
-            "fee_total": round(v["fee_total"], 2),
-            "units_received": v["units_received"],
-            "fee_bearing_units": v["fee_bearing_units"],
-            "asin": v.get("asin"),
-        }
-        for sku, v in per_sku.items()
-    }
-    return per_sku_rounded, sorted(months)
+    return parse_inbound_placement_fee_report(text)
 
 
 async def fetch_aged_inventory_fees_per_sku() -> dict:

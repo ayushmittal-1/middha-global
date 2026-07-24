@@ -643,17 +643,24 @@ def _build_placement_rates(placement_per_sku: dict) -> tuple[dict[str, float], d
     for psku, b in (placement_per_sku or {}).items():
         if not isinstance(b, dict):
             continue
-        fee = float(b.get("fee_total") or 0)
-        bearing = int(b.get("fee_bearing_units") or 0)
-        received = int(b.get("units_received") or 0)
-        denom = bearing if bearing > 0 else received
-        if denom <= 0 or fee <= 0:
+        # Prefer explicit fee_rate (Seller Central fee-rate column).
+        rate = float(b.get("fee_rate") or 0)
+        if rate <= 0:
+            fee = float(b.get("fee_total") or 0)
+            bearing = int(b.get("fee_bearing_units") or 0)
+            received = int(b.get("units_received") or 0)
+            denom = bearing if bearing > 0 else received
+            if denom <= 0 or fee <= 0:
+                continue
+            rate = fee / denom
+        if rate <= 0:
             continue
-        rate = fee / denom
         by_sku[psku] = rate
         asin = (b.get("asin") or "").strip().upper()
         if asin:
             by_asin[asin] = max(by_asin.get(asin, 0.0), rate)
+        if (psku or "").upper().startswith("B") and len(psku) == 10:
+            by_asin[psku.upper()] = max(by_asin.get(psku.upper(), 0.0), rate)
     return by_sku, by_asin
 
 
@@ -1126,8 +1133,12 @@ async def compute_profitability_data(
 
         if need_placement_fetch:
             placement_per_sku, months = (
-                await amazon_sp.fetch_inbound_placement_fees_per_sku(months_back=12)
+                await amazon_sp.fetch_inbound_placement_fees_per_sku(months_back=3)
             )
+            if use_db and placement_per_sku:
+                placement_per_sku = await aurora_data.resolve_placement_report_to_skus(
+                    require_user(), placement_per_sku,
+                )
             await put_placement_fee_cache(placement_per_sku, months)
             placement_meta["source"] = "report_live"
             placement_meta["sku_count"] = len(placement_per_sku)
@@ -1552,10 +1563,9 @@ async def compute_profitability_data(
         "Units and revenue exclude Canceled, Cancelled, and Unfulfillable orders "
         "(same rules as the Aurora dashboard).",
         "Inbound placement is per-unit rate × units sold — the rate comes from "
-        "Amazon's placement fee charges (report or Finances shipment charges "
-        "joined with your FBA shipments), matching the per-unit rate in the "
-        "Seller Central placement fee report. Amazon posts these ~45 days "
-        "after inbound receipt.",
+        "Seller Central's FBA inbound placement service fee rate (per unit) "
+        "column (SP-API report or synced CSV), resolved FNSKU→SKU. Finances "
+        "shipment join is only a fallback when the report is blocked (403).",
         "Storage uses GET_FBA_STORAGE_FEE_CHARGES_DATA: estimated monthly "
         "storage fee ÷ average quantity on hand × units sold (Revenue Calculator).",
         "Aged Inv uses GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA "
