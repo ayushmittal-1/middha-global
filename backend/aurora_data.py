@@ -213,11 +213,11 @@ async def fba_inbound_placement_by_sku(user: dict) -> Optional[dict[str, dict]]:
 
     Aurora's fbaInboundPlacementSyncService persists per-SKU inbound
     placement fees:
-      { totalUnits, totalFee, avgFeePerUnit, asin }
-    plus a top-level `source: 'report' | 'finances_join'` marker.
+      { totalUnits, totalFee, avgFeePerUnit, asin, fee_rate? }
+    plus a top-level `source: 'report' | 'finances_join' | 'seller_central_csv'` marker.
 
     Returns the shape used by agent._build_placement_rates:
-      {sku: {fee_total, units_received, fee_bearing_units, asin}}
+      {sku: {fee_total, units_received, fee_bearing_units, fee_rate, asin}}
     so the caller's rate-building code is unchanged.
 
     Returns None when the collection has no doc for this seller.
@@ -233,13 +233,164 @@ async def fba_inbound_placement_by_sku(user: dict) -> Optional[dict[str, dict]]:
             continue
         units = int(v.get("totalUnits") or 0)
         fee = float(v.get("totalFee") or 0.0)
-        if units <= 0 or fee <= 0:
+        rate = float(v.get("fee_rate") or v.get("avgFeePerUnit") or 0.0)
+        if rate <= 0 and units > 0 and fee > 0:
+            rate = fee / units
+        if rate <= 0 and fee <= 0:
+            continue
+        # When we only have a rate (units unknown), keep a unit weight of 1.
+        bearing = units if units > 0 else (1 if rate > 0 else 0)
+        out[sku] = {
+            "fee_total": fee if fee > 0 else round(rate * bearing, 4),
+            "units_received": units,
+            "fee_bearing_units": bearing,
+            "fee_rate": round(rate, 6),
+            "asin": v.get("asin"),
+            "fnsku": v.get("fnsku"),
+        }
+    return out or None
+
+
+async def resolve_placement_report_to_skus(
+    user: dict,
+    report_rows: dict[str, dict],
+) -> dict[str, dict]:
+    """Map placement report rows (often keyed by FNSKU) onto seller SKUs.
+
+    Seller Central's FBA inbound placement service fees CSV is keyed by
+    FNSKU + ASIN. Profitability is SKU-keyed, so resolve via Aurora products.
+    """
+    if not report_rows:
+        return {}
+    seller_id = ObjectId(str(user["_id"]))
+    fnskus = sorted(
+        {
+            str(b.get("fnsku") or key).strip().upper()
+            for key, b in report_rows.items()
+            if isinstance(b, dict)
+            and (
+                b.get("fnsku")
+                or (str(key).upper().startswith("X") and len(str(key)) >= 10)
+            )
+        }
+    )
+    asins = sorted(
+        {
+            str(b.get("asin") or "").strip().upper()
+            for b in report_rows.values()
+            if isinstance(b, dict) and b.get("asin")
+        }
+    )
+    fnsku_to_sku: dict[str, str] = {}
+    asin_to_skus: dict[str, list[str]] = {}
+    if fnskus or asins:
+        query: dict[str, Any] = {"sellerId": seller_id}
+        ors = []
+        if fnskus:
+            ors.append({"fnSku": {"$in": fnskus}})
+        if asins:
+            ors.append({"asin": {"$in": asins}})
+        if ors:
+            query["$or"] = ors
+        cursor = _db().products.find(query, {"sku": 1, "asin": 1, "fnSku": 1})
+        async for doc in cursor:
+            sku = (doc.get("sku") or "").strip()
+            if not sku:
+                continue
+            fn = (doc.get("fnSku") or "").strip().upper()
+            asin = (doc.get("asin") or "").strip().upper()
+            if fn:
+                fnsku_to_sku[fn] = sku
+            if asin:
+                asin_to_skus.setdefault(asin, []).append(sku)
+
+    per_sku: dict[str, dict] = {}
+
+    def _merge(sku: str, b: dict) -> None:
+        if not sku:
+            return
+        dst = per_sku.setdefault(
+            sku,
+            {
+                "fee_total": 0.0,
+                "units_received": 0,
+                "fee_bearing_units": 0,
+                "rate_weight": 0.0,
+                "rate_weighted_sum": 0.0,
+                "asin": None,
+                "fnsku": None,
+            },
+        )
+        fee = float(b.get("fee_total") or 0)
+        units = int(b.get("units_received") or 0)
+        bearing = int(b.get("fee_bearing_units") or 0)
+        rate = float(b.get("fee_rate") or 0)
+        weight = bearing if bearing > 0 else (units if units > 0 else (1 if rate > 0 else 0))
+        dst["fee_total"] += fee
+        dst["units_received"] += units
+        dst["fee_bearing_units"] += bearing if bearing > 0 else weight
+        if rate > 0 and weight > 0:
+            dst["rate_weight"] += weight
+            dst["rate_weighted_sum"] += rate * weight
+        if b.get("asin") and not dst.get("asin"):
+            dst["asin"] = str(b["asin"]).upper()
+        if b.get("fnsku") and not dst.get("fnsku"):
+            dst["fnsku"] = str(b["fnsku"]).upper()
+
+    for key, b in report_rows.items():
+        if not isinstance(b, dict):
+            continue
+        explicit_sku = (b.get("sku") or "").strip()
+        fnsku = (b.get("fnsku") or "").strip().upper()
+        asin = (b.get("asin") or "").strip().upper()
+        key_s = str(key).strip()
+        key_u = key_s.upper()
+
+        sku = explicit_sku
+        if sku and (
+            sku.upper() == (fnsku or "").upper()
+            or sku.upper() == (asin or "").upper()
+            or (sku.upper().startswith("X") and len(sku) >= 10)
+        ):
+            sku = ""
+        if not sku and key_s and not key_u.startswith("X") and not (
+            key_u.startswith("B") and len(key_u) == 10
+        ):
+            sku = key_s
+        if not sku and fnsku and fnsku in fnsku_to_sku:
+            sku = fnsku_to_sku[fnsku]
+        if not sku and key_u.startswith("X") and key_u in fnsku_to_sku:
+            sku = fnsku_to_sku[key_u]
+            fnsku = fnsku or key_u
+        if not sku and asin:
+            cands = asin_to_skus.get(asin) or []
+            if len(cands) == 1:
+                sku = cands[0]
+        if sku:
+            _merge(sku, {**b, "fnsku": fnsku or b.get("fnsku"), "asin": asin or b.get("asin")})
+        elif asin:
+            # Keep ASIN-keyed row so _build_placement_rates can still match.
+            _merge(asin, {**b, "fnsku": fnsku or b.get("fnsku"), "asin": asin})
+
+    out: dict[str, dict] = {}
+    for sku, v in per_sku.items():
+        if v.get("rate_weight", 0) > 0:
+            fee_rate = v["rate_weighted_sum"] / v["rate_weight"]
+        elif v.get("fee_bearing_units", 0) > 0:
+            fee_rate = v["fee_total"] / v["fee_bearing_units"]
+        elif v.get("units_received", 0) > 0:
+            fee_rate = v["fee_total"] / v["units_received"]
+        else:
+            continue
+        if fee_rate <= 0:
             continue
         out[sku] = {
-            "fee_total": fee,
-            "units_received": units,
-            "fee_bearing_units": units,
+            "fee_total": round(v["fee_total"], 4),
+            "units_received": int(v["units_received"]),
+            "fee_bearing_units": int(v["fee_bearing_units"]),
+            "fee_rate": round(fee_rate, 6),
             "asin": v.get("asin"),
+            "fnsku": v.get("fnsku"),
         }
     return out
 
