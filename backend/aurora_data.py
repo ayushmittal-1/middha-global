@@ -211,16 +211,12 @@ async def fba_aged_inventory_by_sku(user: dict) -> Optional[dict[str, dict]]:
 async def fba_inbound_placement_by_sku(user: dict) -> Optional[dict[str, dict]]:
     """Read Aurora's `fbainboundplacementfees` snapshot for this seller.
 
-    Aurora's fbaInboundPlacementSyncService persists per-SKU inbound
-    placement fees:
-      { totalUnits, totalFee, avgFeePerUnit, asin, fee_rate? }
-    plus a top-level `source: 'report' | 'finances_join' | 'seller_central_csv'` marker.
+    Prefer dated `events` when present (Seller Central transaction rows).
+    Also returns rolled-up perSku rates for legacy / Finances-join docs.
 
-    Returns the shape used by agent._build_placement_rates:
-      {sku: {fee_total, units_received, fee_bearing_units, fee_rate, asin}}
-    so the caller's rate-building code is unchanged.
-
-    Returns None when the collection has no doc for this seller.
+    Returns the shape used by agent._build_placement_rates, plus optional
+    `_events` key on a sentinel… actually returns only per_sku map.
+    Use `fba_inbound_placement_charges_for_window` for date-filtered totals.
     """
     seller_id = ObjectId(str(user["_id"]))
     doc = await _db().fbainboundplacementfees.find_one({"sellerId": seller_id})
@@ -238,7 +234,6 @@ async def fba_inbound_placement_by_sku(user: dict) -> Optional[dict[str, dict]]:
             rate = fee / units
         if rate <= 0 and fee <= 0:
             continue
-        # When we only have a rate (units unknown), keep a unit weight of 1.
         bearing = units if units > 0 else (1 if rate > 0 else 0)
         out[sku] = {
             "fee_total": fee if fee > 0 else round(rate * bearing, 4),
@@ -249,6 +244,156 @@ async def fba_inbound_placement_by_sku(user: dict) -> Optional[dict[str, dict]]:
             "fnsku": v.get("fnsku"),
         }
     return out or None
+
+
+def _parse_placement_tx_date(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    s = str(raw).strip().replace("/", "-")
+    if " " in s and "T" not in s:
+        s = s.replace(" ", "T", 1)
+    # Truncate fractional seconds / timezone noise for fromisoformat
+    if len(s) >= 19:
+        s = s[:19]
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            dt = datetime.strptime(s[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+async def fba_inbound_placement_charges_for_window(
+    user: dict,
+    start_dt: datetime,
+    end_dt: datetime,
+    marketplace_tz: str | None = None,
+) -> tuple[dict[str, float], dict[str, float], dict]:
+    """Sum Seller Central placement charges whose Transaction date falls in
+    the profitability filter — same Event Date window as Seller Central.
+
+    Transaction dates from SC have no timezone; compare calendar days in the
+    marketplace timezone (same day boundaries as Orders / display_start/end).
+
+    Returns (by_sku_fee_total, by_asin_fee_total, meta).
+    ASIN map only includes events that could not be resolved to a seller SKU
+    (avoids double-counting when both maps are used).
+    """
+    seller_id = ObjectId(str(user["_id"]))
+    doc = await _db().fbainboundplacementfees.find_one({"sellerId": seller_id})
+    meta: dict = {"source": None, "event_count": 0, "matched_events": 0}
+    if not doc:
+        return {}, {}, meta
+
+    meta["source"] = doc.get("source") or "unknown"
+    events = doc.get("events") or []
+    if not events:
+        return {}, {}, meta
+
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+
+    by_sku: dict[str, float] = defaultdict(float)
+    by_asin: dict[str, float] = defaultdict(float)
+    meta["event_count"] = len(events)
+    window_total = 0.0
+
+    # Marketplace-local calendar days (matches display_start / display_end).
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(marketplace_tz) if marketplace_tz else timezone.utc
+    except Exception:
+        tz = timezone.utc
+    start_day = start_dt.astimezone(tz).date()
+    end_day = end_dt.astimezone(tz).date()
+    meta["window_start"] = start_day.isoformat()
+    meta["window_end"] = end_day.isoformat()
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        tx = _parse_placement_tx_date(ev.get("transaction_date"))
+        if tx is None:
+            continue
+        # SC Transaction date is marketplace-local wall time without TZ.
+        tx_day = tx.replace(tzinfo=None).date()
+        if tx_day < start_day or tx_day > end_day:
+            continue
+        fee = float(ev.get("fee_total") or 0)
+        if fee <= 0:
+            continue
+        meta["matched_events"] += 1
+        window_total += fee
+        sku = (ev.get("sku") or "").strip()
+        asin = (ev.get("asin") or "").strip().upper()
+        if sku:
+            by_sku[sku] += fee
+        elif asin:
+            by_asin[asin] += fee
+
+    meta["window_total"] = round(window_total, 2)
+    return (
+        {k: round(v, 2) for k, v in by_sku.items()},
+        {k: round(v, 2) for k, v in by_asin.items()},
+        meta,
+    )
+
+
+async def resolve_placement_events_to_skus(
+    user: dict,
+    events: list[dict],
+) -> list[dict]:
+    """Attach seller SKU to each dated placement event via FNSKU/ASIN."""
+    if not events:
+        return []
+    # Reuse resolve on a synthetic per-key map, then stamp sku onto events.
+    synthetic: dict[str, dict] = {}
+    for ev in events:
+        fn = (ev.get("fnsku") or "").strip().upper()
+        asin = (ev.get("asin") or "").strip().upper()
+        key = fn or asin or (ev.get("sku") or "")
+        if not key:
+            continue
+        synthetic[key] = {
+            "fee_total": float(ev.get("fee_total") or 0),
+            "units_received": int(ev.get("units") or 0),
+            "fee_bearing_units": int(ev.get("units") or 0),
+            "fee_rate": float(ev.get("fee_rate") or 0),
+            "asin": asin or None,
+            "fnsku": fn or None,
+            "sku": (ev.get("sku") or None),
+        }
+    resolved = await resolve_placement_report_to_skus(user, synthetic)
+    # Build fnsku→sku and asin→sku from resolved
+    fn_to_sku: dict[str, str] = {}
+    asin_to_sku: dict[str, str] = {}
+    for sku, b in resolved.items():
+        if b.get("fnsku"):
+            fn_to_sku[str(b["fnsku"]).upper()] = sku
+        if b.get("asin"):
+            asin_to_sku[str(b["asin"]).upper()] = sku
+
+    out: list[dict] = []
+    for ev in events:
+        row = dict(ev)
+        fn = (row.get("fnsku") or "").strip().upper()
+        asin = (row.get("asin") or "").strip().upper()
+        sku = (row.get("sku") or "").strip()
+        if not sku and fn and fn in fn_to_sku:
+            sku = fn_to_sku[fn]
+        if not sku and asin and asin in asin_to_sku:
+            sku = asin_to_sku[asin]
+        row["sku"] = sku or None
+        row["fnsku"] = fn or None
+        row["asin"] = asin or None
+        out.append(row)
+    return out
 
 
 async def resolve_placement_report_to_skus(

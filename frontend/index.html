@@ -1835,7 +1835,7 @@
               <th class="num" title="Selling Price × category referral fee % (Product Fees API)">Referral</th>
               <th class="num" title="FBA size-tier fulfillment fee per unit × units (Product Fees API)">FBA</th>
               <th class="num" title="Fuel and inflation surcharge from Product Fees API (split from fulfillment when bundled)">Fuel</th>
-              <th class="num" title="Amazon placement charges ÷ units received × units sold — matches the per-unit rate in the Seller Central placement fee report">Inbound Placement</th>
+              <th class="num" title="Seller Central FBA inbound placement service fees — account total for the selected Event/Transaction date filter. Not allocated by SKU (shown as BLENDED).">Inbound Placement</th>
               <th class="num" title="Low Inventory Level Fee from Finances API (45-day lookback)">Low Inv</th>
               <th class="num" title="FBA storage report: monthly fee ÷ avg units on hand × units sold">Storage</th>
               <th class="num" title="Seller Central Aged Inventory Surcharge report: sum of amount-charged per SKU for months in the window">Aged Inv</th>
@@ -3048,7 +3048,7 @@
                 <td class="num">${money(r.referral_fee)}</td>
                 <td class="num">${money(r.fba_fee)}</td>
                 <td class="num">${money(r.fuel_surcharge)}</td>
-                <td class="num">${money(r.inbound_placement_fee)}</td>
+                <td class="num" title="Inbound placement is blended from the Seller Central report for the date filter — see Totals">${(data.placement_blended || (data.placement_meta && data.placement_meta.blended)) ? `<span class="profit-ads-blended">BLENDED</span>` : money(r.inbound_placement_fee)}</td>
                 <td class="num">${money(r.low_inventory_fee)}</td>
                 <td class="num">${money(r.storage_fee)}</td>
                 <td class="num">${money(r.aged_inventory_fee)}</td>
@@ -3072,7 +3072,7 @@
                 <td class="num">${money(t.referral_fee)}</td>
                 <td class="num">${money(t.fba_fee)}</td>
                 <td class="num">${money(t.fuel_surcharge)}</td>
-                <td class="num">${money(t.inbound_placement_fee)}</td>
+                <td class="num" title="Seller Central placement Total charge for Transaction dates in this filter">${(data.placement_blended || (data.placement_meta && data.placement_meta.blended)) ? `<span class="profit-ads-blended">${money(t.inbound_placement_fee)}</span>` : money(t.inbound_placement_fee)}</td>
                 <td class="num">${money(t.low_inventory_fee)}</td>
                 <td class="num">${money(t.storage_fee)}</td>
                 <td class="num">${money(t.aged_inventory_fee)}</td>
