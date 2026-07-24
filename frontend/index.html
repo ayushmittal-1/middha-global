@@ -3072,7 +3072,7 @@
                 <td class="num">${money(t.referral_fee)}</td>
                 <td class="num">${money(t.fba_fee)}</td>
                 <td class="num">${money(t.fuel_surcharge)}</td>
-                <td class="num" title="Seller Central placement Total charge for Transaction dates in this filter">${(data.placement_blended || (data.placement_meta && data.placement_meta.blended)) ? `<span class="profit-ads-blended">${money(t.inbound_placement_fee)}</span>` : money(t.inbound_placement_fee)}</td>
+                <td class="num" title="Seller Central placement Total charge for Transaction dates in this filter">${money(t.inbound_placement_fee)}</td>
                 <td class="num">${money(t.low_inventory_fee)}</td>
                 <td class="num">${money(t.storage_fee)}</td>
                 <td class="num">${money(t.aged_inventory_fee)}</td>
