@@ -207,7 +207,9 @@ async def get_ad_spend_for_range(start, end) -> dict:
       }
     """
     from datetime import datetime as _dt, timezone as _tz
+    from zoneinfo import ZoneInfo
     from aurora_data import aurora_db_enabled, fetch_ad_spend_by_campaign
+    from marketplace_timezone import resolve_dashboard_timezone
 
     await _ensure_loaded()
     campaigns = _user_campaigns[_user_key()]
@@ -229,8 +231,20 @@ async def get_ad_spend_for_range(start, end) -> dict:
 
     win_start = _to_dt(start)
     win_end = _to_dt(end)
-    start_ymd = win_start.date().isoformat() if win_start else None
-    end_ymd = win_end.date().isoformat() if win_end else None
+
+    # YMD keys must be in the seller's marketplace timezone — Aurora's
+    # `admetricsdailies.date` field is a YMD string in that TZ, and its
+    # dashboard queries with the raw user-input YMD (no UTC shift). Our
+    # callers pass end as 23:59:59 in mp-TZ converted to UTC, so a naive
+    # `.date()` on the UTC value rolls forward one day and adds an extra
+    # day of spend to the aggregate.
+    try:
+        mp_tz = resolve_dashboard_timezone(require_user(), None)
+    except Exception:
+        mp_tz = "UTC"
+    tz = ZoneInfo(mp_tz)
+    start_ymd = win_start.astimezone(tz).date().isoformat() if win_start else None
+    end_ymd = win_end.astimezone(tz).date().isoformat() if win_end else None
 
     # Aurora's `admetricsdailies` is keyed by campaignId — build the
     # campaignId → skus map once so we can allocate range-filtered spend
