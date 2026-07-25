@@ -654,6 +654,33 @@ async def fetch_inventory_summaries(
     return rows
 
 
+async def fetch_ad_spend_by_campaign(
+    user: dict, start_ymd: str, end_ymd: str,
+) -> dict[str, float]:
+    """Per-campaign spend in [start_ymd, end_ymd] from Aurora's
+    `admetricsdailies` collection — the exact source Aurora's own
+    /api/ads dashboard aggregates when a date filter is applied
+    (see auroraBackend/src/services/adsMetricsService.js:124).
+
+    YMD strings match Aurora's `date` field format. Returns
+    {campaignId: total_spend_in_range}.
+    """
+    seller_id = ObjectId(str(user["_id"]))
+    cursor = _db().admetricsdailies.aggregate([
+        {"$match": {
+            "sellerId": seller_id,
+            "source": "DAILY",
+            "date": {"$gte": start_ymd, "$lte": end_ymd},
+        }},
+        {"$group": {
+            "_id": "$campaignId",
+            "spend": {"$sum": {"$ifNull": ["$spend", 0]}},
+        }},
+    ])
+    rows = await cursor.to_list(length=None)
+    return {str(r["_id"]): float(r.get("spend") or 0) for r in rows if r.get("_id")}
+
+
 async def fetch_campaigns(user: dict) -> list[dict]:
     """Campaign metrics from Aurora `ads` collection (+ optional extras)."""
     seller_id = ObjectId(str(user["_id"]))
