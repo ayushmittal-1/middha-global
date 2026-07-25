@@ -2439,13 +2439,22 @@
     const profitStampEl = document.getElementById('profit-stamp');
     const profitStartEl = document.getElementById('profit-start');
     const profitEndEl = document.getElementById('profit-end');
-    // Default range: last 7 days ending today. `toISOString().slice(0,10)`
-    // gives UTC date; that's what the backend expects anyway.
+    // Default range: last 7 days ending "today" in marketplace TZ.
+    // toISOString() is UTC and shifts the calendar day vs Seller Central PDT
+    // (e.g. evening in India can already be the next UTC date).
     (function initProfitDates() {
+      const tz = 'America/Los_Angeles';
+      const ymdInTz = (d) => {
+        const parts = new Intl.DateTimeFormat('en-US', {
+          timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+        }).formatToParts(d);
+        const get = (t) => parts.find((p) => p.type === t)?.value || '00';
+        return `${get('year')}-${get('month')}-${get('day')}`;
+      };
       const today = new Date();
       const back7 = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
-      profitEndEl.value   = today.toISOString().slice(0, 10);
-      profitStartEl.value = back7.toISOString().slice(0, 10);
+      profitEndEl.value = ymdInTz(today);
+      profitStartEl.value = ymdInTz(back7);
     })();
     const profitRefreshBtn = document.getElementById('profit-refresh');
     const profitSearchEl = document.getElementById('profit-search');
