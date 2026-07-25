@@ -275,6 +275,13 @@ async def get_ad_spend_for_range(start, end) -> dict:
     unattributed = 0.0
     total_window = 0.0
     for cid, spend in spend_by_campaign.items():
+        # Only count campaigns that still exist in the Ad collection.
+        # Aurora's dashboard does the same via overlayAdsWithPeriodMetrics
+        # (adController.js:216) — orphaned admetricsdailies rows for
+        # deleted campaigns get dropped, otherwise we sum higher than
+        # Aurora shows.
+        if cid not in skus_by_campaign:
+            continue
         total_window += spend
         skus = skus_by_campaign.get(cid, [])
         if skus:
