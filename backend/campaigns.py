@@ -184,26 +184,27 @@ async def get_ad_spend_for_window(window_days: int) -> dict:
 
 
 async def get_ad_spend_for_range(start, end) -> dict:
-    """Aurora ad spend within [start, end], attributed per SKU when the
-    Aurora Ad doc carries a `skus` array (see the seed script / the
-    Ad.skus field we added). Aurora caches cumulative campaign spend over
-    the campaign's `metricsStartDate → metricsEndDate` window; we compute a
-    daily rate off that and multiply by the overlap between the campaign's
-    metrics window and the requested [start, end].
+    """Aurora ad spend, matched to what Aurora's own /api/ads dashboard shows.
 
-    Returns:
+    Aurora's dashboard sums each campaign's cached `spend.amount` as-is —
+    the endpoint accepts no date-range params (see curl in
+    AURORA_ORDER_FEES_TICKET history). So to make our Profitability "Ad
+    spend" tile line up with Aurora, we do the same: sum the raw cached
+    amount per campaign, no proration by overlap.
+
+    Trade-off: the tile no longer scales with the date picker. That's
+    accepted — the column is already labeled BLENDED (see commit b05cbea)
+    and the KPI tile documents this.
+
+    Returns the same shape as before so downstream callers (per-SKU
+    allocation, LLM tools) don't need to change:
       {
-        total_window:    float,   # sum of every campaign's overlap-spend
-        by_sku:          {sku: window_spend, ...},   # split by campaign.skus
+        total_window:    float,   # sum of every campaign's cached spend
+        by_sku:          {sku: spend, ...},   # split by campaign.skus
         unattributed:    float,   # spend from campaigns without a skus list
         campaign_count:  int,
-        start / end:     ISO strings,
+        start / end:     ISO strings (echoed back for the FE),
       }
-
-    Allocation model within a campaign that has a skus list: uniform —
-    each listed SKU gets total_campaign_window_spend / len(skus). Simple
-    and honest until Amazon's Advertised Product report is wired for
-    real per-SKU attribution.
     """
     from datetime import datetime as _dt, timezone as _tz
 
@@ -223,68 +224,40 @@ async def get_ad_spend_for_range(start, end) -> dict:
                 return None
         if result is None:
             return None
-        # Always return tz-aware so max()/min()/subtraction never mix naive
-        # with aware (raises TypeError). Assume any naive value is UTC —
-        # Aurora writes both flavors depending on the ingest path.
         return result if result.tzinfo else result.replace(tzinfo=_tz.utc)
 
     win_start = _to_dt(start)
     win_end = _to_dt(end)
-    if not win_start or not win_end or win_end <= win_start:
-        return {
-            "total_window": 0.0, "by_sku": {}, "unattributed": 0.0,
-            "campaign_count": len(campaigns), "start": None, "end": None,
-            "total_lifetime": 0.0, "daily_rate": 0.0, "metrics_days": 0,
-        }
 
     by_sku: dict[str, float] = {}
     unattributed = 0.0
     total_window = 0.0
-    total_lifetime = 0.0
     metric_spans: list[float] = []
 
     for c in campaigns:
         spend = float((c.get("spend") or {}).get("amount") or 0)
-        total_lifetime += spend
+        total_window += spend
 
         m_start = _to_dt(c.get("metricsStartDate"))
         m_end = _to_dt(c.get("metricsEndDate"))
-        # Fallback: if the campaign doesn't carry metrics dates, assume the
-        # cached spend covers the last 30 days ending now — same guess the
-        # legacy uniform path used to make.
-        if not m_start or not m_end or m_end <= m_start:
-            m_end = win_end
-            m_start = win_end - (win_end - win_start)
-        span_days = max((m_end - m_start).total_seconds() / 86400.0, 0.5)
-        metric_spans.append(span_days)
-        daily_rate = spend / span_days if span_days > 0 else 0.0
-
-        # Overlap of [m_start, m_end] with [win_start, win_end].
-        ov_start = max(m_start, win_start)
-        ov_end = min(m_end, win_end)
-        if ov_end <= ov_start:
-            continue
-        overlap_days = (ov_end - ov_start).total_seconds() / 86400.0
-        campaign_window_spend = daily_rate * overlap_days
-        total_window += campaign_window_spend
+        if m_start and m_end and m_end > m_start:
+            metric_spans.append((m_end - m_start).total_seconds() / 86400.0)
 
         skus = c.get("skus") or []
-        # Aurora persists the array with mixed casing over time; accept a
-        # single string too as a defensive fallback.
         if isinstance(skus, str):
             skus = [skus]
         skus = [str(s).strip() for s in skus if str(s or "").strip()]
 
         if skus:
-            per_sku = campaign_window_spend / len(skus)
+            per_sku = spend / len(skus)
             for sku in skus:
                 by_sku[sku] = by_sku.get(sku, 0.0) + per_sku
         else:
-            unattributed += campaign_window_spend
+            unattributed += spend
 
     metrics_days = max(metric_spans) if metric_spans else 0
     daily_rate_overall = (
-        total_lifetime / metrics_days if metrics_days else 0.0
+        total_window / metrics_days if metrics_days else 0.0
     )
 
     return {
@@ -292,9 +265,9 @@ async def get_ad_spend_for_range(start, end) -> dict:
         "by_sku": {sku: round(v, 2) for sku, v in by_sku.items()},
         "unattributed": round(unattributed, 2),
         "campaign_count": len(campaigns),
-        "start": win_start.date().isoformat(),
-        "end": win_end.date().isoformat(),
-        "total_lifetime": round(total_lifetime, 2),
+        "start": win_start.date().isoformat() if win_start else None,
+        "end": win_end.date().isoformat() if win_end else None,
+        "total_lifetime": round(total_window, 2),
         "daily_rate": round(daily_rate_overall, 4),
         "metrics_days": round(metrics_days, 2),
     }
