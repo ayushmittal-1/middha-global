@@ -850,7 +850,7 @@ async def compute_profitability_data(
         is_per_asin_by_month_storage_cache,
         merge_storage_by_asin_month,
         split_bundled_fulfillment_total,
-        storage_per_unit_for_window,
+        storage_fees_by_asin_for_window,
     )
 
     # Normalize window using marketplace timezone (matches Aurora Orders / SC).
@@ -1066,6 +1066,22 @@ async def compute_profitability_data(
                 )
         except Exception as e:
             warnings.append(_sp_report_warning("Storage", e))
+
+    storage_fees_by_asin, storage_report_total, storage_month_fractions = (
+        storage_fees_by_asin_for_window(
+            storage_by_asin_month,
+            storage_months_in_window,
+            window_start=start_dt,
+            window_end=end_dt,
+            time_zone=mp_tz,
+        )
+    )
+    # Units sold per ASIN — used to split that ASIN's report fee across SKUs.
+    storage_units_by_asin: dict[str, float] = defaultdict(float)
+    for _sku, _d in sku_data.items():
+        _asin = (_d.get("asin") or "").upper()
+        if _asin and _d.get("units"):
+            storage_units_by_asin[_asin] += float(_d["units"])
 
     product_fee_fallback: dict[str, dict] = {}
     fin_by_sku: dict[str, dict] = {}
@@ -1475,14 +1491,16 @@ async def compute_profitability_data(
 
         amazon_fees = round(referral_total + fba_total + fuel_total, 2)
 
-        # Storage: month_of_charge fee ÷ avg units on hand × units sold (SC report).
-        asin_months = storage_by_asin_month.get((asin or "").upper(), {})
-        if not asin_months and asin:
-            asin_months = storage_by_asin_month.get(asin, {})
-        storage_per_unit = storage_per_unit_for_window(
-            asin_months, storage_months_in_window,
-        )
-        storage = round(storage_per_unit * units, 2)
+        # Storage: use Seller Central Monthly Storage Fees $ for this ASIN
+        # (month_of_charge in filter), split across SKUs that sold that ASIN.
+        # This matches the downloaded report total — NOT fee÷qty × units sold.
+        asin_key = (asin or "").upper()
+        asin_storage_fee = float(storage_fees_by_asin.get(asin_key, 0.0) or 0.0)
+        asin_sold_units = float(storage_units_by_asin.get(asin_key, 0.0) or 0.0)
+        if asin_storage_fee > 0 and asin_sold_units > 0 and units > 0:
+            storage = round(asin_storage_fee * (units / asin_sold_units), 2)
+        else:
+            storage = 0.0
 
         # Ads: per-campaign attribution when the campaign lists this SKU,
         # plus a share of the unattributed pool spread per unit.
@@ -1631,10 +1649,23 @@ async def compute_profitability_data(
         totals["inbound_placement_fee"] = fee_r
         totals["net"] -= fee_r
 
+    # Storage fees on ASINs with inventory but no sales in the window still
+    # appear on Seller Central's Monthly Storage Fees report — add residual
+    # so the Storage KPI matches the CSV total.
+    allocated_storage = round(float(totals.get("storage_fee") or 0), 2)
+    storage_unallocated = round(
+        max(0.0, float(storage_report_total or 0) - allocated_storage), 2,
+    )
+    if storage_unallocated > 0:
+        totals["storage_fee"] = round(allocated_storage + storage_unallocated, 2)
+        totals["net"] -= storage_unallocated
+
     rev = totals["revenue"]
     totals_out = {k: round(v, 2) for k, v in totals.items()}
     totals_out["units"] = int(totals["units"])
     totals_out["margin"] = round((totals["net"] / rev * 100), 1) if rev > 0 else 0.0
+    totals_out["storage_report_total"] = round(float(storage_report_total or 0), 2)
+    totals_out["storage_unallocated"] = storage_unallocated
 
     caveats = [
         f"Date range uses marketplace timezone ({mp_tz}) — same day boundaries as Aurora Orders.",
@@ -1668,8 +1699,10 @@ async def compute_profitability_data(
         )
     caveats.extend([
         "Storage uses GET_FBA_STORAGE_FEE_CHARGES_DATA for the calendar month(s) "
-        "in your filter (month_of_charge): estimated monthly storage fee ÷ "
-        "average quantity on hand × units sold (Revenue Calculator).",
+        f"in your filter ({', '.join(storage_months_in_window) or 'none'}): the "
+        "estimated_monthly_storage_fee total from Seller Central's Monthly Storage "
+        "Fees report (same as the CSV download). Each ASIN's fee is split across "
+        "SKUs that sold that ASIN; ASINs with storage but no sales stay in Totals.",
         "Aged Inv uses GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA "
         "(Seller Central Aged Inventory Surcharge report): sum of "
         "amount-charged per seller SKU for months overlapping the window.",
@@ -1679,6 +1712,15 @@ async def compute_profitability_data(
         "Ads are allocated uniformly per unit — per-SKU PPC attribution requires productAd joins.",
         "Fees posted without a SellerSKU (typically removals) are spread across units proportionally.",
     ])
+    if storage_report_total > 0:
+        caveats.append(
+            f"Storage report total for this window: ${storage_report_total:,.2f}"
+            + (
+                f" (${storage_unallocated:,.2f} on ASINs with no sales in the filter)."
+                if storage_unallocated > 0
+                else "."
+            )
+        )
     if not storage_by_asin_month:
         caveats.append("Storage fees: report unavailable for this window; values are 0.")
     if aged_charges_meta.get("access_denied"):

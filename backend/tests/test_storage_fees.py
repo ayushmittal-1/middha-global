@@ -135,3 +135,50 @@ def test_months_covered_union_not_concat():
         assert False, "expected TypeError"
     except TypeError as e:
         assert "set" in str(e) and "list" in str(e)
+
+
+def test_june_report_total_matches_csv_allocation():
+    """Full June filter Storage KPI must equal Seller Central CSV total (~$39.44)."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    from amazon_sp import (
+        parse_storage_fee_report,
+        storage_fees_by_asin_for_window,
+    )
+
+    text = _load_sample("401643020661.csv")
+    per_asin, months = parse_storage_fee_report(text)
+    assert months == ["2026-06"]
+
+    tz = "America/Los_Angeles"
+    z = ZoneInfo(tz)
+    start = datetime(2026, 6, 1, 0, 0, 0, tzinfo=z).astimezone(timezone.utc)
+    end = datetime(2026, 6, 30, 23, 59, 59, 999999, tzinfo=z).astimezone(timezone.utc)
+    fees, total, fractions = storage_fees_by_asin_for_window(
+        per_asin, ["2026-06"], start, end, tz,
+    )
+    assert abs(fractions["2026-06"] - 1.0) < 1e-6
+    assert abs(total - 39.44) < 0.02
+    assert abs(sum(fees.values()) - total) < 0.02
+
+    # rate × units sold would NOT match (user's mismatch).
+    asin = "B0CJFNHJRX"
+    report_fee = fees[asin]
+    wrong = per_asin[asin]["2026-06"]["storage_per_unit"] * 500
+    assert wrong > report_fee * 2
+
+
+def test_asin_fee_split_across_skus_sums_to_report():
+    from amazon_sp import parse_storage_fee_report, storage_fees_by_asin_for_window
+
+    text = _load_sample("401643020661.csv")
+    per_asin, _ = parse_storage_fee_report(text)
+    fees, total, _ = storage_fees_by_asin_for_window(per_asin, ["2026-06"])
+    asin = "B0CJFNHJRX"
+    asin_fee = fees[asin]
+    # two SKUs share ASIN 60/40
+    s1 = round(asin_fee * (60 / 100), 2)
+    s2 = round(asin_fee * (40 / 100), 2)
+    assert abs((s1 + s2) - asin_fee) <= 0.01
+    assert abs(total - 39.44) < 0.02

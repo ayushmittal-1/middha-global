@@ -956,6 +956,9 @@ def storage_per_unit_for_window(
     (estimated_monthly_storage_fee ÷ average_quantity_on_hand). When the
     window spans multiple months we sum fees and qty across those months
     (same ASIN rollup SC uses in the monthly report).
+
+    Prefer ``storage_fee_for_asin_months`` when matching the Monthly Storage
+    Fees report dollar total (fee is inventory-based, not units-sold × rate).
     """
     total_fee = 0.0
     total_qty = 0.0
@@ -968,6 +971,76 @@ def storage_per_unit_for_window(
     if total_fee <= 0:
         return 0.0
     return round(total_fee / max(total_qty, 1.0), 6)
+
+
+def month_overlap_fraction(
+    month_key: str,
+    window_start: datetime,
+    window_end: datetime,
+    time_zone: str = "UTC",
+) -> float:
+    """Fraction of calendar month overlapping [window_start, window_end] (UTC)."""
+    m_start, m_end_excl = month_start_end_excl(month_key, time_zone)
+    # Treat end as inclusive instant: extend by 1µs so end-of-month matches full month.
+    w_start = window_start
+    w_end_excl = window_end + timedelta(microseconds=1)
+    overlap_start = max(m_start, w_start)
+    overlap_end = min(m_end_excl, w_end_excl)
+    if overlap_end <= overlap_start:
+        return 0.0
+    month_seconds = (m_end_excl - m_start).total_seconds()
+    if month_seconds <= 0:
+        return 0.0
+    frac = (overlap_end - overlap_start).total_seconds() / month_seconds
+    return max(0.0, min(1.0, frac))
+
+
+def storage_fee_for_asin_months(
+    asin_by_month: dict[str, dict],
+    months_in_window: list[str],
+    month_fractions: dict[str, float] | None = None,
+) -> float:
+    """Actual Monthly Storage Fees $ for one ASIN (optionally day-prorated)."""
+    total = 0.0
+    for month in months_in_window:
+        bucket = asin_by_month.get(month) or {}
+        if not isinstance(bucket, dict):
+            continue
+        fee = _coerce_float(bucket.get("monthly_fee"))
+        frac = 1.0 if not month_fractions else float(month_fractions.get(month, 0.0))
+        total += fee * frac
+    return round(total, 4)
+
+
+def storage_fees_by_asin_for_window(
+    storage_by_asin_month: dict[str, dict[str, dict]],
+    months_in_window: list[str],
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+    time_zone: str = "UTC",
+) -> tuple[dict[str, float], float, dict[str, float]]:
+    """ASIN → prorated monthly storage fee matching Seller Central report.
+
+    Returns (fees_by_asin, report_total, month_fractions).
+    Full-month filters (e.g. June 1–30) yield fraction 1.0 so totals match
+    the downloaded Monthly Storage Fees CSV exactly.
+    """
+    fractions: dict[str, float] = {}
+    for month in months_in_window:
+        if window_start is not None and window_end is not None:
+            fractions[month] = month_overlap_fraction(
+                month, window_start, window_end, time_zone,
+            )
+        else:
+            fractions[month] = 1.0
+
+    fees_by_asin: dict[str, float] = {}
+    for asin, by_month in (storage_by_asin_month or {}).items():
+        fee = storage_fee_for_asin_months(by_month, months_in_window, fractions)
+        if fee > 0:
+            fees_by_asin[str(asin).upper()] = fee
+    report_total = round(sum(fees_by_asin.values()), 2)
+    return fees_by_asin, report_total, fractions
 
 
 def is_per_asin_by_month_storage_cache(cached: dict) -> bool:
