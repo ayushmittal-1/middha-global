@@ -1981,56 +1981,108 @@ def _report_covers_month(
     return ds < month_end_excl and de > month_start
 
 
-def _accumulate_aged_surcharge_rows(text: str, per_sku: dict[str, dict]) -> None:
-    """Parse amount-charged rows from an AIS charges report into per_sku."""
+def _accumulate_aged_surcharge_rows(
+    text: str,
+    per_sku: dict[str, dict],
+    months_filter: set[str] | None = None,
+) -> list[str]:
+    """Parse amount-charged rows from an AIS charges report into per_sku.
 
-    def _f(row: dict, *keys: str) -> float:
-        for k in keys:
-            raw = row.get(k)
-            if raw in (None, ""):
-                continue
-            try:
-                return float(raw)
-            except (TypeError, ValueError):
-                continue
-        return 0.0
+    Accepts Seller Central CSV downloads and SP-API TSV. Optionally keeps only
+    rows whose snapshot-date month is in ``months_filter`` (YYYY-MM), matching
+    Seller Central's Event Month filter.
 
-    def _i(row: dict, *keys: str) -> int:
-        return int(_f(row, *keys))
+    Returns the set of snapshot months observed (as a sorted list).
+    """
+    if not (text or "").strip():
+        return []
 
-    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+    cleaned = text.lstrip("\ufeff")
+    first = cleaned.splitlines()[0]
+    delim = "\t" if "\t" in first else ","
+    reader = csv.DictReader(io.StringIO(cleaned), delimiter=delim)
+    seen_months: set[str] = set()
+
     for row in reader:
+        norm = {
+            (k or "").strip().lstrip("\ufeff").lower().replace("_", "-").replace(" ", "-"): v
+            for k, v in row.items()
+        }
         sku = (
-            row.get("sku")
-            or row.get("seller-sku")
-            or row.get("merchant-sku")
+            norm.get("sku")
+            or norm.get("seller-sku")
+            or norm.get("merchant-sku")
             or ""
         ).strip()
         if not sku:
             continue
-        charged = _f(row, "amount-charged", "amount_charged")
+
+        snapshot = (
+            norm.get("snapshot-date")
+            or norm.get("date")
+            or norm.get("snapshotdate")
+            or ""
+        ).strip()
+        month_key = ""
+        if snapshot:
+            # 2026-05-15T08:02:00+00:00 or 2026-05-15
+            month_key = snapshot[:7] if re.match(r"^\d{4}-\d{2}", snapshot) else ""
+            if month_key:
+                seen_months.add(month_key)
+            if months_filter is not None and month_key and month_key not in months_filter:
+                continue
+
+        charged = _coerce_float(
+            norm.get("amount-charged") or norm.get("amountcharged"),
+        )
         if charged <= 0:
-            charged = _f(row, "long-time-range-long-term-storage-fee") + _f(
-                row, "short-time-range-long-term-storage-fee",
+            charged = _coerce_float(norm.get("long-time-range-long-term-storage-fee")) + _coerce_float(
+                norm.get("short-time-range-long-term-storage-fee"),
             )
-        qty = _i(
-            row,
-            "qty-charged",
-            "qty_charged",
-            "qty-charged-long-time-range-long-term-storage-fee",
-            "qty-charged-short-time-range-long-term-storage-fee",
+        qty = int(
+            _coerce_float(
+                norm.get("qty-charged")
+                or norm.get("qtycharged")
+                or norm.get("qty-charged-long-time-range-long-term-storage-fee")
+                or norm.get("qty-charged-short-time-range-long-term-storage-fee"),
+            )
         )
         if charged <= 0 and qty <= 0:
             continue
-        asin = (row.get("asin") or row.get("ASIN") or "").strip().upper() or None
+        asin = (norm.get("asin") or "").strip().upper() or None
         bucket = per_sku.setdefault(
             sku,
             {"charged_total": 0.0, "qty_charged": 0, "asin": asin},
         )
-        bucket["charged_total"] += charged
-        bucket["qty_charged"] += max(qty, 0)
+        bucket["charged_total"] = _coerce_float(bucket["charged_total"]) + charged
+        bucket["qty_charged"] = int(bucket.get("qty_charged") or 0) + max(qty, 0)
         if asin and not bucket.get("asin"):
             bucket["asin"] = asin
+
+    return sorted(seen_months)
+
+
+def parse_aged_surcharge_charges_report(
+    text: str,
+    months_filter: list[str] | None = None,
+) -> tuple[dict[str, dict], list[str]]:
+    """Parse Aged Inventory Surcharge / LONGTERM_STORAGE_FEE_CHARGES report.
+
+    Returns ({sku: {charged_total, qty_charged, asin}}, months_seen).
+    """
+    allowed = set(months_filter) if months_filter else None
+    per_sku: dict[str, dict] = {}
+    months = _accumulate_aged_surcharge_rows(text, per_sku, allowed)
+    out = {
+        sku: {
+            "charged_total": round(_coerce_float(v["charged_total"]), 2),
+            "qty_charged": int(v.get("qty_charged") or 0),
+            "asin": v.get("asin"),
+        }
+        for sku, v in per_sku.items()
+        if _coerce_float(v.get("charged_total")) > 0
+    }
+    return out, months
 
 
 async def fetch_aged_surcharge_charges_per_sku(
@@ -2148,13 +2200,25 @@ async def fetch_aged_surcharge_charges_per_sku(
                     errors.append(f"{label}: recovery failed ({e2})")
 
         if text:
-            _accumulate_aged_surcharge_rows(text, per_sku)
+            # Keep only this Event Month's snapshot-date rows (SC filter).
+            parsed, _ = parse_aged_surcharge_charges_report(text, [label])
+            for sku, bucket in parsed.items():
+                dest = per_sku.setdefault(
+                    sku,
+                    {"charged_total": 0.0, "qty_charged": 0, "asin": bucket.get("asin")},
+                )
+                dest["charged_total"] += float(bucket.get("charged_total") or 0)
+                dest["qty_charged"] += int(bucket.get("qty_charged") or 0)
+                if bucket.get("asin") and not dest.get("asin"):
+                    dest["asin"] = bucket["asin"]
 
     if not per_sku and errors:
         raise RuntimeError(
             "Aged surcharge charges report failed for every month: "
             + "; ".join(errors)
         )
+    # Empty per_sku with no errors = valid "No results found" for the window
+    # (same as Seller Central Event Month with zero AIS charges).
     return {
         sku: {
             "charged_total": round(v["charged_total"], 2),

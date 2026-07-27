@@ -500,6 +500,9 @@ async def get_aged_surcharge_charges_cache(
     doc = await _aged_surcharge_charges_cache().find_one({"userId": user_id})
     if not doc:
         return None
+    # v2 = CSV+TSV parser + Event Month filter (v1 could cache empty parses).
+    if int(doc.get("schemaVersion") or 1) < 2:
+        return None
     if doc.get("startIso") != start_iso or doc.get("endIso") != end_iso:
         return None
     updated = doc.get("updatedAt")
@@ -532,6 +535,7 @@ async def put_aged_surcharge_charges_cache(
                 "startIso": start_iso,
                 "endIso": end_iso,
                 "accessDenied": access_denied,
+                "schemaVersion": 2,
                 "updatedAt": datetime.now(timezone.utc),
             },
             "$setOnInsert": {"userId": user_id},

@@ -1093,6 +1093,8 @@ async def compute_profitability_data(
     placement_meta: dict[str, object] = {"source": "none", "sku_count": 0}
     aged_charges_by_sku: dict[str, float] | None = {}
     aged_charges_meta: dict = {"source": None, "access_denied": False}
+    aged_report_total = 0.0
+    aged_charges_trusted = False  # True when SC charges report/cache was used
     fees_by_asin: dict[str, dict] = {}
     fee_errors_pre: list[str] = []
 
@@ -1334,6 +1336,7 @@ async def compute_profitability_data(
                 charges_cache.get("per_sku") or {}
             )
             aged_charges_meta["source"] = "charges_cache"
+            aged_charges_trusted = True
         else:
             charges_per_sku = await amazon_sp.fetch_aged_surcharge_charges_per_sku(
                 start_dt, end_dt,
@@ -1343,6 +1346,11 @@ async def compute_profitability_data(
             )
             aged_charges_by_sku = _build_aged_charges(charges_per_sku)
             aged_charges_meta["source"] = "charges_report"
+            aged_charges_trusted = True
+        aged_report_total = round(
+            sum(float(v or 0) for v in (aged_charges_by_sku or {}).values()), 2,
+        )
+        aged_charges_meta["report_total"] = aged_report_total
     except Exception as e:
         warnings.append(_sp_report_warning("Aged inventory surcharge charges", e))
         if _is_sp_access_denied(e):
@@ -1356,6 +1364,7 @@ async def compute_profitability_data(
         if planning_aged_by_sku:
             aged_charges_by_sku = dict(planning_aged_by_sku)
             aged_charges_meta["source"] = "planning_estimate_fallback"
+            aged_charges_trusted = False
             warnings.append(
                 "Aged Inv: could not load the Aged Inventory Surcharge charges "
                 "report (create FATAL and no reusable DONE report). Showing "
@@ -1365,6 +1374,7 @@ async def compute_profitability_data(
         else:
             aged_charges_by_sku = None
             aged_charges_meta["source"] = "finances_fallback"
+            aged_charges_trusted = False
 
     # products.fees is primary (same as Aurora Products). Fees API only for SKUs
     # missing that sync — do not prefer stale order-line fees.
@@ -1556,13 +1566,14 @@ async def compute_profitability_data(
         # ASIN — that double-counts when merchant + amzn.gr.* SKUs share an
         # ASIN. Do NOT use planning-report estimated-ais × months_in_window
         # (those are forward projections, not billed amounts).
-        if aged_charges_by_sku is not None:
+        if aged_charges_trusted and aged_charges_by_sku is not None:
+            # Trust the SC report: $0 when SKU has no amount-charged rows.
+            aged_inventory_fee = round(_lookup_sku_amount(aged_charges_by_sku, sku), 2)
+        elif aged_charges_by_sku is not None:
             charged = _lookup_sku_amount(aged_charges_by_sku, sku)
             if charged > 0:
                 aged_inventory_fee = round(charged, 2)
             else:
-                # SKU had no AIS charge this month — don't invent one from
-                # Finances unattributed pool.
                 aged_inventory_fee = round(
                     float(fin_sku.get("aged_inventory", 0.0) or 0), 2,
                 )
@@ -1660,12 +1671,33 @@ async def compute_profitability_data(
         totals["storage_fee"] = round(allocated_storage + storage_unallocated, 2)
         totals["net"] -= storage_unallocated
 
+    # Aged Inv: SKUs with amount-charged but no sales in the window still
+    # appear on Seller Central — add residual so Totals match the CSV.
+    aged_unallocated = 0.0
+    if aged_charges_trusted and aged_charges_by_sku:
+        sold_skus_l = {str(s).lower() for s in skus}
+        for asku, fee in aged_charges_by_sku.items():
+            if str(asku).lower() not in sold_skus_l:
+                aged_unallocated += float(fee or 0)
+        aged_unallocated = round(aged_unallocated, 2)
+        # Also catch penny drift between row sum and report total
+        allocated_aged = round(float(totals.get("aged_inventory_fee") or 0), 2)
+        target_aged = round(float(aged_report_total or 0), 2)
+        gap = round(target_aged - allocated_aged - aged_unallocated, 2)
+        if abs(gap) >= 0.01 and abs(gap) <= 0.05:
+            aged_unallocated = round(aged_unallocated + gap, 2)
+        if aged_unallocated > 0:
+            totals["aged_inventory_fee"] = round(allocated_aged + aged_unallocated, 2)
+            totals["net"] -= aged_unallocated
+
     rev = totals["revenue"]
     totals_out = {k: round(v, 2) for k, v in totals.items()}
     totals_out["units"] = int(totals["units"])
     totals_out["margin"] = round((totals["net"] / rev * 100), 1) if rev > 0 else 0.0
     totals_out["storage_report_total"] = round(float(storage_report_total or 0), 2)
     totals_out["storage_unallocated"] = storage_unallocated
+    totals_out["aged_report_total"] = round(float(aged_report_total or 0), 2)
+    totals_out["aged_unallocated"] = aged_unallocated
 
     caveats = [
         f"Date range uses marketplace timezone ({mp_tz}) — same day boundaries as Aurora Orders.",
@@ -1705,7 +1737,8 @@ async def compute_profitability_data(
         "SKUs that sold that ASIN; ASINs with storage but no sales stay in Totals.",
         "Aged Inv uses GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA "
         "(Seller Central Aged Inventory Surcharge report): sum of "
-        "amount-charged per seller SKU for months overlapping the window.",
+        "amount-charged per seller SKU for Event Months overlapping the window "
+        "(same as the CSV download).",
         "Return processing, low-inventory, and removal fees come from the "
         "Finances API (45-day lookback before the window start) — recent "
         "orders may not have them yet.",
@@ -1718,6 +1751,15 @@ async def compute_profitability_data(
             + (
                 f" (${storage_unallocated:,.2f} on ASINs with no sales in the filter)."
                 if storage_unallocated > 0
+                else "."
+            )
+        )
+    if aged_charges_trusted:
+        caveats.append(
+            f"Aged Inv report total for this window: ${aged_report_total:,.2f}"
+            + (
+                f" (${aged_unallocated:,.2f} on SKUs with no sales in the filter)."
+                if aged_unallocated > 0
                 else "."
             )
         )
