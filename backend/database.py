@@ -330,7 +330,7 @@ async def get_storage_cache(max_age_hours: int = 24) -> dict | None:
         return None
     return {
         "per_sku_monthly": doc.get("perSkuMonthly", {}),
-        "months_covered": doc.get("monthsCovered", []),
+        "months_covered": _normalize_month_keys(doc.get("monthsCovered", [])),
         "updated_at": updated.isoformat(),
     }
 
@@ -349,6 +349,44 @@ async def put_storage_cache(per_sku_monthly: dict, months_covered: list[str]) ->
         },
         upsert=True,
     )
+
+
+def _normalize_month_keys(months) -> list[str]:
+    """Coerce monthsCovered from Mongo to sorted YYYY-MM strings only."""
+    import re
+
+    out: list[str] = []
+    for m in months or []:
+        s = str(m).strip()
+        if re.match(r"^\d{4}-\d{2}$", s):
+            out.append(s)
+    return sorted(set(out))
+
+
+async def merge_storage_cache(
+    new_per_asin_month: dict,
+    new_months: list[str],
+) -> dict:
+    """Merge freshly fetched months into the seller's storage cache (all accounts)."""
+    user_id = _user_oid()
+    doc = await _storage_cache().find_one({"userId": user_id})
+    old_map = (doc or {}).get("perSkuMonthly") or {}
+    old_months = _normalize_month_keys((doc or {}).get("monthsCovered"))
+    new_months_norm = _normalize_month_keys(new_months)
+
+    from amazon_sp import merge_storage_by_asin_month, normalize_storage_fee_map
+
+    merged_map = normalize_storage_fee_map(
+        merge_storage_by_asin_month(old_map, new_per_asin_month)
+    )
+    merged_months = sorted(set(old_months) | set(new_months_norm))
+
+    await put_storage_cache(merged_map, merged_months)
+    return {
+        "per_sku_monthly": merged_map,
+        "months_covered": merged_months,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ── Inbound placement fee report cache (24h TTL, like storage fees) ─────
