@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import time
 from collections import defaultdict
 from collections.abc import AsyncGenerator
@@ -841,9 +842,16 @@ async def compute_profitability_data(
         put_aged_inventory_cache,
         put_aged_surcharge_charges_cache,
         put_placement_fee_cache,
-        put_storage_cache,
+        merge_storage_cache,
     )
-    from amazon_sp import split_bundled_fulfillment_total
+    from amazon_sp import (
+        calendar_months_in_window,
+        fetch_storage_fees_for_months,
+        is_per_asin_by_month_storage_cache,
+        merge_storage_by_asin_month,
+        split_bundled_fulfillment_total,
+        storage_fees_by_asin_for_window,
+    )
 
     # Normalize window using marketplace timezone (matches Aurora Orders / SC).
     user = require_user()
@@ -1009,8 +1017,72 @@ async def compute_profitability_data(
             "Amazon Orders API rate-limited us mid-fetch — showing partial results. "
             "Re-open this tab in a minute to see the full window."
         )
-    storage_per_asin: dict = {}
+    storage_by_asin_month: dict[str, dict[str, dict]] = {}
     storage_cached_at: str | None = None
+    storage_months_in_window = calendar_months_in_window(start_dt, end_dt, mp_tz)
+    covered_months: set[str] = set()
+
+    storage_meta = await get_storage_cache(max_age_hours=24)
+    if storage_meta:
+        cached_map = storage_meta.get("per_sku_monthly") or {}
+        if is_per_asin_by_month_storage_cache(cached_map):
+            storage_by_asin_month = amazon_sp.normalize_storage_fee_map(cached_map)
+            storage_cached_at = storage_meta.get("updated_at")
+            covered_months = {
+                str(m) for m in (storage_meta.get("months_covered") or [])
+                if re.match(r"^\d{4}-\d{2}$", str(m))
+            }
+
+    missing_months = [m for m in storage_months_in_window if m not in covered_months]
+    if missing_months:
+        try:
+            fetched, found_months = await fetch_storage_fees_for_months(
+                missing_months, mp_tz,
+            )
+            if fetched:
+                # Always apply in-memory first so profitability works even if
+                # the Mongo cache write fails.
+                storage_by_asin_month = merge_storage_by_asin_month(
+                    storage_by_asin_month, fetched,
+                )
+                try:
+                    merged = await merge_storage_cache(fetched, found_months)
+                    storage_by_asin_month = merged["per_sku_monthly"]
+                    storage_cached_at = merged["updated_at"]
+                    covered_months = set(merged["months_covered"])
+                except Exception as cache_err:
+                    warnings.append(
+                        f"Storage cache save failed ({type(cache_err).__name__}); "
+                        "using freshly fetched report in-memory."
+                    )
+                    covered_months |= set(found_months)
+                    storage_cached_at = datetime.now(timezone.utc).isoformat()
+            still_missing = [m for m in storage_months_in_window if m not in covered_months]
+            if still_missing:
+                warnings.append(
+                    f"Storage: no FBA storage report data yet for "
+                    f"{', '.join(still_missing)} — Amazon may not have published "
+                    "those months via SP-API yet."
+                )
+        except Exception as e:
+            warnings.append(_sp_report_warning("Storage", e))
+
+    storage_fees_by_asin, storage_report_total, storage_month_fractions = (
+        storage_fees_by_asin_for_window(
+            storage_by_asin_month,
+            storage_months_in_window,
+            window_start=start_dt,
+            window_end=end_dt,
+            time_zone=mp_tz,
+        )
+    )
+    # Units sold per ASIN — used to split that ASIN's report fee across SKUs.
+    storage_units_by_asin: dict[str, float] = defaultdict(float)
+    for _sku, _d in sku_data.items():
+        _asin = (_d.get("asin") or "").upper()
+        if _asin and _d.get("units"):
+            storage_units_by_asin[_asin] += float(_d["units"])
+
     product_fee_fallback: dict[str, dict] = {}
     fin_by_sku: dict[str, dict] = {}
     unattributed_fees = amazon_sp._empty_fee_bucket()
@@ -1021,24 +1093,10 @@ async def compute_profitability_data(
     placement_meta: dict[str, object] = {"source": "none", "sku_count": 0}
     aged_charges_by_sku: dict[str, float] | None = {}
     aged_charges_meta: dict = {"source": None, "access_denied": False}
+    aged_report_total = 0.0
+    aged_charges_trusted = False  # True when SC charges report/cache was used
     fees_by_asin: dict[str, dict] = {}
     fee_errors_pre: list[str] = []
-
-    storage_meta = await get_storage_cache(max_age_hours=24)
-    if storage_meta:
-        cached_map = storage_meta.get("per_sku_monthly") or {}
-        # Legacy cache stored flat monthly fees — ignore so we rebuild per-unit map.
-        if cached_map and not any(isinstance(v, dict) for v in cached_map.values()):
-            cached_map = {}
-        storage_per_asin = cached_map
-        storage_cached_at = storage_meta.get("updated_at")
-    if not storage_per_asin:
-        try:
-            storage_per_asin, months = await amazon_sp.fetch_storage_fees_per_sku(months_back=2)
-            await put_storage_cache(storage_per_asin, months)
-            storage_cached_at = datetime.now(timezone.utc).isoformat()
-        except Exception as e:
-            warnings.append(_sp_report_warning("Storage", e))
 
     # Finances fees (low inv, placement settlements) often post weeks
     # after the related sale/inbound event — look back 45 days before
@@ -1278,15 +1336,21 @@ async def compute_profitability_data(
                 charges_cache.get("per_sku") or {}
             )
             aged_charges_meta["source"] = "charges_cache"
+            aged_charges_trusted = True
         else:
             charges_per_sku = await amazon_sp.fetch_aged_surcharge_charges_per_sku(
-                start_dt, end_dt,
+                start_dt, end_dt, time_zone=mp_tz,
             )
             await put_aged_surcharge_charges_cache(
                 charges_per_sku, charges_start_iso, charges_end_iso,
             )
             aged_charges_by_sku = _build_aged_charges(charges_per_sku)
             aged_charges_meta["source"] = "charges_report"
+            aged_charges_trusted = True
+        aged_report_total = round(
+            sum(float(v or 0) for v in (aged_charges_by_sku or {}).values()), 2,
+        )
+        aged_charges_meta["report_total"] = aged_report_total
     except Exception as e:
         warnings.append(_sp_report_warning("Aged inventory surcharge charges", e))
         if _is_sp_access_denied(e):
@@ -1300,6 +1364,7 @@ async def compute_profitability_data(
         if planning_aged_by_sku:
             aged_charges_by_sku = dict(planning_aged_by_sku)
             aged_charges_meta["source"] = "planning_estimate_fallback"
+            aged_charges_trusted = False
             warnings.append(
                 "Aged Inv: could not load the Aged Inventory Surcharge charges "
                 "report (create FATAL and no reusable DONE report). Showing "
@@ -1309,6 +1374,7 @@ async def compute_profitability_data(
         else:
             aged_charges_by_sku = None
             aged_charges_meta["source"] = "finances_fallback"
+            aged_charges_trusted = False
 
     # products.fees is primary (same as Aurora Products). Fees API only for SKUs
     # missing that sync — do not prefer stale order-line fees.
@@ -1435,13 +1501,16 @@ async def compute_profitability_data(
 
         amazon_fees = round(referral_total + fba_total + fuel_total, 2)
 
-        # Storage: monthly fee ÷ average units on hand × units sold (Revenue Calculator).
-        asin_storage = storage_per_asin.get(asin or "", {})
-        if isinstance(asin_storage, dict):
-            storage_per_unit = float(asin_storage.get("storage_per_unit") or 0)
+        # Storage: use Seller Central Monthly Storage Fees $ for this ASIN
+        # (month_of_charge in filter), split across SKUs that sold that ASIN.
+        # This matches the downloaded report total — NOT fee÷qty × units sold.
+        asin_key = (asin or "").upper()
+        asin_storage_fee = float(storage_fees_by_asin.get(asin_key, 0.0) or 0.0)
+        asin_sold_units = float(storage_units_by_asin.get(asin_key, 0.0) or 0.0)
+        if asin_storage_fee > 0 and asin_sold_units > 0 and units > 0:
+            storage = round(asin_storage_fee * (units / asin_sold_units), 2)
         else:
-            storage_per_unit = float(asin_storage or 0)
-        storage = round(storage_per_unit * units, 2)
+            storage = 0.0
 
         # Ads: per-campaign attribution when the campaign lists this SKU,
         # plus a share of the unattributed pool spread per unit.
@@ -1497,13 +1566,14 @@ async def compute_profitability_data(
         # ASIN — that double-counts when merchant + amzn.gr.* SKUs share an
         # ASIN. Do NOT use planning-report estimated-ais × months_in_window
         # (those are forward projections, not billed amounts).
-        if aged_charges_by_sku is not None:
+        if aged_charges_trusted and aged_charges_by_sku is not None:
+            # Trust the SC report: $0 when SKU has no amount-charged rows.
+            aged_inventory_fee = round(_lookup_sku_amount(aged_charges_by_sku, sku), 2)
+        elif aged_charges_by_sku is not None:
             charged = _lookup_sku_amount(aged_charges_by_sku, sku)
             if charged > 0:
                 aged_inventory_fee = round(charged, 2)
             else:
-                # SKU had no AIS charge this month — don't invent one from
-                # Finances unattributed pool.
                 aged_inventory_fee = round(
                     float(fin_sku.get("aged_inventory", 0.0) or 0), 2,
                 )
@@ -1590,10 +1660,44 @@ async def compute_profitability_data(
         totals["inbound_placement_fee"] = fee_r
         totals["net"] -= fee_r
 
+    # Storage fees on ASINs with inventory but no sales in the window still
+    # appear on Seller Central's Monthly Storage Fees report — add residual
+    # so the Storage KPI matches the CSV total.
+    allocated_storage = round(float(totals.get("storage_fee") or 0), 2)
+    storage_unallocated = round(
+        max(0.0, float(storage_report_total or 0) - allocated_storage), 2,
+    )
+    if storage_unallocated > 0:
+        totals["storage_fee"] = round(allocated_storage + storage_unallocated, 2)
+        totals["net"] -= storage_unallocated
+
+    # Aged Inv: SKUs with amount-charged but no sales in the window still
+    # appear on Seller Central — add residual so Totals match the CSV.
+    aged_unallocated = 0.0
+    if aged_charges_trusted and aged_charges_by_sku:
+        sold_skus_l = {str(s).lower() for s in skus}
+        for asku, fee in aged_charges_by_sku.items():
+            if str(asku).lower() not in sold_skus_l:
+                aged_unallocated += float(fee or 0)
+        aged_unallocated = round(aged_unallocated, 2)
+        # Also catch penny drift between row sum and report total
+        allocated_aged = round(float(totals.get("aged_inventory_fee") or 0), 2)
+        target_aged = round(float(aged_report_total or 0), 2)
+        gap = round(target_aged - allocated_aged - aged_unallocated, 2)
+        if abs(gap) >= 0.01 and abs(gap) <= 0.05:
+            aged_unallocated = round(aged_unallocated + gap, 2)
+        if aged_unallocated > 0:
+            totals["aged_inventory_fee"] = round(allocated_aged + aged_unallocated, 2)
+            totals["net"] -= aged_unallocated
+
     rev = totals["revenue"]
     totals_out = {k: round(v, 2) for k, v in totals.items()}
     totals_out["units"] = int(totals["units"])
     totals_out["margin"] = round((totals["net"] / rev * 100), 1) if rev > 0 else 0.0
+    totals_out["storage_report_total"] = round(float(storage_report_total or 0), 2)
+    totals_out["storage_unallocated"] = storage_unallocated
+    totals_out["aged_report_total"] = round(float(aged_report_total or 0), 2)
+    totals_out["aged_unallocated"] = aged_unallocated
 
     caveats = [
         f"Date range uses marketplace timezone ({mp_tz}) — same day boundaries as Aurora Orders.",
@@ -1626,18 +1730,40 @@ async def compute_profitability_data(
             "inbound placement service fees CSV, or wait for SP-API report access)."
         )
     caveats.extend([
-        "Storage uses GET_FBA_STORAGE_FEE_CHARGES_DATA: estimated monthly "
-        "storage fee ÷ average quantity on hand × units sold (Revenue Calculator).",
+        "Storage uses GET_FBA_STORAGE_FEE_CHARGES_DATA for the calendar month(s) "
+        f"in your filter ({', '.join(storage_months_in_window) or 'none'}): the "
+        "estimated_monthly_storage_fee total from Seller Central's Monthly Storage "
+        "Fees report (same as the CSV download). Each ASIN's fee is split across "
+        "SKUs that sold that ASIN; ASINs with storage but no sales stay in Totals.",
         "Aged Inv uses GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA "
         "(Seller Central Aged Inventory Surcharge report): sum of "
-        "amount-charged per seller SKU for months overlapping the window.",
+        "amount-charged per seller SKU for Event Months overlapping the window "
+        "(same as the CSV download).",
         "Return processing, low-inventory, and removal fees come from the "
         "Finances API (45-day lookback before the window start) — recent "
         "orders may not have them yet.",
         "Ads are allocated uniformly per unit — per-SKU PPC attribution requires productAd joins.",
         "Fees posted without a SellerSKU (typically removals) are spread across units proportionally.",
     ])
-    if not storage_per_asin:
+    if storage_report_total > 0:
+        caveats.append(
+            f"Storage report total for this window: ${storage_report_total:,.2f}"
+            + (
+                f" (${storage_unallocated:,.2f} on ASINs with no sales in the filter)."
+                if storage_unallocated > 0
+                else "."
+            )
+        )
+    if aged_charges_trusted:
+        caveats.append(
+            f"Aged Inv report total for this window: ${aged_report_total:,.2f}"
+            + (
+                f" (${aged_unallocated:,.2f} on SKUs with no sales in the filter)."
+                if aged_unallocated > 0
+                else "."
+            )
+        )
+    if not storage_by_asin_month:
         caveats.append("Storage fees: report unavailable for this window; values are 0.")
     if aged_charges_meta.get("access_denied"):
         caveats.append(
@@ -1704,6 +1830,7 @@ async def compute_profitability_data(
         "fee_errors": fee_errors,
         "ad_window": ad_window,
         "storage_cached_at": storage_cached_at,
+        "storage_months_in_window": storage_months_in_window,
         "unattributed_fees": {k: round(v, 2) for k, v in unattributed_fees.items()},
         "placement_meta": placement_meta,
         "placement_blended": placement_blended,

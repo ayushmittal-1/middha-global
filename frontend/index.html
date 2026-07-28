@@ -3117,7 +3117,12 @@
           caveats.push(`Ad allocation: $${(aw.total_window || 0).toLocaleString()} from ${aw.campaign_count} campaigns over ${data.window_days ?? '?'}d — $${(aw.total_window - (aw.unattributed || 0)).toFixed(2)} attributed per-SKU across ${attributed} SKUs, $${(aw.unattributed || 0).toFixed(2)} spread uniformly across ${t ? t.units : 0} units.`);
         }
         if (data.storage_cached_at) {
-          caveats.push(`Storage allocation from FBA report, cached ${new Date(data.storage_cached_at).toLocaleString()}.`);
+          const months = (data.storage_months_in_window || []).join(', ');
+          caveats.push(
+            months
+              ? `Storage uses FBA Monthly Storage report for ${months} (cached ${new Date(data.storage_cached_at).toLocaleString()}).`
+              : `Storage allocation from FBA report, cached ${new Date(data.storage_cached_at).toLocaleString()}.`,
+          );
         }
         for (const c of data.caveats || []) {
           caveats.push(escapeHtml(c));

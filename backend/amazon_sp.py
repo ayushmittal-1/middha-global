@@ -13,6 +13,7 @@ import hmac
 import io
 import json
 import os
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -777,91 +778,464 @@ async def get_fees_estimates_batch(
     return out
 
 
-# ── FBA Storage Fees report (per-SKU monthly storage) ───────────────────────
+# ── FBA Storage Fees report (per-ASIN monthly storage) ───────────────────────
 
 
-async def fetch_storage_fees_per_sku(months_back: int = 2) -> tuple[dict, list[str]]:
-    """Pull GET_FBA_STORAGE_FEE_CHARGES_DATA for the last `months_back` months
-    and return ({asin: avg_monthly_fee}, months_covered).
+def _storage_row_get(row: dict, *keys: str) -> str:
+    for key in keys:
+        if key in row and row[key] not in (None, ""):
+            return str(row[key]).strip()
+        dashed = key.replace("_", "-")
+        if dashed in row and row[dashed] not in (None, ""):
+            return str(row[dashed]).strip()
+    return ""
 
-    The report is keyed by **ASIN** (also has fnsku + product_name; there is
-    no seller_sku column). One ASIN can appear in multiple rows for the same
-    month — one per fulfillment center / FNSKU pair — so we first sum
-    estimated_monthly_storage_fee within each (asin, month), then average
-    across months.
 
-    The profitability calc joins by ASIN (which we already track on every
-    order item). Caller is responsible for caching — the report takes
-    30–120 s to generate."""
-    now = datetime.now(timezone.utc)
-    start = (now.replace(day=1) - timedelta(days=months_back * 31)).replace(day=1)
-    end = now
-    create_resp = await create_report(
-        "GET_FBA_STORAGE_FEE_CHARGES_DATA",
-        start_date=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        end_date=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        single_marketplace=True,
-    )
-    report_id = create_resp.get("reportId")
-    if not report_id:
-        raise RuntimeError(f"Storage report create returned no id: {create_resp}")
-    text = await download_report_raw(report_id, max_polls=24, poll_interval=10)
+def _storage_row_float(row: dict, *keys: str) -> float:
+    raw = _storage_row_get(row, *keys)
+    if not raw or raw in ("--", "N/A", "n/a", "-"):
+        return 0.0
+    try:
+        return float(raw.replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
 
-    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
-    qty_keys = (
-        "average_quantity_on_hand",
-        "average-quantity-on-hand",
-        "Average quantity on hand",
-    )
-    # (asin, month) -> {fee, qty}
+
+def _coerce_float(value, default: float = 0.0) -> float:
+    """Safe float for Mongo/cache values that may arrive as str/Decimal/None."""
+    if value is None or value == "" or value in ("--", "N/A", "n/a", "-"):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        try:
+            return float(str(value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return default
+
+
+def _normalize_month_of_charge(raw: str) -> str:
+    """Normalize month_of_charge to YYYY-MM (handles 2026-4, 2026/04, etc.)."""
+    s = (raw or "").strip().strip("'\"")
+    if not s:
+        return ""
+    m = re.match(r"^(\d{4})[-/](\d{1,2})$", s)
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"
+    return s if re.match(r"^\d{4}-\d{2}$", s) else ""
+
+
+def normalize_storage_fee_map(
+    per_asin: dict,
+) -> dict[str, dict[str, dict]]:
+    """Ensure {ASIN: {YYYY-MM: {monthly_fee: float, ...}}} with numeric fields."""
+    out: dict[str, dict[str, dict]] = {}
+    if not isinstance(per_asin, dict):
+        return out
+    for asin, by_month in per_asin.items():
+        if not isinstance(by_month, dict):
+            continue
+        asin_key = str(asin or "").strip().upper()
+        if not asin_key:
+            continue
+        kept: dict[str, dict] = {}
+        for month, bucket in by_month.items():
+            month_key = _normalize_month_of_charge(str(month))
+            if not month_key or not isinstance(bucket, dict):
+                continue
+            fee = _coerce_float(bucket.get("monthly_fee"))
+            qty = _coerce_float(bucket.get("avg_quantity_on_hand"))
+            if fee <= 0:
+                continue
+            kept[month_key] = {
+                "monthly_fee": round(fee, 4),
+                "avg_quantity_on_hand": round(qty, 2),
+                "storage_per_unit": round(
+                    fee / max(qty, 1.0), 6,
+                ),
+            }
+        if kept:
+            out[asin_key] = kept
+    return out
+
+
+def parse_storage_fee_report(text: str) -> tuple[dict[str, dict[str, dict]], list[str]]:
+    """Parse GET_FBA_STORAGE_FEE_CHARGES_DATA (TSV or CSV).
+
+    Amazon emits one row per ASIN × FNSKU × fulfillment center × month.
+    We roll up to ASIN × month (sum fees and avg qty on hand), matching
+    Seller Central's Monthly Storage Fees report totals.
+    """
+    if not (text or "").strip():
+        return {}, []
+
+    # Strip BOM; detect delimiter from header (SP-API is usually TSV).
+    cleaned = text.lstrip("\ufeff")
+    first = cleaned.splitlines()[0]
+    delim = "\t" if "\t" in first else ","
+    reader = csv.DictReader(io.StringIO(cleaned), delimiter=delim)
+
     by_asin_month: dict[tuple[str, str], dict] = {}
     months: set[str] = set()
     for row in reader:
-        asin = (row.get("asin") or "").strip()
+        # Normalize keys: SP-API / Seller Central sometimes vary separators.
+        norm_row = {
+            (k or "").strip().lstrip("\ufeff").lower().replace("-", "_").replace(" ", "_"): v
+            for k, v in row.items()
+        }
+        asin = _storage_row_get(norm_row, "asin").upper()
         if not asin:
             continue
-        try:
-            fee = float(row.get("estimated_monthly_storage_fee") or 0)
-        except (TypeError, ValueError):
-            fee = 0.0
-        qty = 0.0
-        for key in qty_keys:
-            raw = row.get(key)
-            if raw not in (None, ""):
-                try:
-                    qty = float(raw)
-                except (TypeError, ValueError):
-                    qty = 0.0
-                break
-        month = (row.get("month_of_charge") or "").strip()
+        fee = _storage_row_float(norm_row, "estimated_monthly_storage_fee")
+        qty = _storage_row_float(
+            norm_row,
+            "average_quantity_on_hand",
+            "average_quantity_on_hand",
+        )
+        month = _normalize_month_of_charge(
+            _storage_row_get(norm_row, "month_of_charge"),
+        )
         if not month:
             continue
         months.add(month)
         key = (asin, month)
-        bucket = by_asin_month.setdefault(key, {"fee": 0.0, "qty": 0.0})
-        bucket["fee"] += fee
-        bucket["qty"] += qty
+        bucket = by_asin_month.setdefault(
+            key, {"monthly_fee": 0.0, "avg_quantity_on_hand": 0.0},
+        )
+        bucket["monthly_fee"] = _coerce_float(bucket["monthly_fee"]) + fee
+        bucket["avg_quantity_on_hand"] = (
+            _coerce_float(bucket["avg_quantity_on_hand"]) + qty
+        )
 
-    # Average monthly fee + quantity per ASIN, then per-unit storage like Revenue Calculator.
-    by_asin_monthly: dict[str, list[dict]] = defaultdict(list)
-    for (asin, _month), bucket in by_asin_month.items():
-        by_asin_monthly[asin].append(bucket)
-
-    per_asin: dict[str, dict] = {}
-    for asin, rows in by_asin_monthly.items():
-        monthly_fees = [r["fee"] for r in rows if r["fee"] > 0]
-        monthly_qtys = [r["qty"] for r in rows if r["qty"] > 0]
-        avg_monthly_fee = sum(monthly_fees) / len(monthly_fees) if monthly_fees else 0.0
-        avg_qty = sum(monthly_qtys) / len(monthly_qtys) if monthly_qtys else 0.0
-        if avg_monthly_fee <= 0:
+    per_asin: dict[str, dict[str, dict]] = defaultdict(dict)
+    for (asin, month), bucket in by_asin_month.items():
+        fee = _coerce_float(bucket["monthly_fee"])
+        qty = _coerce_float(bucket["avg_quantity_on_hand"])
+        if fee <= 0:
             continue
-        divisor = max(avg_qty, 1.0)
-        per_asin[asin] = {
-            "monthly_fee": round(avg_monthly_fee, 4),
-            "avg_quantity_on_hand": round(avg_qty, 2),
-            "storage_per_unit": round(avg_monthly_fee / divisor, 4),
+        divisor = max(qty, 1.0)
+        per_asin[asin][month] = {
+            "monthly_fee": round(fee, 4),
+            "avg_quantity_on_hand": round(qty, 2),
+            "storage_per_unit": round(fee / divisor, 6),
         }
-    return per_asin, sorted(months)
+    return dict(per_asin), sorted(months)
+
+
+def calendar_months_in_window(
+    start_dt: datetime,
+    end_dt: datetime,
+    time_zone: str = "UTC",
+) -> list[str]:
+    """Calendar YYYY-MM keys overlapping [start_dt, end_dt] in marketplace TZ."""
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(time_zone or "UTC")
+    local_start = start_dt.astimezone(tz).date()
+    local_end = end_dt.astimezone(tz).date()
+    months: list[str] = []
+    year, month = local_start.year, local_start.month
+    while (year, month) < (local_end.year, local_end.month) or (
+        year == local_end.year and month == local_end.month
+    ):
+        months.append(f"{year:04d}-{month:02d}")
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return months
+
+
+def storage_per_unit_for_window(
+    asin_by_month: dict[str, dict],
+    months_in_window: list[str],
+) -> float:
+    """Blend monthly storage rates for the months in the profitability window.
+
+    Seller Central's Revenue Calculator uses each month's
+    (estimated_monthly_storage_fee ÷ average_quantity_on_hand). When the
+    window spans multiple months we sum fees and qty across those months
+    (same ASIN rollup SC uses in the monthly report).
+
+    Prefer ``storage_fee_for_asin_months`` when matching the Monthly Storage
+    Fees report dollar total (fee is inventory-based, not units-sold × rate).
+    """
+    total_fee = 0.0
+    total_qty = 0.0
+    for month in months_in_window:
+        bucket = asin_by_month.get(month) or {}
+        if not isinstance(bucket, dict):
+            continue
+        total_fee += _coerce_float(bucket.get("monthly_fee"))
+        total_qty += _coerce_float(bucket.get("avg_quantity_on_hand"))
+    if total_fee <= 0:
+        return 0.0
+    return round(total_fee / max(total_qty, 1.0), 6)
+
+
+def month_overlap_fraction(
+    month_key: str,
+    window_start: datetime,
+    window_end: datetime,
+    time_zone: str = "UTC",
+) -> float:
+    """Fraction of calendar month overlapping [window_start, window_end] (UTC)."""
+    m_start, m_end_excl = month_start_end_excl(month_key, time_zone)
+    # Treat end as inclusive instant: extend by 1µs so end-of-month matches full month.
+    w_start = window_start
+    w_end_excl = window_end + timedelta(microseconds=1)
+    overlap_start = max(m_start, w_start)
+    overlap_end = min(m_end_excl, w_end_excl)
+    if overlap_end <= overlap_start:
+        return 0.0
+    month_seconds = (m_end_excl - m_start).total_seconds()
+    if month_seconds <= 0:
+        return 0.0
+    frac = (overlap_end - overlap_start).total_seconds() / month_seconds
+    return max(0.0, min(1.0, frac))
+
+
+def storage_fee_for_asin_months(
+    asin_by_month: dict[str, dict],
+    months_in_window: list[str],
+    month_fractions: dict[str, float] | None = None,
+) -> float:
+    """Actual Monthly Storage Fees $ for one ASIN (optionally day-prorated)."""
+    total = 0.0
+    for month in months_in_window:
+        bucket = asin_by_month.get(month) or {}
+        if not isinstance(bucket, dict):
+            continue
+        fee = _coerce_float(bucket.get("monthly_fee"))
+        frac = 1.0 if not month_fractions else float(month_fractions.get(month, 0.0))
+        total += fee * frac
+    return round(total, 4)
+
+
+def storage_fees_by_asin_for_window(
+    storage_by_asin_month: dict[str, dict[str, dict]],
+    months_in_window: list[str],
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+    time_zone: str = "UTC",
+) -> tuple[dict[str, float], float, dict[str, float]]:
+    """ASIN → prorated monthly storage fee matching Seller Central report.
+
+    Returns (fees_by_asin, report_total, month_fractions).
+    Full-month filters (e.g. June 1–30) yield fraction 1.0 so totals match
+    the downloaded Monthly Storage Fees CSV exactly.
+    """
+    fractions: dict[str, float] = {}
+    for month in months_in_window:
+        if window_start is not None and window_end is not None:
+            fractions[month] = month_overlap_fraction(
+                month, window_start, window_end, time_zone,
+            )
+        else:
+            fractions[month] = 1.0
+
+    fees_by_asin: dict[str, float] = {}
+    for asin, by_month in (storage_by_asin_month or {}).items():
+        fee = storage_fee_for_asin_months(by_month, months_in_window, fractions)
+        if fee > 0:
+            fees_by_asin[str(asin).upper()] = fee
+    report_total = round(sum(fees_by_asin.values()), 2)
+    return fees_by_asin, report_total, fractions
+
+
+def is_per_asin_by_month_storage_cache(cached: dict) -> bool:
+    """True when cache holds {asin: {YYYY-MM: {...}}} not legacy averages."""
+    if not cached:
+        return False
+    for value in cached.values():
+        if not isinstance(value, dict):
+            return False
+        if any(re.match(r"^\d{4}-\d{2}$", key) for key in value.keys()):
+            return True
+        if "monthly_fee" in value and "storage_per_unit" in value:
+            return False
+    return False
+
+
+def merge_storage_by_asin_month(
+    base: dict[str, dict[str, dict]],
+    extra: dict[str, dict[str, dict]],
+) -> dict[str, dict[str, dict]]:
+    """Merge ASIN×month storage maps (new months overwrite same month keys)."""
+    merged = {asin: dict(months) for asin, months in (base or {}).items()}
+    for asin, months in (extra or {}).items():
+        bucket = merged.setdefault(asin, {})
+        bucket.update(months)
+    return normalize_storage_fee_map(merged)
+
+
+def filter_storage_to_months(
+    per_asin: dict[str, dict[str, dict]],
+    months: list[str],
+) -> dict[str, dict[str, dict]]:
+    allowed = set(months)
+    out: dict[str, dict[str, dict]] = {}
+    for asin, by_month in per_asin.items():
+        kept = {m: b for m, b in by_month.items() if m in allowed}
+        if kept:
+            out[asin] = kept
+    return out
+
+
+def month_start_end_excl(month_key: str, time_zone: str) -> tuple[datetime, datetime]:
+    """UTC [start, end) for a YYYY-MM month_of_charge in marketplace TZ."""
+    from marketplace_timezone import zoned_time_to_utc
+
+    year, month = (int(p) for p in month_key.split("-"))
+    start = zoned_time_to_utc(
+        {"year": year, "month": month, "day": 1, "hour": 0, "minute": 0, "second": 0, "microsecond": 0},
+        time_zone,
+    )
+    if month == 12:
+        end_excl = zoned_time_to_utc(
+            {"year": year + 1, "month": 1, "day": 1, "hour": 0, "minute": 0, "second": 0, "microsecond": 0},
+            time_zone,
+        )
+    else:
+        end_excl = zoned_time_to_utc(
+            {"year": year, "month": month + 1, "day": 1, "hour": 0, "minute": 0, "second": 0, "microsecond": 0},
+            time_zone,
+        )
+    return start, end_excl
+
+
+def storage_report_range_for_months(
+    months: list[str],
+    time_zone: str,
+) -> tuple[datetime, datetime]:
+    """SP-API dataStartTime/dataEndTime covering all requested month_of_charge keys."""
+    if not months:
+        now = datetime.now(timezone.utc)
+        return now, now
+    sorted_months = sorted(months)
+    start, _ = month_start_end_excl(sorted_months[0], time_zone)
+    _, end_excl = month_start_end_excl(sorted_months[-1], time_zone)
+    now = datetime.now(timezone.utc)
+    # Amazon rejects future end times; historical months end before now.
+    end = min(end_excl - timedelta(microseconds=1), now)
+    if end <= start:
+        end = now
+    return start, end
+
+
+async def _list_storage_fee_reports(created_since: datetime) -> list[dict]:
+    """Recent GET_FBA_STORAGE_FEE_CHARGES_DATA reports (Seller Central downloads too)."""
+    resp = await _sp_request(
+        "GET",
+        "/reports/2021-06-30/reports",
+        params={
+            "reportTypes": "GET_FBA_STORAGE_FEE_CHARGES_DATA",
+            "pageSize": "100",
+            "createdSince": created_since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+    )
+    return list(resp.get("reports") or [])
+
+
+async def fetch_storage_fees_for_months(
+    months: list[str],
+    time_zone: str = "UTC",
+) -> tuple[dict[str, dict[str, dict]], list[str]]:
+    """Pull storage for specific calendar months via SP-API (no manual CSV).
+
+    Reuses a recent DONE report when Seller Central / Aurora already requested
+    the same month. Otherwise creates GET_FBA_STORAGE_FEE_CHARGES_DATA for the
+    range — works for January (or any past month) as long as Amazon still
+    exposes that month_of_charge in the report API.
+    """
+    months = sorted({m for m in months if re.match(r"^\d{4}-\d{2}$", m)})
+    if not months:
+        return {}, []
+
+    report_start, report_end = storage_report_range_for_months(months, time_zone)
+    now = datetime.now(timezone.utc)
+    # List reports back to the earliest requested month (not just 89d) so a
+    # January view can reuse a DONE report created when that month closed.
+    lookback = report_start - timedelta(days=1)
+    max_lookback = now - timedelta(days=730)
+    if lookback < max_lookback:
+        lookback = max_lookback
+
+    text: str | None = None
+    try:
+        existing = await _list_storage_fee_reports(lookback)
+        candidates = [
+            r for r in existing
+            if r.get("processingStatus") == "DONE"
+            and r.get("reportDocumentId")
+            and _report_covers_month(r, report_start, report_end + timedelta(seconds=1))
+        ]
+        candidates.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+        if candidates:
+            text = await download_report_raw(
+                candidates[0]["reportId"], max_polls=6, poll_interval=5,
+            )
+    except Exception:
+        text = None
+
+    if text is None:
+        create_resp = await create_report(
+            "GET_FBA_STORAGE_FEE_CHARGES_DATA",
+            start_date=report_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            end_date=report_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            single_marketplace=True,
+        )
+        report_id = create_resp.get("reportId")
+        if not report_id:
+            raise RuntimeError(f"Storage report create returned no id: {create_resp}")
+        text = await download_report_raw(report_id, max_polls=24, poll_interval=10)
+
+    per_asin, parsed_months = parse_storage_fee_report(text)
+    filtered = filter_storage_to_months(per_asin, months)
+    # Return only months we actually got rows for (may be subset if Amazon omitted data).
+    found_months = sorted(
+        {m for by_month in filtered.values() for m in by_month.keys()}
+    )
+    if not found_months and parsed_months:
+        # Amazon sometimes returns a neighboring month_of_charge when the
+        # requested month isn't published yet — keep whatever we parsed so
+        # cache can still grow; caller filters to the profitability window.
+        return normalize_storage_fee_map(per_asin), sorted(parsed_months)
+    return normalize_storage_fee_map(filtered), found_months or [
+        m for m in months if m in parsed_months
+    ]
+
+
+async def fetch_storage_fees_by_asin_month(
+    window_start: datetime,
+    window_end: datetime,
+    time_zone: str = "UTC",
+) -> tuple[dict[str, dict[str, dict]], list[str]]:
+    """Pull storage report for calendar months overlapping the profitability window."""
+    months = calendar_months_in_window(window_start, window_end, time_zone)
+    return await fetch_storage_fees_for_months(months, time_zone)
+
+
+async def fetch_storage_fees_per_sku(months_back: int = 2) -> tuple[dict, list[str]]:
+    """Legacy wrapper — prefer fetch_storage_fees_by_asin_month."""
+    now = datetime.now(timezone.utc)
+    start = (now.replace(day=1) - timedelta(days=months_back * 31)).replace(day=1)
+    per_asin, months = await fetch_storage_fees_by_asin_month(start, now)
+    # Flatten to legacy averaged shape for any old callers.
+    flat: dict[str, dict] = {}
+    for asin, by_month in per_asin.items():
+        fees = [b["monthly_fee"] for b in by_month.values() if b.get("monthly_fee")]
+        qtys = [b["avg_quantity_on_hand"] for b in by_month.values() if b.get("avg_quantity_on_hand")]
+        if not fees:
+            continue
+        avg_fee = sum(fees) / len(fees)
+        avg_qty = sum(qtys) / len(qtys) if qtys else 1.0
+        flat[asin] = {
+            "monthly_fee": round(avg_fee, 4),
+            "avg_quantity_on_hand": round(avg_qty, 2),
+            "storage_per_unit": round(avg_fee / max(avg_qty, 1.0), 4),
+        }
+    return flat, months
 
 
 # ── Finances API (v0) ────────────────────────────────────────────────────────
@@ -1607,93 +1981,135 @@ def _report_covers_month(
     return ds < month_end_excl and de > month_start
 
 
-def _accumulate_aged_surcharge_rows(text: str, per_sku: dict[str, dict]) -> None:
-    """Parse amount-charged rows from an AIS charges report into per_sku."""
+def _accumulate_aged_surcharge_rows(
+    text: str,
+    per_sku: dict[str, dict],
+    months_filter: set[str] | None = None,
+) -> list[str]:
+    """Parse amount-charged rows from an AIS charges report into per_sku.
 
-    def _f(row: dict, *keys: str) -> float:
-        for k in keys:
-            raw = row.get(k)
-            if raw in (None, ""):
-                continue
-            try:
-                return float(raw)
-            except (TypeError, ValueError):
-                continue
-        return 0.0
+    Accepts Seller Central CSV downloads and SP-API TSV. Optionally keeps only
+    rows whose snapshot-date month is in ``months_filter`` (YYYY-MM), matching
+    Seller Central's Event Month filter.
 
-    def _i(row: dict, *keys: str) -> int:
-        return int(_f(row, *keys))
+    Returns the set of snapshot months observed (as a sorted list).
+    """
+    if not (text or "").strip():
+        return []
 
-    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+    cleaned = text.lstrip("\ufeff")
+    first = cleaned.splitlines()[0]
+    delim = "\t" if "\t" in first else ","
+    reader = csv.DictReader(io.StringIO(cleaned), delimiter=delim)
+    seen_months: set[str] = set()
+
     for row in reader:
+        norm = {
+            (k or "").strip().lstrip("\ufeff").lower().replace("_", "-").replace(" ", "-"): v
+            for k, v in row.items()
+        }
         sku = (
-            row.get("sku")
-            or row.get("seller-sku")
-            or row.get("merchant-sku")
+            norm.get("sku")
+            or norm.get("seller-sku")
+            or norm.get("merchant-sku")
             or ""
         ).strip()
         if not sku:
             continue
-        charged = _f(row, "amount-charged", "amount_charged")
+
+        snapshot = (
+            norm.get("snapshot-date")
+            or norm.get("date")
+            or norm.get("snapshotdate")
+            or ""
+        ).strip()
+        month_key = ""
+        if snapshot:
+            # 2026-05-15T08:02:00+00:00 or 2026-05-15
+            month_key = snapshot[:7] if re.match(r"^\d{4}-\d{2}", snapshot) else ""
+            if month_key:
+                seen_months.add(month_key)
+            if months_filter is not None and month_key and month_key not in months_filter:
+                continue
+
+        charged = _coerce_float(
+            norm.get("amount-charged") or norm.get("amountcharged"),
+        )
         if charged <= 0:
-            charged = _f(row, "long-time-range-long-term-storage-fee") + _f(
-                row, "short-time-range-long-term-storage-fee",
+            charged = _coerce_float(norm.get("long-time-range-long-term-storage-fee")) + _coerce_float(
+                norm.get("short-time-range-long-term-storage-fee"),
             )
-        qty = _i(
-            row,
-            "qty-charged",
-            "qty_charged",
-            "qty-charged-long-time-range-long-term-storage-fee",
-            "qty-charged-short-time-range-long-term-storage-fee",
+        qty = int(
+            _coerce_float(
+                norm.get("qty-charged")
+                or norm.get("qtycharged")
+                or norm.get("qty-charged-long-time-range-long-term-storage-fee")
+                or norm.get("qty-charged-short-time-range-long-term-storage-fee"),
+            )
         )
         if charged <= 0 and qty <= 0:
             continue
-        asin = (row.get("asin") or row.get("ASIN") or "").strip().upper() or None
+        asin = (norm.get("asin") or "").strip().upper() or None
         bucket = per_sku.setdefault(
             sku,
             {"charged_total": 0.0, "qty_charged": 0, "asin": asin},
         )
-        bucket["charged_total"] += charged
-        bucket["qty_charged"] += max(qty, 0)
+        bucket["charged_total"] = _coerce_float(bucket["charged_total"]) + charged
+        bucket["qty_charged"] = int(bucket.get("qty_charged") or 0) + max(qty, 0)
         if asin and not bucket.get("asin"):
             bucket["asin"] = asin
+
+    return sorted(seen_months)
+
+
+def parse_aged_surcharge_charges_report(
+    text: str,
+    months_filter: list[str] | None = None,
+) -> tuple[dict[str, dict], list[str]]:
+    """Parse Aged Inventory Surcharge / LONGTERM_STORAGE_FEE_CHARGES report.
+
+    Returns ({sku: {charged_total, qty_charged, asin}}, months_seen).
+    """
+    allowed = set(months_filter) if months_filter else None
+    per_sku: dict[str, dict] = {}
+    months = _accumulate_aged_surcharge_rows(text, per_sku, allowed)
+    out = {
+        sku: {
+            "charged_total": round(_coerce_float(v["charged_total"]), 2),
+            "qty_charged": int(v.get("qty_charged") or 0),
+            "asin": v.get("asin"),
+        }
+        for sku, v in per_sku.items()
+        if _coerce_float(v.get("charged_total")) > 0
+    }
+    return out, months
 
 
 async def fetch_aged_surcharge_charges_per_sku(
     start: datetime,
     end: datetime,
+    time_zone: str = "UTC",
 ) -> dict[str, dict]:
     """Pull GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA — the same
     report Seller Central shows as "Aged Inventory Surcharge report".
 
     Strategy (critical — Amazon FATALS duplicate creates):
-      1. Prefer an existing DONE report that already covers each calendar
-         month (via getReports). Re-creating the same month often returns
-         FATAL after a few requests even when a DONE copy exists.
-      2. Only create a new report when none is available.
-      3. Date span must be exactly one month as Amazon docs require —
-         use 1st-of-month 00:00Z → 1st-of-next-month 00:00Z (the shape
-         that consistently completes DONE for this report type).
+      1. Calendar months are taken in marketplace TZ (not UTC day boundaries —
+         March 31 PDT end-of-day is April 1 UTC and must NOT pull April).
+      2. Prefer an existing DONE report, but only if its rows include the
+         requested Event Month (snapshot-date). Blind date-range reuse was
+         returning June/May files for March filters → $0 after month filter.
+      3. Create a new month report when reuse yields no matching Event Month.
+      4. Empty parsed result after a successful create = real SC "No results".
 
     Returns {sku: {charged_total, qty_charged, asin}}.
     """
-    start_utc = start.astimezone(timezone.utc)
-    end_utc = end.astimezone(timezone.utc)
+    month_keys = calendar_months_in_window(start, end, time_zone)
+    if not month_keys:
+        return {}
 
-    months: list[tuple[datetime, datetime]] = []
-    cursor = start_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    end_month = end_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    while cursor <= end_month:
-        if cursor.month == 12:
-            nxt = cursor.replace(year=cursor.year + 1, month=1)
-        else:
-            nxt = cursor.replace(month=cursor.month + 1)
-        months.append((cursor, nxt))
-        cursor = nxt
-
-    # Pull recent reports once — covers reuse across all months in the window.
-    # getReports rejects createdSince older than 90 days.
     now = datetime.now(timezone.utc)
+    # getReports rejects createdSince older than 90 days.
     lookback = now - timedelta(days=89)
     try:
         existing = await _list_aged_surcharge_reports(lookback)
@@ -1706,81 +2122,138 @@ async def fetch_aged_surcharge_charges_per_sku(
 
     per_sku: dict[str, dict] = {}
     errors: list[str] = []
-    for month_start, month_end_excl in months:
-        label = month_start.strftime("%Y-%m")
-        # Newest DONE report covering this month first.
+    months_resolved: list[str] = []
+
+    def _merge_parsed(parsed: dict[str, dict]) -> None:
+        for sku, bucket in parsed.items():
+            dest = per_sku.setdefault(
+                sku,
+                {"charged_total": 0.0, "qty_charged": 0, "asin": bucket.get("asin")},
+            )
+            dest["charged_total"] += float(bucket.get("charged_total") or 0)
+            dest["qty_charged"] += int(bucket.get("qty_charged") or 0)
+            if bucket.get("asin") and not dest.get("asin"):
+                dest["asin"] = bucket["asin"]
+
+    async def _try_text_for_month(text: str, label: str) -> bool:
+        """True if report contains this Event Month (even when amount-charged is $0)."""
+        parsed, seen = parse_aged_surcharge_charges_report(text, [label])
+        if label not in seen and not parsed:
+            # Wrong month file (e.g. reused June report while asking for March).
+            return False
+        _merge_parsed(parsed)
+        return True
+
+    for label in month_keys:
+        month_start, month_end_excl = month_start_end_excl(label, time_zone)
+        resolved = False
+
+        # 1) Try DONE reports whose data window overlaps this month.
         candidates = [
             r for r in existing_done
             if _report_covers_month(r, month_start, month_end_excl)
         ]
-        candidates.sort(
-            key=lambda r: r.get("createdTime") or "",
-            reverse=True,
-        )
-        text: str | None = None
-        if candidates:
+        candidates.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+
+        # 2) Also try newest DONE reports even if date metadata is off —
+        #    content snapshot-date is the source of truth (SC Event Month).
+        extras = [
+            r for r in existing_done
+            if r not in candidates
+        ]
+        extras.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+        ordered = candidates + extras[:15]
+
+        for report in ordered:
             try:
                 text = await download_report_raw(
-                    candidates[0]["reportId"], max_polls=3, poll_interval=5,
+                    report["reportId"], max_polls=3, poll_interval=5,
                 )
             except Exception as e:
-                errors.append(f"{label}: reuse {candidates[0].get('reportId')} failed ({e})")
-                text = None
+                errors.append(f"{label}: reuse {report.get('reportId')} failed ({e})")
+                continue
+            if await _try_text_for_month(text, label):
+                resolved = True
+                months_resolved.append(label)
+                break
 
-        if text is None:
-            # Create only when no reusable DONE report exists.
-            try:
-                create_resp = await create_report(
-                    "GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA",
-                    start_date=month_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    end_date=month_end_excl.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    single_marketplace=True,
+        if resolved:
+            continue
+
+        # 3) Create a fresh report for this Event Month.
+        try:
+            # Amazon wants [start, end) in UTC; end exclusive = next month start.
+            end_for_api = min(month_end_excl, now)
+            if end_for_api <= month_start:
+                end_for_api = now
+            create_resp = await create_report(
+                "GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA",
+                start_date=month_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                end_date=end_for_api.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                single_marketplace=True,
+            )
+            report_id = create_resp.get("reportId")
+            if not report_id:
+                errors.append(f"{label}: create returned no id")
+            else:
+                text = await download_report_raw(
+                    report_id, max_polls=36, poll_interval=10,
                 )
-                report_id = create_resp.get("reportId")
-                if not report_id:
-                    errors.append(f"{label}: create returned no id")
+                if await _try_text_for_month(text, label):
+                    resolved = True
+                    months_resolved.append(label)
                 else:
-                    text = await download_report_raw(
-                        report_id, max_polls=36, poll_interval=10,
-                    )
-            except Exception as e:
-                errors.append(f"{label}: create/download failed ({e})")
-                # Last chance: refresh the report list — another DONE may
-                # have appeared, or an older one we missed.
-                try:
-                    existing = await _list_aged_surcharge_reports(lookback)
-                    existing_done = [
-                        r for r in existing
-                        if r.get("processingStatus") == "DONE"
-                        and r.get("reportDocumentId")
-                    ]
-                    candidates = [
-                        r for r in existing_done
-                        if _report_covers_month(r, month_start, month_end_excl)
-                    ]
-                    candidates.sort(
-                        key=lambda r: r.get("createdTime") or "",
-                        reverse=True,
-                    )
-                    if candidates:
-                        text = await download_report_raw(
-                            candidates[0]["reportId"], max_polls=3, poll_interval=5,
+                    # Successful download but no rows for this month = real $0.
+                    # Mark resolved so we don't treat it as a hard failure.
+                    parsed_all, seen_all = parse_aged_surcharge_charges_report(text)
+                    if not seen_all or label in seen_all or not parsed_all:
+                        resolved = True
+                        months_resolved.append(label)
+                    else:
+                        errors.append(
+                            f"{label}: created report had months {seen_all}, not {label}"
                         )
+        except Exception as e:
+            errors.append(f"{label}: create/download failed ({e})")
+            # Last chance: refresh list and scan content again.
+            try:
+                existing = await _list_aged_surcharge_reports(lookback)
+                existing_done = [
+                    r for r in existing
+                    if r.get("processingStatus") == "DONE"
+                    and r.get("reportDocumentId")
+                ]
+                for report in sorted(
+                    existing_done,
+                    key=lambda r: r.get("createdTime") or "",
+                    reverse=True,
+                )[:20]:
+                    try:
+                        text = await download_report_raw(
+                            report["reportId"], max_polls=3, poll_interval=5,
+                        )
+                    except Exception:
+                        continue
+                    if await _try_text_for_month(text, label):
+                        resolved = True
+                        months_resolved.append(label)
                         errors.append(
                             f"{label}: recovered via existing DONE "
-                            f"{candidates[0].get('reportId')}"
+                            f"{report.get('reportId')}"
                         )
-                except Exception as e2:
-                    errors.append(f"{label}: recovery failed ({e2})")
+                        break
+            except Exception as e2:
+                errors.append(f"{label}: recovery failed ({e2})")
 
-        if text:
-            _accumulate_aged_surcharge_rows(text, per_sku)
+        if not resolved:
+            errors.append(f"{label}: no Aged Inventory Surcharge data resolved")
 
-    if not per_sku and errors:
+    if not per_sku and errors and not months_resolved:
         raise RuntimeError(
             "Aged surcharge charges report failed for every month: "
             + "; ".join(errors)
         )
+    # Empty per_sku with resolved months = valid "No results found".
     return {
         sku: {
             "charged_total": round(v["charged_total"], 2),
