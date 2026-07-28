@@ -59,3 +59,27 @@ def test_tsv_aged_report_still_parses():
     assert months == ["2026-05"]
     assert per_sku["TEST-SKU"]["charged_total"] == 1.25
     assert per_sku["TEST-SKU"]["qty_charged"] == 2
+
+
+def test_wrong_month_report_does_not_count_as_match():
+    """Reused June file must not satisfy a March Event Month request."""
+    june = _load_sample("401660020661 (1).csv")
+    parsed, seen = parse_aged_surcharge_charges_report(june, months_filter=["2026-03"])
+    assert parsed == {}
+    assert "2026-03" not in seen
+    assert "2026-06" in seen
+
+
+def test_march_window_months_are_marketplace_not_utc_spill():
+    """March 31 PDT end-of-day is April 1 UTC — must still be only 2026-03."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    from amazon_sp import calendar_months_in_window
+
+    tz = "America/Los_Angeles"
+    z = ZoneInfo(tz)
+    start = datetime(2026, 3, 1, 0, 0, 0, tzinfo=z).astimezone(timezone.utc)
+    end = datetime(2026, 3, 31, 23, 59, 59, 999999, tzinfo=z).astimezone(timezone.utc)
+    assert end.month == 4  # UTC spill
+    assert calendar_months_in_window(start, end, tz) == ["2026-03"]

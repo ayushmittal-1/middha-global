@@ -2088,38 +2088,28 @@ def parse_aged_surcharge_charges_report(
 async def fetch_aged_surcharge_charges_per_sku(
     start: datetime,
     end: datetime,
+    time_zone: str = "UTC",
 ) -> dict[str, dict]:
     """Pull GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA — the same
     report Seller Central shows as "Aged Inventory Surcharge report".
 
     Strategy (critical — Amazon FATALS duplicate creates):
-      1. Prefer an existing DONE report that already covers each calendar
-         month (via getReports). Re-creating the same month often returns
-         FATAL after a few requests even when a DONE copy exists.
-      2. Only create a new report when none is available.
-      3. Date span must be exactly one month as Amazon docs require —
-         use 1st-of-month 00:00Z → 1st-of-next-month 00:00Z (the shape
-         that consistently completes DONE for this report type).
+      1. Calendar months are taken in marketplace TZ (not UTC day boundaries —
+         March 31 PDT end-of-day is April 1 UTC and must NOT pull April).
+      2. Prefer an existing DONE report, but only if its rows include the
+         requested Event Month (snapshot-date). Blind date-range reuse was
+         returning June/May files for March filters → $0 after month filter.
+      3. Create a new month report when reuse yields no matching Event Month.
+      4. Empty parsed result after a successful create = real SC "No results".
 
     Returns {sku: {charged_total, qty_charged, asin}}.
     """
-    start_utc = start.astimezone(timezone.utc)
-    end_utc = end.astimezone(timezone.utc)
+    month_keys = calendar_months_in_window(start, end, time_zone)
+    if not month_keys:
+        return {}
 
-    months: list[tuple[datetime, datetime]] = []
-    cursor = start_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    end_month = end_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    while cursor <= end_month:
-        if cursor.month == 12:
-            nxt = cursor.replace(year=cursor.year + 1, month=1)
-        else:
-            nxt = cursor.replace(month=cursor.month + 1)
-        months.append((cursor, nxt))
-        cursor = nxt
-
-    # Pull recent reports once — covers reuse across all months in the window.
-    # getReports rejects createdSince older than 90 days.
     now = datetime.now(timezone.utc)
+    # getReports rejects createdSince older than 90 days.
     lookback = now - timedelta(days=89)
     try:
         existing = await _list_aged_surcharge_reports(lookback)
@@ -2132,93 +2122,138 @@ async def fetch_aged_surcharge_charges_per_sku(
 
     per_sku: dict[str, dict] = {}
     errors: list[str] = []
-    for month_start, month_end_excl in months:
-        label = month_start.strftime("%Y-%m")
-        # Newest DONE report covering this month first.
+    months_resolved: list[str] = []
+
+    def _merge_parsed(parsed: dict[str, dict]) -> None:
+        for sku, bucket in parsed.items():
+            dest = per_sku.setdefault(
+                sku,
+                {"charged_total": 0.0, "qty_charged": 0, "asin": bucket.get("asin")},
+            )
+            dest["charged_total"] += float(bucket.get("charged_total") or 0)
+            dest["qty_charged"] += int(bucket.get("qty_charged") or 0)
+            if bucket.get("asin") and not dest.get("asin"):
+                dest["asin"] = bucket["asin"]
+
+    async def _try_text_for_month(text: str, label: str) -> bool:
+        """True if report contains this Event Month (even when amount-charged is $0)."""
+        parsed, seen = parse_aged_surcharge_charges_report(text, [label])
+        if label not in seen and not parsed:
+            # Wrong month file (e.g. reused June report while asking for March).
+            return False
+        _merge_parsed(parsed)
+        return True
+
+    for label in month_keys:
+        month_start, month_end_excl = month_start_end_excl(label, time_zone)
+        resolved = False
+
+        # 1) Try DONE reports whose data window overlaps this month.
         candidates = [
             r for r in existing_done
             if _report_covers_month(r, month_start, month_end_excl)
         ]
-        candidates.sort(
-            key=lambda r: r.get("createdTime") or "",
-            reverse=True,
-        )
-        text: str | None = None
-        if candidates:
+        candidates.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+
+        # 2) Also try newest DONE reports even if date metadata is off —
+        #    content snapshot-date is the source of truth (SC Event Month).
+        extras = [
+            r for r in existing_done
+            if r not in candidates
+        ]
+        extras.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+        ordered = candidates + extras[:15]
+
+        for report in ordered:
             try:
                 text = await download_report_raw(
-                    candidates[0]["reportId"], max_polls=3, poll_interval=5,
+                    report["reportId"], max_polls=3, poll_interval=5,
                 )
             except Exception as e:
-                errors.append(f"{label}: reuse {candidates[0].get('reportId')} failed ({e})")
-                text = None
+                errors.append(f"{label}: reuse {report.get('reportId')} failed ({e})")
+                continue
+            if await _try_text_for_month(text, label):
+                resolved = True
+                months_resolved.append(label)
+                break
 
-        if text is None:
-            # Create only when no reusable DONE report exists.
-            try:
-                create_resp = await create_report(
-                    "GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA",
-                    start_date=month_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    end_date=month_end_excl.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    single_marketplace=True,
+        if resolved:
+            continue
+
+        # 3) Create a fresh report for this Event Month.
+        try:
+            # Amazon wants [start, end) in UTC; end exclusive = next month start.
+            end_for_api = min(month_end_excl, now)
+            if end_for_api <= month_start:
+                end_for_api = now
+            create_resp = await create_report(
+                "GET_FBA_FULFILLMENT_LONGTERM_STORAGE_FEE_CHARGES_DATA",
+                start_date=month_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                end_date=end_for_api.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                single_marketplace=True,
+            )
+            report_id = create_resp.get("reportId")
+            if not report_id:
+                errors.append(f"{label}: create returned no id")
+            else:
+                text = await download_report_raw(
+                    report_id, max_polls=36, poll_interval=10,
                 )
-                report_id = create_resp.get("reportId")
-                if not report_id:
-                    errors.append(f"{label}: create returned no id")
+                if await _try_text_for_month(text, label):
+                    resolved = True
+                    months_resolved.append(label)
                 else:
-                    text = await download_report_raw(
-                        report_id, max_polls=36, poll_interval=10,
-                    )
-            except Exception as e:
-                errors.append(f"{label}: create/download failed ({e})")
-                # Last chance: refresh the report list — another DONE may
-                # have appeared, or an older one we missed.
-                try:
-                    existing = await _list_aged_surcharge_reports(lookback)
-                    existing_done = [
-                        r for r in existing
-                        if r.get("processingStatus") == "DONE"
-                        and r.get("reportDocumentId")
-                    ]
-                    candidates = [
-                        r for r in existing_done
-                        if _report_covers_month(r, month_start, month_end_excl)
-                    ]
-                    candidates.sort(
-                        key=lambda r: r.get("createdTime") or "",
-                        reverse=True,
-                    )
-                    if candidates:
-                        text = await download_report_raw(
-                            candidates[0]["reportId"], max_polls=3, poll_interval=5,
+                    # Successful download but no rows for this month = real $0.
+                    # Mark resolved so we don't treat it as a hard failure.
+                    parsed_all, seen_all = parse_aged_surcharge_charges_report(text)
+                    if not seen_all or label in seen_all or not parsed_all:
+                        resolved = True
+                        months_resolved.append(label)
+                    else:
+                        errors.append(
+                            f"{label}: created report had months {seen_all}, not {label}"
                         )
+        except Exception as e:
+            errors.append(f"{label}: create/download failed ({e})")
+            # Last chance: refresh list and scan content again.
+            try:
+                existing = await _list_aged_surcharge_reports(lookback)
+                existing_done = [
+                    r for r in existing
+                    if r.get("processingStatus") == "DONE"
+                    and r.get("reportDocumentId")
+                ]
+                for report in sorted(
+                    existing_done,
+                    key=lambda r: r.get("createdTime") or "",
+                    reverse=True,
+                )[:20]:
+                    try:
+                        text = await download_report_raw(
+                            report["reportId"], max_polls=3, poll_interval=5,
+                        )
+                    except Exception:
+                        continue
+                    if await _try_text_for_month(text, label):
+                        resolved = True
+                        months_resolved.append(label)
                         errors.append(
                             f"{label}: recovered via existing DONE "
-                            f"{candidates[0].get('reportId')}"
+                            f"{report.get('reportId')}"
                         )
-                except Exception as e2:
-                    errors.append(f"{label}: recovery failed ({e2})")
+                        break
+            except Exception as e2:
+                errors.append(f"{label}: recovery failed ({e2})")
 
-        if text:
-            # Keep only this Event Month's snapshot-date rows (SC filter).
-            parsed, _ = parse_aged_surcharge_charges_report(text, [label])
-            for sku, bucket in parsed.items():
-                dest = per_sku.setdefault(
-                    sku,
-                    {"charged_total": 0.0, "qty_charged": 0, "asin": bucket.get("asin")},
-                )
-                dest["charged_total"] += float(bucket.get("charged_total") or 0)
-                dest["qty_charged"] += int(bucket.get("qty_charged") or 0)
-                if bucket.get("asin") and not dest.get("asin"):
-                    dest["asin"] = bucket["asin"]
+        if not resolved:
+            errors.append(f"{label}: no Aged Inventory Surcharge data resolved")
 
-    if not per_sku and errors:
+    if not per_sku and errors and not months_resolved:
         raise RuntimeError(
             "Aged surcharge charges report failed for every month: "
             + "; ".join(errors)
         )
-    # Empty per_sku with no errors = valid "No results found" for the window
-    # (same as Seller Central Event Month with zero AIS charges).
+    # Empty per_sku with resolved months = valid "No results found".
     return {
         sku: {
             "charged_total": round(v["charged_total"], 2),

@@ -1339,7 +1339,7 @@ async def compute_profitability_data(
             aged_charges_trusted = True
         else:
             charges_per_sku = await amazon_sp.fetch_aged_surcharge_charges_per_sku(
-                start_dt, end_dt,
+                start_dt, end_dt, time_zone=mp_tz,
             )
             await put_aged_surcharge_charges_cache(
                 charges_per_sku, charges_start_iso, charges_end_iso,
