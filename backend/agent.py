@@ -1120,13 +1120,12 @@ async def compute_profitability_data(
 
     # Returns come from Aurora's Order.customerReturns (populated by
     # customerReturnsService from GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA),
-    # NOT from Finances. Two big wins over the Finances-refund-events path:
-    #   1. `returnDate` bounds returns precisely to the seller's actual
-    #      customer-return window — no bleed-through from earlier refunds
-    #      posted late (the /1-10 June -> $1.07 bug).
-    #   2. `orderItems[].referralFee` gives the exact referral Amazon
-    #      charged at sale time, so 0.20 × that × units is per-order-line
-    #      accurate rather than a window average.
+    # NOT from Finances. Bounded by the ORDER's purchaseDate — matches
+    # the same sale-window the rest of the tab uses, so a return counts
+    # in the window the item was SOLD (regardless of when the customer
+    # actually returned it). `orderItems[].referralFee` gives the exact
+    # referral Amazon charged at sale time, so 0.20 × that × units is
+    # per-order-line accurate rather than a window average.
     returns_by_sku: dict[str, dict] = {}
     if use_db:
         try:

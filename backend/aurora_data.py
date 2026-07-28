@@ -178,9 +178,15 @@ async def fba_returns_by_sku(
     start: datetime,
     end: datetime,
 ) -> dict[str, dict]:
-    """Per-SKU customer returns aggregated from Aurora's Order.customerReturns
-    within [start, end], using the ORDER's own referral fee (per line item)
-    as the refunded_referral input.
+    """Per-SKU customer returns for orders PURCHASED in [start, end],
+    using the ORDER's own referral fee (per line item) as the
+    refunded_referral input.
+
+    Bound by `purchaseDate`, not `customerReturns.returnDate`: the
+    Profitability tab treats a window as "orders placed in this window",
+    so a return of one of those orders belongs to the same window even
+    if the customer returned it later (or hasn't yet). Returns of
+    earlier orders don't count.
 
     Aurora's customerReturnsService populates Order.customerReturns from
     GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA, and orderItems[].referralFee
@@ -189,15 +195,16 @@ async def fba_returns_by_sku(
         refunded_referral += (referralFee.amount / quantityOrdered) × qty_returned
 
     Returns {sku: {returned_units, refunded_referral, asin}}. Empty dict
-    when the seller has no returns in the window.
+    when the seller has no returns for orders purchased in the window.
     """
     seller_id = ObjectId(str(user["_id"]))
     pipeline = [
-        {"$match": {"sellerId": seller_id, "hasCustomerReturn": True}},
-        {"$unwind": "$customerReturns"},
         {"$match": {
-            "customerReturns.returnDate": {"$gte": start, "$lte": end},
+            "sellerId": seller_id,
+            "hasCustomerReturn": True,
+            "purchaseDate": {"$gte": start, "$lte": end},
         }},
+        {"$unwind": "$customerReturns"},
         # Find the orderItem with a matching seller SKU on the same order —
         # that carries the referralFee we want.
         {"$addFields": {
