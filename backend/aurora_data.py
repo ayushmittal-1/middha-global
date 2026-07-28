@@ -173,6 +173,79 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
     return out
 
 
+async def fba_returns_by_sku(
+    user: dict,
+    start: datetime,
+    end: datetime,
+) -> dict[str, dict]:
+    """Per-SKU customer returns aggregated from Aurora's Order.customerReturns
+    within [start, end], using the ORDER's own referral fee (per line item)
+    as the refunded_referral input.
+
+    Aurora's customerReturnsService populates Order.customerReturns from
+    GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA, and orderItems[].referralFee
+    carries the actual Amazon-charged referral. So:
+
+        refunded_referral += (referralFee.amount / quantityOrdered) × qty_returned
+
+    Returns {sku: {returned_units, refunded_referral, asin}}. Empty dict
+    when the seller has no returns in the window.
+    """
+    seller_id = ObjectId(str(user["_id"]))
+    pipeline = [
+        {"$match": {"sellerId": seller_id, "hasCustomerReturn": True}},
+        {"$unwind": "$customerReturns"},
+        {"$match": {
+            "customerReturns.returnDate": {"$gte": start, "$lte": end},
+        }},
+        # Find the orderItem with a matching seller SKU on the same order —
+        # that carries the referralFee we want.
+        {"$addFields": {
+            "matchingItem": {
+                "$first": {
+                    "$filter": {
+                        "input": "$orderItems",
+                        "as": "it",
+                        "cond": {"$eq": ["$$it.sellerSku", "$customerReturns.sku"]},
+                    }
+                }
+            }
+        }},
+        {"$addFields": {
+            "referralPerUnit": {
+                "$cond": [
+                    {"$gt": [{"$ifNull": ["$matchingItem.quantityOrdered", 0]}, 0]},
+                    {"$divide": [
+                        {"$ifNull": ["$matchingItem.referralFee.amount", 0]},
+                        "$matchingItem.quantityOrdered",
+                    ]},
+                    0,
+                ]
+            },
+            "returnedUnits": {"$ifNull": ["$customerReturns.quantity", 0]},
+        }},
+        {"$group": {
+            "_id": "$customerReturns.sku",
+            "returned_units": {"$sum": "$returnedUnits"},
+            "refunded_referral": {
+                "$sum": {"$multiply": ["$referralPerUnit", "$returnedUnits"]}
+            },
+            "asin": {"$first": "$customerReturns.asin"},
+        }},
+    ]
+    out: dict[str, dict] = {}
+    async for doc in _db().orders.aggregate(pipeline):
+        sku = (doc.get("_id") or "").strip()
+        if not sku:
+            continue
+        out[sku] = {
+            "returned_units": int(doc.get("returned_units") or 0),
+            "refunded_referral": abs(float(doc.get("refunded_referral") or 0.0)),
+            "asin": doc.get("asin"),
+        }
+    return out
+
+
 async def fba_aged_inventory_by_sku(user: dict) -> Optional[dict[str, dict]]:
     """Read Aurora's `fbaagedinventoryfees` snapshot for this seller.
 
