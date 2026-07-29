@@ -39,6 +39,22 @@ _FEES_ESTIMATE_TTL_S = 30 * 60
 _ORDERS_CACHE: dict[tuple, tuple[float, dict]] = {}
 _ORDERS_CACHE_TTL_S = 30 * 60
 
+# DONE report bodies never change — cache by reportId so profitability does
+# not re-hit getReportDocument (tight quota) on every Apply / every candidate.
+_REPORT_TEXT_CACHE: dict[str, str] = {}
+_REPORT_TEXT_CACHE_MAX = 64
+# Space document GETs so we don't burn the Reports document rate limit.
+_DOC_GET_LOCK: asyncio.Lock | None = None
+_DOC_GET_LAST_TS = 0.0
+_DOC_GET_MIN_GAP_S = 1.25
+
+
+def _doc_get_lock() -> asyncio.Lock:
+    global _DOC_GET_LOCK
+    if _DOC_GET_LOCK is None:
+        _DOC_GET_LOCK = asyncio.Lock()
+    return _DOC_GET_LOCK
+
 # ── App-level config (stays in env) ──────────────────────────────────────────
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
@@ -2238,21 +2254,23 @@ async def fetch_aged_surcharge_charges_per_sku(
         month_start, month_end_excl = month_start_end_excl(label, time_zone)
         resolved = False
 
-        # 1) Try DONE reports whose data window overlaps this month.
+        # 1) Try a few DONE reports whose data window overlaps this month.
+        #    Do NOT scan extras[:15] / [:20] — each getReportDocument hit
+        #    burns the Reports quota and freezes the profitability UI on 429.
         candidates = [
             r for r in existing_done
             if _report_covers_month(r, month_start, month_end_excl)
         ]
         candidates.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
-
-        # 2) Also try newest DONE reports even if date metadata is off —
-        #    content snapshot-date is the source of truth (SC Event Month).
-        extras = [
-            r for r in existing_done
-            if r not in candidates
-        ]
-        extras.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
-        ordered = candidates + extras[:15]
+        # Newest overlapping first; at most one non-overlapping newest as fallback.
+        ordered = list(candidates[:2])
+        if existing_done:
+            newest = max(
+                existing_done,
+                key=lambda r: r.get("createdTime") or "",
+            )
+            if newest not in ordered:
+                ordered.append(newest)
 
         for report in ordered:
             try:
@@ -2287,7 +2305,7 @@ async def fetch_aged_surcharge_charges_per_sku(
                 errors.append(f"{label}: create returned no id")
             else:
                 text = await download_report_raw(
-                    report_id, max_polls=36, poll_interval=10,
+                    report_id, max_polls=24, poll_interval=8,
                 )
                 if await _try_text_for_month(text, label):
                     resolved = True
@@ -2305,7 +2323,7 @@ async def fetch_aged_surcharge_charges_per_sku(
                         )
         except Exception as e:
             errors.append(f"{label}: create/download failed ({e})")
-            # Last chance: refresh list and scan content again.
+            # Last chance: refresh list and try at most 2 newest DONE reports.
             try:
                 existing = await _list_aged_surcharge_reports(lookback)
                 existing_done = [
@@ -2317,7 +2335,7 @@ async def fetch_aged_surcharge_charges_per_sku(
                     existing_done,
                     key=lambda r: r.get("createdTime") or "",
                     reverse=True,
-                )[:20]:
+                )[:2]:
                     try:
                         text = await download_report_raw(
                             report["reportId"], max_polls=3, poll_interval=5,
@@ -2562,16 +2580,16 @@ async def fetch_removal_fees_per_sku(
 
         text: str | None = None
 
-        # 1) Try existing DONE reports that fully cover this month.
+        # 1) Try existing DONE reports that fully cover this month (1 best).
         covering = [
             r for r in existing_done
             if _report_fully_covers_window(r, month_start, report_end)
         ]
         covering.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
-        for report in covering[:3]:
+        for report in covering[:1]:
             try:
                 text = await download_report_raw(
-                    report["reportId"], max_polls=4, poll_interval=5,
+                    report["reportId"], max_polls=3, poll_interval=5,
                 )
                 break
             except Exception:
@@ -2582,8 +2600,9 @@ async def fetch_removal_fees_per_sku(
             _merge(parsed)
             continue
 
-        # 2) An IN_PROGRESS report for this month already exists — wait for it.
-        #    Never create a duplicate (Amazon will FATAL and the UI will loop).
+        # 2) An IN_PROGRESS report for this month already exists — wait briefly.
+        #    Never create a duplicate (Amazon will FATAL). Cap wait so the UI
+        #    cannot hang for minutes; caller can refresh once Amazon finishes.
         in_prog_covering = [
             r for r in existing_inprog
             if _report_covers_month(r, month_start, report_end)
@@ -2593,9 +2612,9 @@ async def fetch_removal_fees_per_sku(
         if in_prog_covering:
             waited_id = in_prog_covering[0]["reportId"]
             try:
-                # Wait up to ~4 min (48 × 5 s) for the in-progress report.
+                # ~60s max (12 × 5s) — not 4 minutes.
                 text = await download_report_raw(
-                    waited_id, max_polls=48, poll_interval=5,
+                    waited_id, max_polls=12, poll_interval=5,
                 )
             except Exception:
                 text = None
@@ -2613,7 +2632,7 @@ async def fetch_removal_fees_per_sku(
                 created_id = create_resp.get("reportId")
                 if created_id:
                     text = await download_report_raw(
-                        created_id, max_polls=48, poll_interval=5,
+                        created_id, max_polls=18, poll_interval=5,
                     )
             except Exception:
                 created_id = None
@@ -2628,12 +2647,12 @@ async def fetch_removal_fees_per_sku(
                     refreshed_done,
                     key=lambda r: r.get("createdTime") or "",
                     reverse=True,
-                )[:10]:
+                )[:2]:
                     if _report_fully_covers_window(r, month_start, report_end) or \
                        _report_covers_month(r, month_start, report_end):
                         try:
                             text = await download_report_raw(
-                                r["reportId"], max_polls=4, poll_interval=5,
+                                r["reportId"], max_polls=3, poll_interval=5,
                             )
                             if text:
                                 break
@@ -2647,7 +2666,7 @@ async def fetch_removal_fees_per_sku(
             raise RuntimeError(
                 f"Removal Order Detail unavailable for {label}: "
                 "report still IN_PROGRESS or create failed. "
-                "Refresh in ~2 minutes once Amazon finishes processing."
+                "Refresh in ~1 minute once Amazon finishes processing."
             )
 
         parsed, _ = parse_removal_order_detail_report(text, w_start, w_end)
@@ -2772,8 +2791,25 @@ async def get_report(report_id: str) -> dict:
 
 
 async def get_report_document(document_id: str) -> dict:
-    """Get the download URL for a completed report document."""
-    return await _sp_request("GET", f"/reports/2021-06-30/documents/{document_id}")
+    """Get the download URL for a completed report document.
+
+    Documents endpoint has a tight quota — space calls and fail fast on 429
+    so the profitability UI cannot hang for minutes on retries.
+    """
+    global _DOC_GET_LAST_TS
+    async with _doc_get_lock():
+        now = time.monotonic()
+        gap = _DOC_GET_MIN_GAP_S - (now - _DOC_GET_LAST_TS)
+        if gap > 0:
+            await asyncio.sleep(gap)
+        try:
+            return await _sp_request(
+                "GET",
+                f"/reports/2021-06-30/documents/{document_id}",
+                max_429_retries=3,
+            )
+        finally:
+            _DOC_GET_LAST_TS = time.monotonic()
 
 
 async def download_report_raw(report_id: str, max_polls: int = 30, poll_interval: int = 10) -> str:
@@ -2781,7 +2817,12 @@ async def download_report_raw(report_id: str, max_polls: int = 30, poll_interval
 
     Used by the ingest pipeline, which needs every row (not the
     LLM-friendly truncated summary that `download_report` returns).
+    Caches DONE report bodies by reportId for the process lifetime.
     """
+    cached = _REPORT_TEXT_CACHE.get(report_id)
+    if cached is not None:
+        return cached
+
     for _ in range(max_polls):
         status = await get_report(report_id)
         processing_status = status.get("processingStatus", "")
@@ -2799,7 +2840,12 @@ async def download_report_raw(report_id: str, max_polls: int = 30, poll_interval
             content = resp.content
             if doc_info.get("compressionAlgorithm") == "GZIP":
                 content = gzip.decompress(content)
-            return content.decode("utf-8", errors="replace")
+            text = content.decode("utf-8", errors="replace")
+            if len(_REPORT_TEXT_CACHE) >= _REPORT_TEXT_CACHE_MAX:
+                # Drop an arbitrary oldest entry (insertion order in 3.7+).
+                _REPORT_TEXT_CACHE.pop(next(iter(_REPORT_TEXT_CACHE)), None)
+            _REPORT_TEXT_CACHE[report_id] = text
+            return text
         if processing_status in ("CANCELLED", "FATAL"):
             raise RuntimeError(f"Report {report_id} failed: {processing_status}")
         await asyncio.sleep(poll_interval)
