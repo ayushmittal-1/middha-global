@@ -77,6 +77,11 @@ def _aged_surcharge_charges_cache():
     return _db().agedSurchargeChargesCache
 
 
+def _removal_fees_cache():
+    """Actual removal fees (REMOVAL_ORDER_DETAIL report) for a date window."""
+    return _db().removalFeesCache
+
+
 def _product_settings():
     return _db().productSettings
 
@@ -116,6 +121,9 @@ async def init_db():
         [("userId", 1)], unique=True
     )
     await _aged_surcharge_charges_cache().create_index(
+        [("userId", 1)], unique=True
+    )
+    await _removal_fees_cache().create_index(
         [("userId", 1)], unique=True
     )
     await _product_settings().create_index(
@@ -536,6 +544,71 @@ async def put_aged_surcharge_charges_cache(
                 "endIso": end_iso,
                 "accessDenied": access_denied,
                 "schemaVersion": 3,
+                "updatedAt": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {"userId": user_id},
+        },
+        upsert=True,
+    )
+
+
+async def get_removal_fees_cache(
+    start_iso: str,
+    end_iso: str,
+    max_age_hours: int = 24,
+) -> dict | None:
+    """Cached Removal Order Detail fees for one profitability window.
+
+    Different start/end must not reuse each other — Amazon is only called for
+    the selected filter, and the cache is keyed to that exact window.
+    """
+    user_id = _user_oid()
+    doc = await _removal_fees_cache().find_one({"userId": user_id})
+    if not doc:
+        return None
+    if int(doc.get("schemaVersion") or 0) < 5:
+        return None
+    if doc.get("startIso") != start_iso or doc.get("endIso") != end_iso:
+        return None
+    updated = doc.get("updatedAt")
+    if not updated:
+        return None
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
+    if age_hours > max_age_hours:
+        return None
+    return {
+        "per_sku": doc.get("perSku", {}),
+        "updated_at": updated.isoformat(),
+        "access_denied": bool(doc.get("accessDenied")),
+        "report_total": float(doc.get("reportTotal") or 0),
+    }
+
+
+async def put_removal_fees_cache(
+    per_sku: dict,
+    start_iso: str,
+    end_iso: str,
+    access_denied: bool = False,
+) -> None:
+    user_id = _user_oid()
+    report_total = 0.0
+    for v in (per_sku or {}).values():
+        if isinstance(v, dict):
+            report_total += float(v.get("removal_fee") or 0)
+        else:
+            report_total += float(v or 0)
+    await _removal_fees_cache().update_one(
+        {"userId": user_id},
+        {
+            "$set": {
+                "perSku": per_sku,
+                "startIso": start_iso,
+                "endIso": end_iso,
+                "accessDenied": access_denied,
+                "reportTotal": round(report_total, 2),
+                "schemaVersion": 5,
                 "updatedAt": datetime.now(timezone.utc),
             },
             "$setOnInsert": {"userId": user_id},
