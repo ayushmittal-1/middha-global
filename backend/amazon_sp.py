@@ -39,6 +39,22 @@ _FEES_ESTIMATE_TTL_S = 30 * 60
 _ORDERS_CACHE: dict[tuple, tuple[float, dict]] = {}
 _ORDERS_CACHE_TTL_S = 30 * 60
 
+# DONE report bodies never change — cache by reportId so profitability does
+# not re-hit getReportDocument (tight quota) on every Apply / every candidate.
+_REPORT_TEXT_CACHE: dict[str, str] = {}
+_REPORT_TEXT_CACHE_MAX = 64
+# Space document GETs so we don't burn the Reports document rate limit.
+_DOC_GET_LOCK: asyncio.Lock | None = None
+_DOC_GET_LAST_TS = 0.0
+_DOC_GET_MIN_GAP_S = 1.25
+
+
+def _doc_get_lock() -> asyncio.Lock:
+    global _DOC_GET_LOCK
+    if _DOC_GET_LOCK is None:
+        _DOC_GET_LOCK = asyncio.Lock()
+    return _DOC_GET_LOCK
+
 # ── App-level config (stays in env) ──────────────────────────────────────────
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
@@ -1255,9 +1271,20 @@ _FEE_TYPE_BUCKETS = [
     ("aged_inventory", ("agedinventorysurcharge", "longtermstoragefee",
                         "agedinventory", "inventoryagesurcharge",
                         "agedinventoryfee")),
+    # Payments → Transactions "FBA Removal Order: Return/Disposal Fee"
+    # posts as Service Fees (not AdjustmentEventList). Match FeeType and
+    # FeeDescription text from Seller Central.
+    ("removal", (
+        "removalorder", "removalfee", "disposalfee", "fbaremover",
+        "fbaremoverorder", "disposalorder",
+    )),
 ]
 
 _REMOVAL_ADJUSTMENT_HINTS = ("removal", "disposal")
+_REMOVAL_SERVICE_HINTS = (
+    "removal order", "removal fee", "disposal fee", "fba removal",
+    "disposal order",
+)
 _PLACEMENT_ADJUSTMENT_HINTS = (
     "inboundplacement", "inbound placement", "placementservice",
     "placement service", "placement fee",
@@ -1324,8 +1351,9 @@ async def get_financial_events(
     posted_after: str,
     posted_before: str | None = None,
     paginate: bool = True,
-    max_pages: int = 20,
+    max_pages: int = 40,
     refund_posted_after: str | None = None,
+    removal_posted_after: str | None = None,
 ) -> dict:
     """Pull ListFinancialEvents for the window and normalize into per-SKU
     fee buckets. Returns:
@@ -1358,6 +1386,7 @@ async def get_financial_events(
 
     by_sku: dict[str, dict] = defaultdict(_empty_fee_bucket)
     unattributed = _empty_fee_bucket()
+    removal_by_order: dict[str, float] = defaultdict(float)
     pages = 0
     page_params = dict(base_params)
 
@@ -1438,19 +1467,42 @@ async def get_financial_events(
 
         for evt in events.get("ServiceFeeEventList") or []:
             sku = (evt.get("SellerSKU") or "").strip()
-            fee_desc = (
-                evt.get("FeeDescription") or evt.get("FeeReason") or ""
+            fee_desc = " ".join(
+                str(evt.get(k) or "")
+                for k in ("FeeDescription", "FeeReason", "FeeType")
             ).lower()
+            # On removal service fees AmazonOrderId is the Removal Order ID
+            # (Payments → Transactions "Order ID"), not a customer order.
+            removal_order_id = (evt.get("AmazonOrderId") or "").strip()
+            posted = evt.get("PostedDate") or ""
             for ftype, amt in _fees_from_lists(evt.get("FeeList")):
+                if not amt:
+                    continue
+                ftype_l = (ftype or "").lower()
                 bucket = _classify_fee_type(ftype)
                 if not bucket and any(h in fee_desc for h in _PLACEMENT_ADJUSTMENT_HINTS):
                     bucket = "inbound_placement"
                 if not bucket and any(h in fee_desc for h in _AGED_ADJUSTMENT_HINTS):
                     bucket = "aged_inventory"
+                # Payments → Transactions rows like
+                # "FBA Removal Order: Return Fee" / "Disposal Fee".
+                if not bucket and (
+                    any(h in fee_desc for h in _REMOVAL_SERVICE_HINTS)
+                    or any(h in ftype_l for h in _REMOVAL_ADJUSTMENT_HINTS)
+                ):
+                    bucket = "removal"
                 if not bucket:
                     continue
+                # Bound removal to the profitability PostedDate window so we
+                # match Seller Central Payments → Transactions "Date", not
+                # Removal Order Detail request-date (those diverge a lot).
+                if bucket == "removal" and removal_posted_after:
+                    if posted and posted < removal_posted_after:
+                        continue
                 target = by_sku[sku] if sku else unattributed
                 target[bucket] += abs(amt)
+                if bucket == "removal" and removal_order_id:
+                    removal_by_order[removal_order_id] += abs(amt)
 
         for evt in events.get("AdjustmentEventList") or []:
             adj_type = (evt.get("AdjustmentType") or "").lower()
@@ -1503,6 +1555,10 @@ async def get_financial_events(
                 continue
             if not any(h in adj_type for h in _REMOVAL_ADJUSTMENT_HINTS):
                 continue
+            if removal_posted_after:
+                posted = evt.get("PostedDate") or ""
+                if posted and posted < removal_posted_after:
+                    continue
             for item in evt.get("AdjustmentItemList") or []:
                 sku = (item.get("SellerSKU") or "").strip()
                 amt_obj = item.get("PerUnitAmount") or item.get("TotalAmount") or {}
@@ -1532,6 +1588,7 @@ async def get_financial_events(
         "by_sku": {sku: {k: round(v, 2) for k, v in bucket.items()}
                    for sku, bucket in by_sku.items()},
         "unattributed": {k: round(v, 2) for k, v in unattributed.items()},
+        "removal_by_order": {k: round(v, 2) for k, v in removal_by_order.items()},
         "totals": totals,
         "pages": pages,
         "posted_after": posted_after,
@@ -1981,6 +2038,55 @@ def _report_covers_month(
     return ds < month_end_excl and de > month_start
 
 
+def _report_covers_month(
+    report: dict, month_start: datetime, report_end: datetime,
+) -> bool:
+    """Loose overlap check for IN_PROGRESS reports whose dataEnd may not be set yet.
+    Returns True if the report window overlaps with [month_start, report_end).
+    Falls back to True if no timing info is present (assume it might cover it).
+    """
+    ds = _parse_report_dt(report.get("dataStartTime"))
+    de = _parse_report_dt(report.get("dataEndTime"))
+    if ds is None:
+        return True  # No timing — assume it might be relevant
+    if ds.tzinfo is None:
+        ds = ds.replace(tzinfo=timezone.utc)
+    if month_start.tzinfo is None:
+        month_start = month_start.replace(tzinfo=timezone.utc)
+    if report_end.tzinfo is None:
+        report_end = report_end.replace(tzinfo=timezone.utc)
+    # If dataEnd not known, check dataStart is within 45 days of month_start.
+    if de is None:
+        return abs((ds - month_start).days) <= 45
+    if de.tzinfo is None:
+        de = de.replace(tzinfo=timezone.utc)
+    return ds < report_end and de > month_start
+
+
+def _report_fully_covers_window(
+    report: dict, start: datetime, end: datetime,
+) -> bool:
+    """True if report dataStart/dataEnd fully contains [start, end).
+
+    Mere overlap is not enough for Removal Order Detail: a report that ends
+    mid-month would under-count later request-dates if we treated it as done.
+    Amazon often sets dataEnd to the last second of the range (end - 1s).
+    """
+    ds = _parse_report_dt(report.get("dataStartTime"))
+    de = _parse_report_dt(report.get("dataEndTime"))
+    if ds is None or de is None:
+        return False
+    if ds.tzinfo is None:
+        ds = ds.replace(tzinfo=timezone.utc)
+    if de.tzinfo is None:
+        de = de.replace(tzinfo=timezone.utc)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return ds <= (start + timedelta(seconds=1)) and de >= (end - timedelta(seconds=2))
+
+
 def _accumulate_aged_surcharge_rows(
     text: str,
     per_sku: dict[str, dict],
@@ -2148,21 +2254,23 @@ async def fetch_aged_surcharge_charges_per_sku(
         month_start, month_end_excl = month_start_end_excl(label, time_zone)
         resolved = False
 
-        # 1) Try DONE reports whose data window overlaps this month.
+        # 1) Try a few DONE reports whose data window overlaps this month.
+        #    Do NOT scan extras[:15] / [:20] — each getReportDocument hit
+        #    burns the Reports quota and freezes the profitability UI on 429.
         candidates = [
             r for r in existing_done
             if _report_covers_month(r, month_start, month_end_excl)
         ]
         candidates.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
-
-        # 2) Also try newest DONE reports even if date metadata is off —
-        #    content snapshot-date is the source of truth (SC Event Month).
-        extras = [
-            r for r in existing_done
-            if r not in candidates
-        ]
-        extras.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
-        ordered = candidates + extras[:15]
+        # Newest overlapping first; at most one non-overlapping newest as fallback.
+        ordered = list(candidates[:2])
+        if existing_done:
+            newest = max(
+                existing_done,
+                key=lambda r: r.get("createdTime") or "",
+            )
+            if newest not in ordered:
+                ordered.append(newest)
 
         for report in ordered:
             try:
@@ -2197,7 +2305,7 @@ async def fetch_aged_surcharge_charges_per_sku(
                 errors.append(f"{label}: create returned no id")
             else:
                 text = await download_report_raw(
-                    report_id, max_polls=36, poll_interval=10,
+                    report_id, max_polls=24, poll_interval=8,
                 )
                 if await _try_text_for_month(text, label):
                     resolved = True
@@ -2215,7 +2323,7 @@ async def fetch_aged_surcharge_charges_per_sku(
                         )
         except Exception as e:
             errors.append(f"{label}: create/download failed ({e})")
-            # Last chance: refresh list and scan content again.
+            # Last chance: refresh list and try at most 2 newest DONE reports.
             try:
                 existing = await _list_aged_surcharge_reports(lookback)
                 existing_done = [
@@ -2227,7 +2335,7 @@ async def fetch_aged_surcharge_charges_per_sku(
                     existing_done,
                     key=lambda r: r.get("createdTime") or "",
                     reverse=True,
-                )[:20]:
+                )[:2]:
                     try:
                         text = await download_report_raw(
                             report["reportId"], max_polls=3, poll_interval=5,
@@ -2262,6 +2370,322 @@ async def fetch_aged_surcharge_charges_per_sku(
         }
         for sku, v in per_sku.items()
         if v["charged_total"] > 0
+    }
+
+
+# ── FBA Removal Order Detail (removal / disposal fees) ───────────────────────
+
+
+async def _list_removal_order_detail_reports(created_since: datetime) -> list[dict]:
+    """Recent GET_FBA_FULFILLMENT_REMOVAL_ORDER_DETAIL_DATA reports."""
+    params = {
+        "reportTypes": "GET_FBA_FULFILLMENT_REMOVAL_ORDER_DETAIL_DATA",
+        "pageSize": "50",
+        "createdSince": created_since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    try:
+        resp = await _sp_request("GET", "/reports/2021-06-30/reports", params=params)
+    except Exception:
+        return []
+    if isinstance(resp, dict):
+        return list(resp.get("reports") or [])
+    return []
+
+
+def _parse_removal_request_dt(raw: str) -> datetime | None:
+    """Parse request-date from Removal Order Detail (CSV/TSV)."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    try:
+        if len(s) == 10 and re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+            return datetime(int(s[:4]), int(s[5:7]), int(s[8:10]), tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def parse_removal_order_detail_report(
+    text: str,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+) -> tuple[dict[str, dict], float]:
+    """Parse GET_FBA_FULFILLMENT_REMOVAL_ORDER_DETAIL_DATA (SC CSV or SP-API TSV).
+
+    Seller Central's Removal Order Detail report bills by ``request-date``.
+    When ``window_start`` / ``window_end`` are set, only rows with
+    request-date in ``[window_start, window_end)`` are counted — same filter
+    as the profitability date picker.
+
+    Returns ({sku: {removal_fee, qty, order_ids}}, report_total).
+    """
+    if not (text or "").strip():
+        return {}, 0.0
+
+    cleaned = text.lstrip("\ufeff")
+    first = cleaned.splitlines()[0]
+    delim = "\t" if "\t" in first else ","
+    reader = csv.DictReader(io.StringIO(cleaned), delimiter=delim)
+
+    start = window_start
+    end = window_end
+    if start is not None and start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end is not None and end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+
+    per_sku: dict[str, dict] = {}
+    report_total = 0.0
+
+    for row in reader:
+        norm = {
+            (k or "").strip().lstrip("\ufeff").lower().replace("_", "-").replace(" ", "-"): v
+            for k, v in row.items()
+        }
+        sku = (
+            norm.get("sku")
+            or norm.get("seller-sku")
+            or norm.get("merchant-sku")
+            or ""
+        ).strip()
+        if not sku:
+            continue
+
+        req_raw = (
+            norm.get("request-date")
+            or norm.get("requestdate")
+            or norm.get("order-date")
+            or ""
+        ).strip()
+        req_dt = _parse_removal_request_dt(req_raw)
+        if start is not None or end is not None:
+            if req_dt is None:
+                continue
+            if start is not None and req_dt < start:
+                continue
+            if end is not None and req_dt >= end:
+                continue
+
+        fee = _coerce_float(norm.get("removal-fee") or norm.get("removalfee"))
+        if fee <= 0:
+            continue
+
+        qty = int(
+            _coerce_float(
+                norm.get("requested-quantity")
+                or norm.get("disposed-quantity")
+                or norm.get("shipped-quantity")
+                or 0,
+            )
+        )
+        order_id = (norm.get("order-id") or norm.get("orderid") or "").strip()
+        bucket = per_sku.setdefault(
+            sku,
+            {"removal_fee": 0.0, "qty": 0, "order_ids": []},
+        )
+        bucket["removal_fee"] = _coerce_float(bucket["removal_fee"]) + fee
+        bucket["qty"] = int(bucket.get("qty") or 0) + max(qty, 0)
+        if order_id and order_id not in bucket["order_ids"]:
+            bucket["order_ids"].append(order_id)
+        report_total += fee
+
+    out = {
+        sku: {
+            "removal_fee": round(_coerce_float(v["removal_fee"]), 2),
+            "qty": int(v.get("qty") or 0),
+            "order_ids": list(v.get("order_ids") or []),
+        }
+        for sku, v in per_sku.items()
+        if _coerce_float(v.get("removal_fee")) > 0
+    }
+    return out, round(report_total, 2)
+
+
+async def fetch_removal_fees_per_sku(
+    start: datetime,
+    end: datetime,
+    time_zone: str = "UTC",
+) -> dict[str, dict]:
+    """Pull Removal Order Detail fees for the profitability window.
+
+    Strategy (matches Seller Central Event Date / request-date):
+      1. Resolve calendar months overlapping the window in marketplace TZ.
+      2. For each month, prefer an existing DONE report that fully covers it.
+         If one is IN_PROGRESS, wait for it (never create a duplicate).
+         Only create a new report when nothing useful exists.
+      3. Filter rows by the customer's exact [start, end) date range.
+
+    Returns {sku: {removal_fee, qty, order_ids}}.
+    """
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if end <= start:
+        return {}
+
+    month_keys = calendar_months_in_window(start, end, time_zone)
+    if not month_keys:
+        return {}
+
+    now = datetime.now(timezone.utc)
+    # 90-day lookback for the reports list.
+    lookback = now - timedelta(days=89)
+
+    def _refresh_lists(reports: list[dict]) -> tuple[list, list]:
+        done = [
+            r for r in reports
+            if r.get("processingStatus") == "DONE" and r.get("reportDocumentId")
+        ]
+        in_prog = [
+            r for r in reports
+            if r.get("processingStatus") in ("IN_QUEUE", "IN_PROGRESS")
+        ]
+        return done, in_prog
+
+    try:
+        existing = await _list_removal_order_detail_reports(lookback)
+    except Exception:
+        existing = []
+    existing_done, existing_inprog = _refresh_lists(existing)
+
+    merged: dict[str, dict] = {}
+
+    def _merge(parsed: dict[str, dict]) -> None:
+        for sku, bucket in parsed.items():
+            dest = merged.setdefault(
+                sku, {"removal_fee": 0.0, "qty": 0, "order_ids": []}
+            )
+            dest["removal_fee"] = float(dest["removal_fee"]) + float(
+                bucket.get("removal_fee") or 0
+            )
+            dest["qty"] = int(dest.get("qty") or 0) + int(bucket.get("qty") or 0)
+            for oid in bucket.get("order_ids") or []:
+                if oid and oid not in dest["order_ids"]:
+                    dest["order_ids"].append(oid)
+
+    for label in month_keys:
+        month_start, month_end_excl = month_start_end_excl(label, time_zone)
+        w_start = max(start, month_start)
+        w_end = min(end, month_end_excl)
+        if w_end <= w_start:
+            continue
+
+        report_end = min(month_end_excl, now)
+        if report_end <= month_start:
+            report_end = now
+
+        text: str | None = None
+
+        # 1) Try existing DONE reports that fully cover this month (1 best).
+        covering = [
+            r for r in existing_done
+            if _report_fully_covers_window(r, month_start, report_end)
+        ]
+        covering.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+        for report in covering[:1]:
+            try:
+                text = await download_report_raw(
+                    report["reportId"], max_polls=3, poll_interval=5,
+                )
+                break
+            except Exception:
+                pass
+
+        if text is not None:
+            parsed, _ = parse_removal_order_detail_report(text, w_start, w_end)
+            _merge(parsed)
+            continue
+
+        # 2) An IN_PROGRESS report for this month already exists — wait briefly.
+        #    Never create a duplicate (Amazon will FATAL). Cap wait so the UI
+        #    cannot hang for minutes; caller can refresh once Amazon finishes.
+        in_prog_covering = [
+            r for r in existing_inprog
+            if _report_covers_month(r, month_start, report_end)
+        ]
+        in_prog_covering.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+        waited_id: str | None = None
+        if in_prog_covering:
+            waited_id = in_prog_covering[0]["reportId"]
+            try:
+                # ~60s max (12 × 5s) — not 4 minutes.
+                text = await download_report_raw(
+                    waited_id, max_polls=12, poll_interval=5,
+                )
+            except Exception:
+                text = None
+
+        # 3) No existing report — create one.
+        created_id: str | None = None
+        if text is None and waited_id is None:
+            try:
+                create_resp = await create_report(
+                    "GET_FBA_FULFILLMENT_REMOVAL_ORDER_DETAIL_DATA",
+                    start_date=month_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    end_date=report_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    single_marketplace=True,
+                )
+                created_id = create_resp.get("reportId")
+                if created_id:
+                    text = await download_report_raw(
+                        created_id, max_polls=18, poll_interval=5,
+                    )
+            except Exception:
+                created_id = None
+
+        # 4) After create failure (FATAL = duplicate) refresh and find the DONE.
+        if text is None:
+            try:
+                refreshed = await _list_removal_order_detail_reports(lookback)
+                refreshed_done, _ = _refresh_lists(refreshed)
+                existing_done = refreshed_done
+                for r in sorted(
+                    refreshed_done,
+                    key=lambda r: r.get("createdTime") or "",
+                    reverse=True,
+                )[:2]:
+                    if _report_fully_covers_window(r, month_start, report_end) or \
+                       _report_covers_month(r, month_start, report_end):
+                        try:
+                            text = await download_report_raw(
+                                r["reportId"], max_polls=3, poll_interval=5,
+                            )
+                            if text:
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        if text is None:
+            # Still nothing — raise so the caller can show the warning.
+            raise RuntimeError(
+                f"Removal Order Detail unavailable for {label}: "
+                "report still IN_PROGRESS or create failed. "
+                "Refresh in ~1 minute once Amazon finishes processing."
+            )
+
+        parsed, _ = parse_removal_order_detail_report(text, w_start, w_end)
+        _merge(parsed)
+        # Update our cached lists for the next month iteration.
+        try:
+            existing = await _list_removal_order_detail_reports(lookback)
+            existing_done, existing_inprog = _refresh_lists(existing)
+        except Exception:
+            pass
+
+    return {
+        sku: {
+            "removal_fee": round(float(v["removal_fee"]), 2),
+            "qty": int(v.get("qty") or 0),
+            "order_ids": list(v.get("order_ids") or []),
+        }
+        for sku, v in merged.items()
+        if float(v.get("removal_fee") or 0) > 0
     }
 
 
@@ -2367,8 +2791,25 @@ async def get_report(report_id: str) -> dict:
 
 
 async def get_report_document(document_id: str) -> dict:
-    """Get the download URL for a completed report document."""
-    return await _sp_request("GET", f"/reports/2021-06-30/documents/{document_id}")
+    """Get the download URL for a completed report document.
+
+    Documents endpoint has a tight quota — space calls and fail fast on 429
+    so the profitability UI cannot hang for minutes on retries.
+    """
+    global _DOC_GET_LAST_TS
+    async with _doc_get_lock():
+        now = time.monotonic()
+        gap = _DOC_GET_MIN_GAP_S - (now - _DOC_GET_LAST_TS)
+        if gap > 0:
+            await asyncio.sleep(gap)
+        try:
+            return await _sp_request(
+                "GET",
+                f"/reports/2021-06-30/documents/{document_id}",
+                max_429_retries=3,
+            )
+        finally:
+            _DOC_GET_LAST_TS = time.monotonic()
 
 
 async def download_report_raw(report_id: str, max_polls: int = 30, poll_interval: int = 10) -> str:
@@ -2376,7 +2817,12 @@ async def download_report_raw(report_id: str, max_polls: int = 30, poll_interval
 
     Used by the ingest pipeline, which needs every row (not the
     LLM-friendly truncated summary that `download_report` returns).
+    Caches DONE report bodies by reportId for the process lifetime.
     """
+    cached = _REPORT_TEXT_CACHE.get(report_id)
+    if cached is not None:
+        return cached
+
     for _ in range(max_polls):
         status = await get_report(report_id)
         processing_status = status.get("processingStatus", "")
@@ -2394,7 +2840,12 @@ async def download_report_raw(report_id: str, max_polls: int = 30, poll_interval
             content = resp.content
             if doc_info.get("compressionAlgorithm") == "GZIP":
                 content = gzip.decompress(content)
-            return content.decode("utf-8", errors="replace")
+            text = content.decode("utf-8", errors="replace")
+            if len(_REPORT_TEXT_CACHE) >= _REPORT_TEXT_CACHE_MAX:
+                # Drop an arbitrary oldest entry (insertion order in 3.7+).
+                _REPORT_TEXT_CACHE.pop(next(iter(_REPORT_TEXT_CACHE)), None)
+            _REPORT_TEXT_CACHE[report_id] = text
+            return text
         if processing_status in ("CANCELLED", "FATAL"):
             raise RuntimeError(f"Report {report_id} failed: {processing_status}")
         await asyncio.sleep(poll_interval)

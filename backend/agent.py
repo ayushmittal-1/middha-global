@@ -696,6 +696,19 @@ def _build_aged_charges(charges_per_sku: dict) -> dict[str, float]:
     return by_sku
 
 
+def _build_removal_fees(charges_per_sku: dict) -> dict[str, float]:
+    """SKU → removal-fee from Seller Central Removal Order Detail."""
+    by_sku: dict[str, float] = {}
+    for asku, b in (charges_per_sku or {}).items():
+        if not isinstance(b, dict):
+            fee = float(b or 0)
+        else:
+            fee = float(b.get("removal_fee") or 0)
+        if fee > 0:
+            by_sku[str(asku)] = fee
+    return by_sku
+
+
 def _lookup_sku_amount(by_sku: dict[str, float] | None, sku: str) -> float:
     """Case-insensitive SKU lookup for absolute fee amounts."""
     if not by_sku:
@@ -825,8 +838,9 @@ async def compute_profitability_data(
     Storage comes from GET_FBA_STORAGE_FEE_CHARGES_DATA (cached 24h — first
     cold call adds 30–120 s). Ads come from Aurora campaigns pro-rated to
     the window and allocated per SKU when a campaign lists its SKUs;
-    otherwise spread uniformly across units sold. Returns / removals /
-    low-inv / inbound-placement / aged-inv fees come from Finances API.
+    otherwise spread uniformly across units sold. Returns / low-inv /
+    inbound-placement come from Finances / Aurora events; aged-inv and
+    removal / disposal come from their Seller Central charge reports.
 
     Window is defined by `start`/`end` (YYYY-MM-DD strings or datetimes)
     when either is provided; falls back to `days_back` for legacy callers
@@ -838,14 +852,17 @@ async def compute_profitability_data(
         get_aged_inventory_cache,
         get_aged_surcharge_charges_cache,
         get_placement_fee_cache,
+        get_removal_fees_cache,
         get_storage_cache,
         put_aged_inventory_cache,
         put_aged_surcharge_charges_cache,
         put_placement_fee_cache,
+        put_removal_fees_cache,
         merge_storage_cache,
     )
     from amazon_sp import (
         calendar_months_in_window,
+        fetch_removal_fees_per_sku,
         fetch_storage_fees_for_months,
         is_per_asin_by_month_storage_cache,
         merge_storage_by_asin_month,
@@ -1393,6 +1410,64 @@ async def compute_profitability_data(
             aged_charges_meta["source"] = "finances_fallback"
             aged_charges_trusted = False
 
+    # Removal / Disposal: Seller Central Removal Order Detail only
+    # (GET_FBA_FULFILLMENT_REMOVAL_ORDER_DETAIL_DATA), request-date / Event Date.
+    # Always BLENDED on Totals (like inbound placement) — never Finances
+    # ServiceFee spread across sold SKUs (that invents wrong per-row amounts).
+    # Report is requested per calendar month in the filter, then clipped to the
+    # customer's exact [start, end) date range.
+    removal_fees_by_sku: dict[str, float] = {}
+    removal_fees_trusted = False
+    removal_blended = True
+    removal_report_total = 0.0
+    removal_months = calendar_months_in_window(start_dt, end_dt, mp_tz)
+    removal_meta: dict = {
+        "source": None,
+        "access_denied": False,
+        "blended": True,
+        "months": removal_months,
+    }
+    try:
+        removal_cache = await get_removal_fees_cache(
+            charges_start_iso, charges_end_iso, max_age_hours=24,
+        )
+        if removal_cache and not removal_cache.get("access_denied"):
+            removal_fees_by_sku = _build_removal_fees(
+                removal_cache.get("per_sku") or {},
+            )
+            removal_report_total = round(
+                float(removal_cache.get("report_total") or 0)
+                or sum(removal_fees_by_sku.values()),
+                2,
+            )
+            removal_meta["source"] = "charges_cache"
+            removal_fees_trusted = True
+        else:
+            removal_raw = await fetch_removal_fees_per_sku(
+                start_dt, end_dt, time_zone=mp_tz,
+            )
+            await put_removal_fees_cache(
+                removal_raw, charges_start_iso, charges_end_iso,
+            )
+            removal_fees_by_sku = _build_removal_fees(removal_raw)
+            removal_report_total = round(
+                sum(removal_fees_by_sku.values()), 2,
+            )
+            removal_meta["source"] = "charges_report"
+            removal_fees_trusted = True
+        removal_meta["report_total"] = removal_report_total
+    except Exception as e:
+        warnings.append(_sp_report_warning("Removal Order Detail", e))
+        if _is_sp_access_denied(e):
+            removal_meta["access_denied"] = True
+            await put_removal_fees_cache(
+                {}, charges_start_iso, charges_end_iso, access_denied=True,
+            )
+        removal_fees_by_sku = {}
+        removal_fees_trusted = False
+        removal_report_total = 0.0
+        removal_meta["source"] = "unavailable"
+
     # products.fees is primary (same as Aurora Products). Fees API only for SKUs
     # missing that sync — do not prefer stale order-line fees.
     if use_db:
@@ -1610,9 +1685,9 @@ async def compute_profitability_data(
                 float(fin_sku.get("aged_inventory", 0.0) or 0), 2,
             )
 
-        removal_fee = round(
-            (fin_sku.get("removal", 0.0)
-             + unattr_per_unit["removal"] * units), 2)
+        # Removal / Disposal: always BLENDED from Removal Order Detail.
+        # Per-SKU rows stay $0; Totals carries the request-date report sum.
+        removal_fee = 0.0
 
         # COGS components (only when uploaded)
         cogs_row = cogs_map.get(sku)
@@ -1715,6 +1790,17 @@ async def compute_profitability_data(
             totals["aged_inventory_fee"] = round(allocated_aged + aged_unallocated, 2)
             totals["net"] -= aged_unallocated
 
+    # Removal: BLENDED account total from Removal Order Detail (request-date).
+    removal_unallocated = 0.0
+    if removal_fees_trusted:
+        fee_r = round(float(removal_report_total or 0), 2)
+        totals["removal_fee"] = fee_r
+        # Rows carried $0; apply once on account totals (same as placement).
+        if fee_r:
+            totals["net"] -= fee_r
+        removal_unallocated = fee_r
+        removal_blended = True
+
     rev = totals["revenue"]
     totals_out = {k: round(v, 2) for k, v in totals.items()}
     totals_out["units"] = int(totals["units"])
@@ -1723,6 +1809,9 @@ async def compute_profitability_data(
     totals_out["storage_unallocated"] = storage_unallocated
     totals_out["aged_report_total"] = round(float(aged_report_total or 0), 2)
     totals_out["aged_unallocated"] = aged_unallocated
+    totals_out["removal_report_total"] = round(float(removal_report_total or 0), 2)
+    totals_out["removal_unallocated"] = removal_unallocated
+    totals_out["removal_blended"] = bool(removal_blended)
 
     caveats = [
         f"Date range uses marketplace timezone ({mp_tz}) — same day boundaries as Aurora Orders.",
@@ -1764,11 +1853,15 @@ async def compute_profitability_data(
         "(Seller Central Aged Inventory Surcharge report): sum of "
         "amount-charged per seller SKU for Event Months overlapping the window "
         "(same as the CSV download).",
-        "Return processing, low-inventory, and removal fees come from the "
-        "Finances API (45-day lookback before the window start) — recent "
-        "orders may not have them yet.",
+        "Removal / Disposal uses GET_FBA_FULFILLMENT_REMOVAL_ORDER_DETAIL_DATA "
+        "(Seller Central Removal Order Detail): BLENDED account total of "
+        "removal-fee by request-date (Event Date) for Return + Disposal. "
+        f"Months in filter: {', '.join(removal_months) or 'none'}. "
+        "Never uses Finances ServiceFee spread.",
+        "Return processing and low-inventory fees come from the Finances API "
+        "(45-day lookback before the window start) — recent orders may not have "
+        "them yet.",
         "Ads are allocated uniformly per unit — per-SKU PPC attribution requires productAd joins.",
-        "Fees posted without a SellerSKU (typically removals) are spread across units proportionally.",
     ])
     if storage_report_total > 0:
         caveats.append(
@@ -1787,6 +1880,23 @@ async def compute_profitability_data(
                 if aged_unallocated > 0
                 else "."
             )
+        )
+    if removal_fees_trusted:
+        caveats.append(
+            f"Removal is BLENDED for this window: ${removal_report_total:,.2f} "
+            f"(Removal Order Detail request-date total for "
+            f"{', '.join(removal_months) or 'the filter'}). "
+            "SKU rows show BLENDED; see Totals / Removal KPI."
+        )
+    elif removal_meta.get("access_denied"):
+        caveats.append(
+            "Removal: Removal Order Detail report is blocked (403) — "
+            "showing $0 (Finances spread is disabled)."
+        )
+    elif removal_meta.get("source") == "unavailable":
+        caveats.append(
+            "Removal: Removal Order Detail unavailable for this window — "
+            "showing $0 (retry; Finances spread is disabled so totals stay accurate)."
         )
     if not storage_by_asin_month:
         caveats.append("Storage fees: report unavailable for this window; values are 0.")
@@ -1859,6 +1969,8 @@ async def compute_profitability_data(
         "unattributed_fees": {k: round(v, 2) for k, v in unattributed_fees.items()},
         "placement_meta": placement_meta,
         "placement_blended": placement_blended,
+        "removal_blended": bool(removal_blended),
+        "removal_meta": removal_meta,
         "caveats": caveats,
         "warnings": warnings,
     }
