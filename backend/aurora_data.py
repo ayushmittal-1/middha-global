@@ -173,6 +173,86 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
     return out
 
 
+async def fba_returns_by_sku(
+    user: dict,
+    start: datetime,
+    end: datetime,
+) -> dict[str, dict]:
+    """Per-SKU customer returns for orders PURCHASED in [start, end],
+    using the ORDER's own referral fee (per line item) as the
+    refunded_referral input.
+
+    Bound by `purchaseDate`, not `customerReturns.returnDate`: the
+    Profitability tab treats a window as "orders placed in this window",
+    so a return of one of those orders belongs to the same window even
+    if the customer returned it later (or hasn't yet). Returns of
+    earlier orders don't count.
+
+    Aurora's customerReturnsService populates Order.customerReturns from
+    GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA, and orderItems[].referralFee
+    carries the actual Amazon-charged referral. So:
+
+        refunded_referral += (referralFee.amount / quantityOrdered) × qty_returned
+
+    Returns {sku: {returned_units, refunded_referral, asin}}. Empty dict
+    when the seller has no returns for orders purchased in the window.
+    """
+    seller_id = ObjectId(str(user["_id"]))
+    pipeline = [
+        {"$match": {
+            "sellerId": seller_id,
+            "hasCustomerReturn": True,
+            "purchaseDate": {"$gte": start, "$lte": end},
+        }},
+        {"$unwind": "$customerReturns"},
+        # Find the orderItem with a matching seller SKU on the same order —
+        # that carries the referralFee we want.
+        {"$addFields": {
+            "matchingItem": {
+                "$first": {
+                    "$filter": {
+                        "input": "$orderItems",
+                        "as": "it",
+                        "cond": {"$eq": ["$$it.sellerSku", "$customerReturns.sku"]},
+                    }
+                }
+            }
+        }},
+        {"$addFields": {
+            "referralPerUnit": {
+                "$cond": [
+                    {"$gt": [{"$ifNull": ["$matchingItem.quantityOrdered", 0]}, 0]},
+                    {"$divide": [
+                        {"$ifNull": ["$matchingItem.referralFee.amount", 0]},
+                        "$matchingItem.quantityOrdered",
+                    ]},
+                    0,
+                ]
+            },
+            "returnedUnits": {"$ifNull": ["$customerReturns.quantity", 0]},
+        }},
+        {"$group": {
+            "_id": "$customerReturns.sku",
+            "returned_units": {"$sum": "$returnedUnits"},
+            "refunded_referral": {
+                "$sum": {"$multiply": ["$referralPerUnit", "$returnedUnits"]}
+            },
+            "asin": {"$first": "$customerReturns.asin"},
+        }},
+    ]
+    out: dict[str, dict] = {}
+    async for doc in _db().orders.aggregate(pipeline):
+        sku = (doc.get("_id") or "").strip()
+        if not sku:
+            continue
+        out[sku] = {
+            "returned_units": int(doc.get("returned_units") or 0),
+            "refunded_referral": abs(float(doc.get("refunded_referral") or 0.0)),
+            "asin": doc.get("asin"),
+        }
+    return out
+
+
 async def fba_aged_inventory_by_sku(user: dict) -> Optional[dict[str, dict]]:
     """Read Aurora's `fbaagedinventoryfees` snapshot for this seller.
 
@@ -652,6 +732,33 @@ async def fetch_inventory_summaries(
             "fulfillmentType": doc.get("fulfillmentType"),
         })
     return rows
+
+
+async def fetch_ad_spend_by_campaign(
+    user: dict, start_ymd: str, end_ymd: str,
+) -> dict[str, float]:
+    """Per-campaign spend in [start_ymd, end_ymd] from Aurora's
+    `admetricsdailies` collection — the exact source Aurora's own
+    /api/ads dashboard aggregates when a date filter is applied
+    (see auroraBackend/src/services/adsMetricsService.js:124).
+
+    YMD strings match Aurora's `date` field format. Returns
+    {campaignId: total_spend_in_range}.
+    """
+    seller_id = ObjectId(str(user["_id"]))
+    cursor = _db().admetricsdailies.aggregate([
+        {"$match": {
+            "sellerId": seller_id,
+            "source": "DAILY",
+            "date": {"$gte": start_ymd, "$lte": end_ymd},
+        }},
+        {"$group": {
+            "_id": "$campaignId",
+            "spend": {"$sum": {"$ifNull": ["$spend", 0]}},
+        }},
+    ])
+    rows = await cursor.to_list(length=None)
+    return {str(r["_id"]): float(r.get("spend") or 0) for r in rows if r.get("_id")}
 
 
 async def fetch_campaigns(user: dict) -> list[dict]:

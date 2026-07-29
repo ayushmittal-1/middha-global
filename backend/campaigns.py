@@ -184,28 +184,32 @@ async def get_ad_spend_for_window(window_days: int) -> dict:
 
 
 async def get_ad_spend_for_range(start, end) -> dict:
-    """Aurora ad spend within [start, end], attributed per SKU when the
-    Aurora Ad doc carries a `skus` array (see the seed script / the
-    Ad.skus field we added). Aurora caches cumulative campaign spend over
-    the campaign's `metricsStartDate → metricsEndDate` window; we compute a
-    daily rate off that and multiply by the overlap between the campaign's
-    metrics window and the requested [start, end].
+    """Aurora ad spend within [start, end], matched to Aurora's own
+    /api/ads?startDate=…&endDate=… response.
+
+    Data source (DB path): `admetricsdailies` — per-day per-campaign
+    spend, populated by Aurora's DAILY sync. Aurora aggregates the same
+    collection when a date filter is applied
+    (see auroraBackend/src/services/adsMetricsService.js:124).
+
+    Per-SKU attribution still uses the Ad doc's `skus` array (Aurora
+    doesn't expose per-SKU spend either); campaigns without `skus` land
+    in `unattributed` and downstream blends them per unit.
 
     Returns:
       {
-        total_window:    float,   # sum of every campaign's overlap-spend
-        by_sku:          {sku: window_spend, ...},   # split by campaign.skus
-        unattributed:    float,   # spend from campaigns without a skus list
+        total_window:    float,   # Σ spend in [start, end]
+        by_sku:          {sku: spend, ...},   # split by campaign.skus
+        unattributed:    float,   # campaigns without a skus list
         campaign_count:  int,
-        start / end:     ISO strings,
+        start / end:     YYYY-MM-DD strings,
+        source:          "aurora_daily" | "aurora_lifetime_fallback",
       }
-
-    Allocation model within a campaign that has a skus list: uniform —
-    each listed SKU gets total_campaign_window_spend / len(skus). Simple
-    and honest until Amazon's Advertised Product report is wired for
-    real per-SKU attribution.
     """
     from datetime import datetime as _dt, timezone as _tz
+    from zoneinfo import ZoneInfo
+    from aurora_data import aurora_db_enabled, fetch_ad_spend_by_campaign
+    from marketplace_timezone import resolve_dashboard_timezone
 
     await _ensure_loaded()
     campaigns = _user_campaigns[_user_key()]
@@ -223,80 +227,103 @@ async def get_ad_spend_for_range(start, end) -> dict:
                 return None
         if result is None:
             return None
-        # Always return tz-aware so max()/min()/subtraction never mix naive
-        # with aware (raises TypeError). Assume any naive value is UTC —
-        # Aurora writes both flavors depending on the ingest path.
         return result if result.tzinfo else result.replace(tzinfo=_tz.utc)
 
     win_start = _to_dt(start)
     win_end = _to_dt(end)
-    if not win_start or not win_end or win_end <= win_start:
-        return {
-            "total_window": 0.0, "by_sku": {}, "unattributed": 0.0,
-            "campaign_count": len(campaigns), "start": None, "end": None,
-            "total_lifetime": 0.0, "daily_rate": 0.0, "metrics_days": 0,
-        }
+
+    # YMD keys must be in the seller's marketplace timezone — Aurora's
+    # `admetricsdailies.date` field is a YMD string in that TZ, and its
+    # dashboard queries with the raw user-input YMD (no UTC shift). Our
+    # callers pass end as 23:59:59 in mp-TZ converted to UTC, so a naive
+    # `.date()` on the UTC value rolls forward one day and adds an extra
+    # day of spend to the aggregate.
+    try:
+        mp_tz = resolve_dashboard_timezone(require_user(), None)
+    except Exception:
+        mp_tz = "UTC"
+    tz = ZoneInfo(mp_tz)
+    start_ymd = win_start.astimezone(tz).date().isoformat() if win_start else None
+    end_ymd = win_end.astimezone(tz).date().isoformat() if win_end else None
+
+    # Aurora's `admetricsdailies` is keyed by campaignId — build the
+    # campaignId → skus map once so we can allocate range-filtered spend
+    # back onto SKUs the way the previous (lifetime) code did.
+    skus_by_campaign: dict[str, list[str]] = {}
+    for c in campaigns:
+        cid = c.get("campaignId")
+        if not cid:
+            continue
+        skus = c.get("skus") or []
+        if isinstance(skus, str):
+            skus = [skus]
+        skus_by_campaign[str(cid)] = [
+            str(s).strip() for s in skus if str(s or "").strip()
+        ]
+
+    spend_by_campaign: dict[str, float] = {}
+    source = "aurora_daily"
+    if aurora_db_enabled() and start_ymd and end_ymd:
+        try:
+            user = require_user()
+            spend_by_campaign = await fetch_ad_spend_by_campaign(
+                user, start_ymd, end_ymd,
+            )
+        except Exception as e:
+            print(f"[campaigns] admetricsdailies read failed: {e}")
+
+    if not spend_by_campaign:
+        # No daily rows for this window — fall back to each Ad doc's
+        # cached lifetime `spend.amount`. Better than 0; matches Aurora's
+        # lifetime view (isLifetime path) when daily sync hasn't landed.
+        source = "aurora_lifetime_fallback"
+        for c in campaigns:
+            cid = c.get("campaignId")
+            if not cid:
+                continue
+            spend_by_campaign[str(cid)] = float(
+                (c.get("spend") or {}).get("amount") or 0
+            )
 
     by_sku: dict[str, float] = {}
     unattributed = 0.0
     total_window = 0.0
-    total_lifetime = 0.0
-    metric_spans: list[float] = []
-
-    for c in campaigns:
-        spend = float((c.get("spend") or {}).get("amount") or 0)
-        total_lifetime += spend
-
-        m_start = _to_dt(c.get("metricsStartDate"))
-        m_end = _to_dt(c.get("metricsEndDate"))
-        # Fallback: if the campaign doesn't carry metrics dates, assume the
-        # cached spend covers the last 30 days ending now — same guess the
-        # legacy uniform path used to make.
-        if not m_start or not m_end or m_end <= m_start:
-            m_end = win_end
-            m_start = win_end - (win_end - win_start)
-        span_days = max((m_end - m_start).total_seconds() / 86400.0, 0.5)
-        metric_spans.append(span_days)
-        daily_rate = spend / span_days if span_days > 0 else 0.0
-
-        # Overlap of [m_start, m_end] with [win_start, win_end].
-        ov_start = max(m_start, win_start)
-        ov_end = min(m_end, win_end)
-        if ov_end <= ov_start:
+    for cid, spend in spend_by_campaign.items():
+        # Only count campaigns that still exist in the Ad collection.
+        # Aurora's dashboard does the same via overlayAdsWithPeriodMetrics
+        # (adController.js:216) — orphaned admetricsdailies rows for
+        # deleted campaigns get dropped, otherwise we sum higher than
+        # Aurora shows.
+        if cid not in skus_by_campaign:
             continue
-        overlap_days = (ov_end - ov_start).total_seconds() / 86400.0
-        campaign_window_spend = daily_rate * overlap_days
-        total_window += campaign_window_spend
-
-        skus = c.get("skus") or []
-        # Aurora persists the array with mixed casing over time; accept a
-        # single string too as a defensive fallback.
-        if isinstance(skus, str):
-            skus = [skus]
-        skus = [str(s).strip() for s in skus if str(s or "").strip()]
-
+        total_window += spend
+        skus = skus_by_campaign.get(cid, [])
         if skus:
-            per_sku = campaign_window_spend / len(skus)
+            per_sku = spend / len(skus)
             for sku in skus:
                 by_sku[sku] = by_sku.get(sku, 0.0) + per_sku
         else:
-            unattributed += campaign_window_spend
+            unattributed += spend
 
-    metrics_days = max(metric_spans) if metric_spans else 0
-    daily_rate_overall = (
-        total_lifetime / metrics_days if metrics_days else 0.0
-    )
+    window_days = 0.0
+    if win_start and win_end and win_end > win_start:
+        window_days = (win_end - win_start).total_seconds() / 86400.0
+    daily_rate_overall = total_window / window_days if window_days > 0 else 0.0
 
     return {
         "total_window": round(total_window, 2),
         "by_sku": {sku: round(v, 2) for sku, v in by_sku.items()},
         "unattributed": round(unattributed, 2),
         "campaign_count": len(campaigns),
-        "start": win_start.date().isoformat(),
-        "end": win_end.date().isoformat(),
-        "total_lifetime": round(total_lifetime, 2),
+        "start": start_ymd,
+        "end": end_ymd,
+        "total_lifetime": round(
+            sum(float((c.get("spend") or {}).get("amount") or 0) for c in campaigns),
+            2,
+        ),
         "daily_rate": round(daily_rate_overall, 4),
-        "metrics_days": round(metrics_days, 2),
+        "metrics_days": round(window_days, 2),
+        "source": source,
     }
 
 

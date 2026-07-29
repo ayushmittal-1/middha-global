@@ -1135,6 +1135,23 @@ async def compute_profitability_data(
     except Exception as e:
         warnings.append(_sp_report_warning("Finances", e))
 
+    # Returns come from Aurora's Order.customerReturns (populated by
+    # customerReturnsService from GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA),
+    # NOT from Finances. Bounded by the ORDER's purchaseDate — matches
+    # the same sale-window the rest of the tab uses, so a return counts
+    # in the window the item was SOLD (regardless of when the customer
+    # actually returned it). `orderItems[].referralFee` gives the exact
+    # referral Amazon charged at sale time, so 0.20 × that × units is
+    # per-order-line accurate rather than a window average.
+    returns_by_sku: dict[str, dict] = {}
+    if use_db:
+        try:
+            returns_by_sku = await aurora_data.fba_returns_by_sku(
+                require_user(), start_dt, end_dt,
+            )
+        except Exception as e:
+            warnings.append(_sp_report_warning("Customer returns (Aurora)", e))
+
     total_units_window = sum(d["units"] for d in sku_data.values())
     unattr_per_unit = {
         k: (unattributed_fees.get(k, 0.0) / total_units_window
@@ -1601,18 +1618,26 @@ async def compute_profitability_data(
                 (v for k, v in fin_by_sku.items() if str(k).lower() == sku.lower()),
                 {},
             )
-        # Return processing fee = 20% × the actual referral fee Amazon
-        # reversed on each refund event for this SKU. Client-confirmed
-        # policy for the categories this seller sells; also matches
-        # Amazon's standard FBA Returns Processing Fee rate card.
+        # Return processing fee = 20% × the actual referral fee for the
+        # returned units. Client-confirmed policy for this seller's
+        # categories; matches Amazon's standard FBA Returns Processing
+        # Fee rate card.
         #
-        # `refunded_referral` is populated in amazon_sp.get_financial_events
-        # from RefundEventList[].ShipmentItemAdjustmentList[]
-        # .ItemFeeAdjustmentList[FeeType='Commission'].FeeAmount. That is
-        # the referral fee Amazon originally charged on the sold unit that
-        # was later returned — the correct multiplier for the client's rule
-        # regardless of when the original sale happened.
-        refunded_referral = float(fin_sku.get("refunded_referral", 0.0) or 0.0)
+        # Source: Aurora's Order.customerReturns joined against the same
+        # order's orderItems.referralFee (returned to us as
+        # `refunded_referral`). Using Aurora is strictly better than the
+        # earlier Finances-refund-events path — customerReturns.returnDate
+        # bounds the count precisely to the seller's actual return window,
+        # and orderItems.referralFee is the exact per-order-line referral
+        # Amazon charged at sale time.
+        ret = returns_by_sku.get(sku)
+        if not ret and asin:
+            ret = next(
+                (v for v in returns_by_sku.values() if v.get("asin") == asin),
+                None,
+            )
+        refunded_referral = float((ret or {}).get("refunded_referral") or 0.0)
+        returned_units = int((ret or {}).get("returned_units") or 0)
         return_processing_fee = round(0.20 * refunded_referral, 2)
         low_inventory_fee = round(
             (fin_sku.get("low_inventory", 0.0)
