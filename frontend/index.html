@@ -895,6 +895,14 @@
       box-shadow: 0 -2px 8px rgba(15, 23, 42, 0.06);
     }
     table.restock.profit tbody td { color: #0f172a; }
+    table.restock.profit a.profit-price-link {
+      color: inherit;
+      text-decoration: none;
+      font-weight: inherit;
+    }
+    table.restock.profit a.profit-price-link:hover {
+      text-decoration: underline;
+    }
     table.restock.profit tbody td.num {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
@@ -1348,6 +1356,9 @@
     }
     body.embedded-in-aurora #profit-table-wrap tfoot .num { color: #f1f5f9; }
     body.embedded-in-aurora table.restock.profit tbody td { color: #f1f5f9; }
+    body.embedded-in-aurora table.restock.profit a.profit-price-link {
+      color: #f1f5f9;
+    }
     body.embedded-in-aurora .margin-good { color: #86efac !important; }
     body.embedded-in-aurora .margin-warn { color: #fdba74 !important; }
     body.embedded-in-aurora .margin-bad  { color: #fca5a5 !important; }
