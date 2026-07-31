@@ -505,11 +505,17 @@ def _fee_line_amount(entry: dict) -> float:
 
 
 def split_bundled_fulfillment_total(total: float) -> tuple[float, float]:
-    """Split a bundled FBA fulfillment total into base + fuel (Revenue Calculator)."""
+    """Split a bundled FBA fulfillment total into base + fuel (Revenue Calculator).
+
+    Amazon displays these at cent precision (e.g. $3.86 → base $3.73 + fuel $0.13).
+    Rounding to 4dp first (3.7295 / 0.1305) then × units drifts by a few cents
+    vs the calculator even though FBA+Fuel still matches.
+    """
     if total <= 0:
         return 0.0, 0.0
-    base = round(total / 1.035, 4)
-    fuel = round(total - base, 4)
+    total = round(float(total), 2)
+    base = round(total / 1.035, 2)
+    fuel = round(total - base, 2)
     return base, fuel
 
 
@@ -555,7 +561,9 @@ def parse_fee_detail_lines(detail_list: list) -> dict:
             has_explicit_fuel = bundled_fuel > 0
         has_base_fba = True
     elif fba > 0 and fuel == 0 and has_base_fba and not has_explicit_fuel:
-        fuel = round(fba * 0.035, 4)
+        fuel = round(round(fba, 2) * 0.035, 2)
+        # Keep base+fuel consistent with Amazon cent display when we invented fuel.
+        fba = round(float(fba), 2)
 
     total = referral + fba + fuel + variable_closing
     return {

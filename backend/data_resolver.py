@@ -239,11 +239,17 @@ def skus_needing_fees_api(
     disagreeing with Aurora Products / Revenue Calculator.
     """
     need: list[str] = []
+    # Case-insensitive index of products.fees rows already loaded.
+    pf_lower = {str(k).lower(): v for k, v in (product_fee_fallback or {}).items()}
     for sku, d in sku_data.items():
         if int(d.get("units") or 0) <= 0:
             continue
-        pf = product_fee_fallback.get(sku) or {}
-        if float(pf.get("referral_per_unit") or 0) > 0 or float(pf.get("fba_per_unit") or 0) > 0:
+        pf = product_fee_fallback.get(sku) or pf_lower.get(str(sku).lower()) or {}
+        if (
+            float(pf.get("referral_per_unit") or 0) > 0
+            or float(pf.get("fba_per_unit") or 0) > 0
+            or float(pf.get("fulfillment_per_unit") or 0) > 0
+        ):
             continue
         if d.get("asin") and float(d.get("revenue") or 0) > 0:
             need.append(sku)
