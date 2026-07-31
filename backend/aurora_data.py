@@ -122,54 +122,106 @@ def aggregate_sku_metrics_from_orders(
 async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str, dict]:
     """Per-unit fees from Aurora `products.fees` (same source as Products page).
 
-    Used as the primary fee basis for Profitability — not a last-resort fallback.
+    Products UI shows ``fees.fbaFee`` as the FBA fee — that field is the source
+    of truth for fulfillment. Profitability splits it into base FBA + fuel so
+    FBA + Fuel == Products FBA Fee.
+
     Referral is stored as a per-unit amount at the listing price; callers should
     scale it by revenue when the sale price differs.
     """
     if not skus:
         return {}
     seller_id = ObjectId(str(user["_id"]))
+    # Exact match first, then case-insensitive for any miss (order SKUs
+    # sometimes differ in casing from products.sku).
+    wanted = [str(s) for s in skus if s]
+    wanted_lower = {s.lower(): s for s in wanted}
     cursor = _db().products.find(
-        {"sellerId": seller_id, "sku": {"$in": skus}},
+        {"sellerId": seller_id, "sku": {"$in": wanted}},
         {"sku": 1, "asin": 1, "fees": 1, "price": 1},
     )
     out: dict[str, dict] = {}
+    found_lower: set[str] = set()
+
+    def _pack(sku: str, doc: dict) -> dict | None:
+        fees = doc.get("fees") or {}
+        price = _money_amount((doc.get("price") or {}))
+        breakdown = fees.get("breakdown") or []
+        stored_fba = _money_amount(fees.get("fbaFee"))
+        referral = _money_amount(fees.get("referralFee"))
+        total = _money_amount(fees.get("totalFees"))
+
+        # Referral: prefer stored field (Products column); else breakdown / estimate.
+        if referral <= 0 and breakdown:
+            referral = float(parse_fee_detail_lines(breakdown).get("referral") or 0)
+        if referral <= 0 and total > 0 and stored_fba > 0:
+            referral = max(total - stored_fba, 0.0)
+        elif referral <= 0 and price > 0:
+            referral = price * 0.15
+
+        # Fulfillment: Products page displays fees.fbaFee — keep that total.
+        # Split into base + fuel for Profitability's two columns.
+        fba = 0.0
+        fuel = 0.0
+        if stored_fba > 0:
+            if breakdown:
+                parsed = parse_fee_detail_lines(breakdown)
+                p_fba = float(parsed.get("fba") or 0)
+                p_fuel = float(parsed.get("fuel_surcharge") or 0)
+                if p_fba > 0 and abs((p_fba + p_fuel) - stored_fba) <= 0.02:
+                    fba, fuel = p_fba, p_fuel
+                else:
+                    fba, fuel = split_bundled_fulfillment_total(stored_fba)
+            else:
+                fba, fuel = split_bundled_fulfillment_total(stored_fba)
+        elif breakdown:
+            parsed = parse_fee_detail_lines(breakdown)
+            fba = float(parsed.get("fba") or 0)
+            fuel = float(parsed.get("fuel_surcharge") or 0)
+        if referral <= 0 and fba <= 0 and fuel <= 0:
+            return None
+        return {
+            "referral_per_unit": referral,
+            "fba_per_unit": fba,
+            "fuel_per_unit": fuel,
+            # Full Products-page FBA fee (base+fuel) for diagnostics / UI parity.
+            "fulfillment_per_unit": round(fba + fuel, 4) if (fba + fuel) > 0 else stored_fba,
+            "listing_price": price,
+            "asin": doc.get("asin"),
+        }
+
     async for doc in cursor:
         sku = doc.get("sku")
         if not sku:
             continue
-        fees = doc.get("fees") or {}
-        price = _money_amount((doc.get("price") or {}))
-        breakdown = fees.get("breakdown") or []
-        if breakdown:
-            parsed = parse_fee_detail_lines(breakdown)
-            referral = parsed["referral"]
-            fba = parsed["fba"]
-            fuel = parsed["fuel_surcharge"]
-            # If breakdown only had a bundled FBAFees parent, parser already split.
-            # If fbaFee field is the full fulfillment total and breakdown missed fuel,
-            # prefer splitting the stored fbaFee when it is clearly larger.
-            stored_fba = _money_amount(fees.get("fbaFee"))
-            if stored_fba > 0 and fuel <= 0 and abs(stored_fba - (fba + fuel)) > 0.02:
-                fba, fuel = split_bundled_fulfillment_total(stored_fba)
-        else:
-            fba_total = _money_amount(fees.get("fbaFee"))
-            referral = _money_amount(fees.get("referralFee"))
-            total = _money_amount(fees.get("totalFees"))
-            if referral <= 0 and total > 0 and fba_total > 0:
-                referral = max(total - fba_total, 0.0)
-            elif referral <= 0 and price > 0:
-                referral = price * 0.15
-            fba, fuel = split_bundled_fulfillment_total(fba_total)
-        if referral <= 0 and fba <= 0 and fuel <= 0:
+        packed = _pack(str(sku), doc)
+        if not packed:
             continue
-        out[sku] = {
-            "referral_per_unit": referral,
-            "fba_per_unit": fba,
-            "fuel_per_unit": fuel,
-            "listing_price": price,
-            "asin": doc.get("asin"),
-        }
+        # Key by the order SKU spelling when casings differ.
+        order_sku = wanted_lower.get(str(sku).lower(), str(sku))
+        out[order_sku] = packed
+        if order_sku != str(sku):
+            out[str(sku)] = packed
+        found_lower.add(str(sku).lower())
+
+    missing = [s for s in wanted if s.lower() not in found_lower]
+    if missing:
+        # Case-insensitive fallback query for remaining SKUs.
+        or_clauses = [{"sku": {"$regex": f"^{re.escape(s)}$", "$options": "i"}} for s in missing]
+        async for doc in _db().products.find(
+            {"sellerId": seller_id, "$or": or_clauses},
+            {"sku": 1, "asin": 1, "fees": 1, "price": 1},
+        ):
+            sku = doc.get("sku")
+            if not sku:
+                continue
+            packed = _pack(str(sku), doc)
+            if not packed:
+                continue
+            order_sku = wanted_lower.get(str(sku).lower(), str(sku))
+            out[order_sku] = packed
+            out[str(sku)] = packed
+
     return out
 
 

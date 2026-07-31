@@ -1554,24 +1554,41 @@ async def compute_profitability_data(
             )
         )
         pf = product_fee_fallback.get(sku) if sku in product_fee_fallback else None
+        if not pf and product_fee_fallback:
+            pf = next(
+                (
+                    v for k, v in product_fee_fallback.items()
+                    if str(k).lower() == str(sku).lower()
+                ),
+                None,
+            )
         pf_ok = bool(
             pf
             and (
                 float(pf.get("referral_per_unit") or 0) > 0
                 or float(pf.get("fba_per_unit") or 0) > 0
                 or float(pf.get("fuel_per_unit") or 0) > 0
+                or float(pf.get("fulfillment_per_unit") or 0) > 0
             )
         )
 
         if pf_ok:
+            # Same source as Aurora Products (`products.fees`). FBA + Fuel
+            # equals the Products "FBA Fee" column (fulfillment total).
             listing_price = float(pf.get("listing_price") or 0)
             ref_unit = float(pf.get("referral_per_unit") or 0)
             if listing_price > 0 and ref_unit > 0 and revenue > 0:
                 referral_total = round(revenue * (ref_unit / listing_price), 2)
             else:
                 referral_total = round(ref_unit * units, 2)
-            fba_total = round(float(pf.get("fba_per_unit") or 0) * units, 2)
-            fuel_total = round(float(pf.get("fuel_per_unit") or 0) * units, 2)
+            fba_unit = float(pf.get("fba_per_unit") or 0)
+            fuel_unit = float(pf.get("fuel_per_unit") or 0)
+            # Safety: if split drifted, re-align to Products fbaFee total.
+            ful_unit = float(pf.get("fulfillment_per_unit") or 0)
+            if ful_unit > 0 and abs((fba_unit + fuel_unit) - ful_unit) > 0.02:
+                fba_unit, fuel_unit = split_bundled_fulfillment_total(ful_unit)
+            fba_total = round(fba_unit * units, 2)
+            fuel_total = round(fuel_unit * units, 2)
             if not asin and pf.get("asin"):
                 asin = pf["asin"]
         elif est_ok:
