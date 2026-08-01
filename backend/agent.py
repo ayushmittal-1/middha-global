@@ -816,6 +816,31 @@ def _aggregate_sku_from_sp_api(
     return sku_data, orders_count
 
 
+# Storage report generation on Amazon's side runs 30-240s for months not
+# yet published. Kick it off in the background, dedupe rapid callers on the
+# same (user, months) key, and let the caller decide whether to wait. Keep
+# strong references so the task isn't garbage-collected mid-flight.
+_STORAGE_BG_TASKS: dict[tuple, asyncio.Task] = {}
+
+# SP-API's /reports endpoint has a tight per-account quota (~0.02 req/s).
+# Running the storage / aged / removal / placement loaders in parallel
+# triggers 429 storms with exponential backoff up to 24s+ per call —
+# strictly worse than sequential. Serialize the report-hitting parts.
+_REPORT_SEM = asyncio.Semaphore(1)
+
+# Strong references so tasks that outlive the request handler (report
+# loaders that missed the soft deadline) aren't garbage-collected. The
+# done_callback discards them once complete.
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _fire_bg(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
 async def compute_profitability_data(
     days_back: int = 7,
     start: str | datetime | None = None,
@@ -1019,13 +1044,6 @@ async def compute_profitability_data(
         )
 
     skus = sorted(sku_data.keys())
-    cogs_map: dict = {}
-    if skus:
-        try:
-            cogs_rows = await get_cogs(skus)
-            cogs_map = {r["sku"]: r for r in cogs_rows}
-        except Exception as e:
-            return {"error": f"Error reading COGS: {e}"}
 
     # ── Storage / finances / placement / aged — not in Aurora DB; SP-API ───
     warnings: list[str] = []
@@ -1034,55 +1052,560 @@ async def compute_profitability_data(
             "Amazon Orders API rate-limited us mid-fetch — showing partial results. "
             "Re-open this tab in a minute to see the full window."
         )
+
+    # State populated by parallel loaders below.
+    cogs_map: dict = {}
+    cogs_error: str | None = None
     storage_by_asin_month: dict[str, dict[str, dict]] = {}
     storage_cached_at: str | None = None
     storage_months_in_window = calendar_months_in_window(start_dt, end_dt, mp_tz)
     covered_months: set[str] = set()
 
-    storage_meta = await get_storage_cache(max_age_hours=24)
-    if storage_meta:
-        cached_map = storage_meta.get("per_sku_monthly") or {}
-        if is_per_asin_by_month_storage_cache(cached_map):
-            storage_by_asin_month = amazon_sp.normalize_storage_fee_map(cached_map)
-            storage_cached_at = storage_meta.get("updated_at")
-            covered_months = {
-                str(m) for m in (storage_meta.get("months_covered") or [])
-                if re.match(r"^\d{4}-\d{2}$", str(m))
-            }
+    product_fee_fallback: dict[str, dict] = {}
+    fin_by_sku: dict[str, dict] = {}
+    unattributed_fees = amazon_sp._empty_fee_bucket()
+    placement_avg_per_unit: dict[str, float] | None = None
+    placement_avg_per_asin: dict[str, float] = {}
+    placement_charges_by_sku: dict[str, float] = {}
+    placement_charges_by_asin: dict[str, float] = {}
+    placement_meta: dict[str, object] = {"source": "none", "sku_count": 0}
+    placement_blended = False
+    placement_window_total = 0.0
+    aged_charges_by_sku: dict[str, float] | None = {}
+    aged_charges_meta: dict = {"source": None, "access_denied": False}
+    aged_report_total = 0.0
+    aged_charges_trusted = False  # True when SC charges report/cache was used
+    fees_by_asin: dict[str, dict] = {}
+    fee_errors_pre: list[str] = []
+    returns_by_sku: dict[str, dict] = {}
 
-    missing_months = [m for m in storage_months_in_window if m not in covered_months]
-    if missing_months:
+    removal_fees_by_sku: dict[str, float] = {}
+    removal_fees_trusted = False
+    removal_blended = True
+    removal_report_total = 0.0
+    removal_months = calendar_months_in_window(start_dt, end_dt, mp_tz)
+    removal_meta: dict = {
+        "source": None,
+        "access_denied": False,
+        "blended": True,
+        "months": removal_months,
+    }
+
+    ad_window = {
+        "total_window": 0.0, "campaign_count": 0,
+        "by_sku": {}, "unattributed": 0.0,
+    }
+
+    charges_start_iso = utc_instant_to_iso_z(start_dt)
+    charges_end_iso = utc_instant_to_iso_z(end_dt)
+
+    # Each loader is fully async; asyncio.gather below overlaps all their
+    # I/O so wall time collapses to the slowest single call instead of the
+    # sum. Loaders write to enclosing-scope vars via `nonlocal` — safe
+    # because asyncio is single-threaded and each loader touches its own
+    # subset of state.
+    async def _load_cogs():
+        nonlocal cogs_map, cogs_error
+        if not skus:
+            return
         try:
-            fetched, found_months = await fetch_storage_fees_for_months(
-                missing_months, mp_tz,
-            )
+            cogs_rows = await get_cogs(skus)
+            cogs_map = {r["sku"]: r for r in cogs_rows}
+        except Exception as e:
+            cogs_error = f"Error reading COGS: {e}"
+
+    async def _load_storage():
+        nonlocal storage_by_asin_month, storage_cached_at, covered_months
+        storage_meta = await get_storage_cache(max_age_hours=24)
+        if storage_meta:
+            cached_map = storage_meta.get("per_sku_monthly") or {}
+            if is_per_asin_by_month_storage_cache(cached_map):
+                storage_by_asin_month = amazon_sp.normalize_storage_fee_map(cached_map)
+                storage_cached_at = storage_meta.get("updated_at")
+                covered_months = {
+                    str(m) for m in (storage_meta.get("months_covered") or [])
+                    if re.match(r"^\d{4}-\d{2}$", str(m))
+                }
+        missing_months = [m for m in storage_months_in_window if m not in covered_months]
+        if not missing_months:
+            return
+        try:
+            async with _REPORT_SEM:
+                fetched, found_months = await fetch_storage_fees_for_months(
+                    missing_months, mp_tz,
+                )
             if fetched:
                 # Always apply in-memory first so profitability works even if
                 # the Mongo cache write fails.
                 storage_by_asin_month = merge_storage_by_asin_month(
                     storage_by_asin_month, fetched,
                 )
-                try:
-                    merged = await merge_storage_cache(fetched, found_months)
-                    storage_by_asin_month = merged["per_sku_monthly"]
-                    storage_cached_at = merged["updated_at"]
-                    covered_months = set(merged["months_covered"])
-                except Exception as cache_err:
-                    warnings.append(
-                        f"Storage cache save failed ({type(cache_err).__name__}); "
-                        "using freshly fetched report in-memory."
-                    )
-                    covered_months |= set(found_months)
-                    storage_cached_at = datetime.now(timezone.utc).isoformat()
-            still_missing = [m for m in storage_months_in_window if m not in covered_months]
-            if still_missing:
+            # Persist even when Amazon returned nothing — otherwise every
+            # request for a month Amazon hasn't published yet re-invokes
+            # a ~30s report poll. Recording missing_months in monthsCovered
+            # skips re-fetch until the 24h storage-cache TTL expires.
+            try:
+                merged = await merge_storage_cache(
+                    fetched or {}, list(set(found_months) | set(missing_months)),
+                )
+                storage_by_asin_month = merged["per_sku_monthly"]
+                storage_cached_at = merged["updated_at"]
+                covered_months = set(merged["months_covered"])
+            except Exception as cache_err:
+                warnings.append(
+                    f"Storage cache save failed ({type(cache_err).__name__}); "
+                    "using freshly fetched report in-memory."
+                )
+                covered_months = covered_months | set(found_months) | set(missing_months)
+                storage_cached_at = datetime.now(timezone.utc).isoformat()
+            empty_months = [m for m in missing_months if m not in (found_months or [])]
+            if empty_months:
                 warnings.append(
                     f"Storage: no FBA storage report data yet for "
-                    f"{', '.join(still_missing)} — Amazon may not have published "
+                    f"{', '.join(empty_months)} — Amazon may not have published "
                     "those months via SP-API yet."
                 )
         except Exception as e:
             warnings.append(_sp_report_warning("Storage", e))
+
+    async def _load_finances():
+        nonlocal fin_by_sku, unattributed_fees
+        # Finances fees (low inv, placement settlements) often post weeks
+        # after the related sale/inbound event — look back 45 days before
+        # the window for those. But refunds must be bounded to the actual
+        # window: counting May's refund events against a June 1–10 window
+        # inflates return_processing_fee and returned_units for pre-window
+        # sales that the seller doesn't see as returns "in" the window.
+        fin_posted_after = utc_instant_to_iso_z(start_dt - timedelta(days=45))
+        refund_posted_after = utc_instant_to_iso_z(start_dt)
+        try:
+            fin = await amazon_sp.get_financial_events(
+                posted_after=fin_posted_after,
+                posted_before=created_before,
+                paginate=True,
+                refund_posted_after=refund_posted_after,
+            )
+            fin_by_sku = fin.get("by_sku") or {}
+            unattributed_fees = fin.get("unattributed") or unattributed_fees
+        except Exception as e:
+            warnings.append(_sp_report_warning("Finances", e))
+
+    async def _load_returns():
+        # Returns come from Aurora's Order.customerReturns (populated by
+        # customerReturnsService from GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA),
+        # NOT from Finances. Bounded by the ORDER's purchaseDate — matches
+        # the same sale-window the rest of the tab uses, so a return counts
+        # in the window the item was SOLD (regardless of when the customer
+        # actually returned it). `orderItems[].referralFee` gives the exact
+        # referral Amazon charged at sale time, so 0.20 × that × units is
+        # per-order-line accurate rather than a window average.
+        nonlocal returns_by_sku
+        if not use_db:
+            return
+        try:
+            returns_by_sku = await aurora_data.fba_returns_by_sku(
+                require_user(), start_dt, end_dt,
+            )
+        except Exception as e:
+            warnings.append(_sp_report_warning("Customer returns (Aurora)", e))
+
+    async def _load_placement():
+        # Prefer Aurora's fbainboundplacementfees dated events filtered by the
+        # profitability window (same Event Date filter as Seller Central).
+        # When dated events exist, placement is account-level BLENDED: do NOT
+        # allocate by SKU/ASIN — totals use the report window sum only.
+        # Fall back to fee_rate × units sold only when no dated events exist.
+        nonlocal placement_charges_by_sku, placement_charges_by_asin
+        nonlocal placement_blended, placement_window_total
+        nonlocal placement_avg_per_unit, placement_avg_per_asin
+        placement_from_aurora: dict | None = None
+        if use_db:
+            try:
+                (
+                    placement_charges_by_sku,
+                    placement_charges_by_asin,
+                    win_meta,
+                ) = await aurora_data.fba_inbound_placement_charges_for_window(
+                    require_user(), start_dt, end_dt, marketplace_tz=mp_tz,
+                )
+                # Any stored dated events ⇒ always use report window total
+                # (even if $0 for this filter). Never fall back to rate × units,
+                # which disagrees with Seller Central's Event Date totals.
+                if int(win_meta.get("event_count") or 0) > 0:
+                    placement_blended = True
+                    placement_window_total = float(win_meta.get("window_total") or 0)
+                    placement_meta["source"] = "aurora_events_window"
+                    placement_meta["blended"] = True
+                    placement_meta["matched_events"] = win_meta.get("matched_events")
+                    placement_meta["event_count"] = win_meta.get("event_count")
+                    placement_meta["window_total"] = placement_window_total
+                    placement_meta["window_start"] = win_meta.get("window_start")
+                    placement_meta["window_end"] = win_meta.get("window_end")
+                    placement_meta["sku_count"] = 0
+                else:
+                    placement_from_aurora = await aurora_data.fba_inbound_placement_by_sku(
+                        require_user(),
+                    )
+            except Exception as e:
+                warnings.append(_sp_report_warning("Inbound placement (Aurora)", e))
+
+        placement_cache_meta = await get_placement_fee_cache(max_age_hours=24)
+        try:
+            placement_per_sku: dict = {}
+            need_placement_fetch = False
+            if placement_blended:
+                pass  # account-level report total only — no per-SKU rates
+            elif placement_from_aurora:
+                placement_per_sku = placement_from_aurora
+                placement_meta["source"] = "aurora_db"
+                placement_meta["sku_count"] = len(placement_per_sku)
+                placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
+                    placement_per_sku
+                )
+                placement_meta["resolved_skus"] = len(placement_avg_per_unit)
+            elif placement_cache_meta and placement_cache_meta.get("access_denied"):
+                placement_meta["access_denied"] = True
+                placement_per_sku = placement_cache_meta.get("per_sku") or {}
+                if not placement_per_sku and use_db:
+                    placement_per_sku = await _placement_rates_from_finances_join(use_db)
+                if placement_per_sku:
+                    placement_meta["source"] = "finances_shipment_join"
+                    placement_meta["sku_count"] = len(placement_per_sku)
+                    placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
+                        placement_per_sku
+                    )
+                    placement_meta["resolved_skus"] = len(placement_avg_per_unit)
+                else:
+                    placement_meta["source"] = "finances_fallback"
+                    warnings.append(
+                        "Inbound placement report unavailable — Amazon denied access "
+                        "(403) and no placement fee events were found in Finances. "
+                        "Placement fees may show as 0."
+                    )
+            elif placement_cache_meta:
+                placement_per_sku = placement_cache_meta.get("per_sku") or {}
+                if placement_per_sku and not any(
+                    isinstance(b, dict) and "fee_bearing_units" in b
+                    for b in placement_per_sku.values()
+                ):
+                    need_placement_fetch = True
+                elif placement_per_sku:
+                    placement_meta["source"] = "report_cache"
+                    placement_meta["sku_count"] = len(placement_per_sku)
+                    placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
+                        placement_per_sku
+                    )
+                    placement_meta["resolved_skus"] = len(placement_avg_per_unit)
+                else:
+                    need_placement_fetch = True
+            else:
+                need_placement_fetch = True
+
+            if need_placement_fetch:
+                async with _REPORT_SEM:
+                    placement_per_sku, months, events = (
+                        await amazon_sp.fetch_inbound_placement_fees_per_sku(months_back=3)
+                    )
+                if use_db and placement_per_sku:
+                    placement_per_sku = await aurora_data.resolve_placement_report_to_skus(
+                        require_user(), placement_per_sku,
+                    )
+                if use_db and events:
+                    events = await aurora_data.resolve_placement_events_to_skus(
+                        require_user(), events,
+                    )
+                await put_placement_fee_cache(placement_per_sku, months)
+                placement_meta["source"] = "report_live"
+                placement_meta["sku_count"] = len(placement_per_sku)
+                if placement_per_sku:
+                    placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
+                        placement_per_sku
+                    )
+                    placement_meta["resolved_skus"] = len(placement_avg_per_unit)
+                else:
+                    placement_avg_per_unit = None
+        except Exception as e:
+            warnings.append(_sp_report_warning("Inbound placement", e))
+            if _is_sp_access_denied(e):
+                placement_meta["access_denied"] = True
+                placement_per_sku = {}
+                if use_db:
+                    try:
+                        placement_per_sku = await _placement_rates_from_finances_join(use_db)
+                    except Exception as join_err:
+                        warnings.append(
+                            f"Inbound placement Finances join failed ({join_err}); "
+                            "placement fees may show as 0."
+                        )
+                        await put_placement_fee_cache({}, [], access_denied=True)
+                else:
+                    await put_placement_fee_cache({}, [], access_denied=True)
+                if placement_per_sku:
+                    placement_meta["source"] = "finances_shipment_join"
+                    placement_meta["sku_count"] = len(placement_per_sku)
+                    placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
+                        placement_per_sku
+                    )
+                    placement_meta["resolved_skus"] = len(placement_avg_per_unit)
+                else:
+                    placement_avg_per_unit = None
+                    placement_avg_per_asin = {}
+                    placement_meta["source"] = "finances_fallback"
+            else:
+                placement_avg_per_unit = None
+                placement_avg_per_asin = {}
+                placement_meta["source"] = "finances_fallback"
+
+    async def _load_aged():
+        # Prefer Aurora's fbaagedinventoryfees snapshot (populated by
+        # auroraBackend's fbaAgedInventorySyncService from the FBA Inventory
+        # Planning report). This is the SAME source the legacy planning path
+        # uses — Aurora just runs it on its side and hands us the result.
+        # NOTE: this feeds planning_aged_by_sku only. The actual Aged Inventory
+        # Surcharge dollars used in /profitability come from the CHARGES report
+        # (further below), which Aurora doesn't ingest.
+        nonlocal aged_charges_by_sku, aged_charges_meta, aged_report_total, aged_charges_trusted
+        planning_aged_by_sku: dict[str, float] = {}
+        aged_from_aurora: dict | None = None
+        if use_db:
+            try:
+                aged_from_aurora = await aurora_data.fba_aged_inventory_by_sku(require_user())
+            except Exception as e:
+                warnings.append(_sp_report_warning("Aged inventory (Aurora)", e))
+
+        aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
+        # Force a refetch when the cache pre-dates the HDoS / recommended-ship-qty
+        # extraction — an old-shape cache is technically fresh (< 24h) but missing
+        # the fields the Restock table needs. Detect it by looking for any entry
+        # carrying the new keys; if none do, treat as stale.
+        aged_needs_refresh = bool(aged_cache_meta) and not any(
+            (
+                "historical_days_of_supply" in v
+                or "recommended_ship_in_quantity" in v
+            )
+            for v in (aged_cache_meta.get("per_sku") or {}).values()
+        )
+        try:
+            aged_per_sku: dict = {}
+            if aged_from_aurora is not None:
+                # Aurora synced this planning report — use it, skip our fetch.
+                aged_per_sku = aged_from_aurora
+            else:
+                need_aged_fetch = True
+                if aged_cache_meta and not aged_needs_refresh:
+                    aged_per_sku = aged_cache_meta.get("per_sku") or {}
+                    if aged_per_sku:
+                        need_aged_fetch = False
+                if need_aged_fetch:
+                    async with _REPORT_SEM:
+                        aged_per_sku = await amazon_sp.fetch_aged_inventory_fees_per_sku()
+                    await put_aged_inventory_cache(aged_per_sku)
+            for psku, b in (aged_per_sku or {}).items():
+                if not isinstance(b, dict):
+                    continue
+                fee = float(b.get("monthly_fee") or 0)
+                if fee > 0:
+                    planning_aged_by_sku[psku] = fee
+            # Planning report is cached for Restock (HDOS / recommended qty).
+            # Profitability uses the actual AIS charges report below.
+        except Exception as e:
+            warnings.append(_sp_report_warning("Aged inventory planning", e))
+            if _is_sp_access_denied(e):
+                await put_aged_inventory_cache({})
+
+        # Actual Aged Inventory Surcharge charges (Seller Central report).
+        try:
+            charges_cache = await get_aged_surcharge_charges_cache(
+                charges_start_iso, charges_end_iso, max_age_hours=24,
+            )
+            if charges_cache and not charges_cache.get("access_denied"):
+                aged_charges_by_sku = _build_aged_charges(
+                    charges_cache.get("per_sku") or {}
+                )
+                aged_charges_meta["source"] = "charges_cache"
+                aged_charges_trusted = True
+            else:
+                async with _REPORT_SEM:
+                    charges_per_sku = await amazon_sp.fetch_aged_surcharge_charges_per_sku(
+                        start_dt, end_dt, time_zone=mp_tz,
+                    )
+                await put_aged_surcharge_charges_cache(
+                    charges_per_sku, charges_start_iso, charges_end_iso,
+                )
+                aged_charges_by_sku = _build_aged_charges(charges_per_sku)
+                aged_charges_meta["source"] = "charges_report"
+                aged_charges_trusted = True
+            aged_report_total = round(
+                sum(float(v or 0) for v in (aged_charges_by_sku or {}).values()), 2,
+            )
+            aged_charges_meta["report_total"] = aged_report_total
+        except Exception as e:
+            warnings.append(_sp_report_warning("Aged inventory surcharge charges", e))
+            if _is_sp_access_denied(e):
+                aged_charges_meta["access_denied"] = True
+                await put_aged_surcharge_charges_cache(
+                    {}, charges_start_iso, charges_end_iso, access_denied=True,
+                )
+            # Prefer planning estimated-ais (SKU-only) over Finances only when
+            # BOTH create and DONE-report reuse failed. Finances posts AIS as a
+            # lumped unattributed total (no SellerSKU), which left every row at $0.
+            if planning_aged_by_sku:
+                aged_charges_by_sku = dict(planning_aged_by_sku)
+                aged_charges_meta["source"] = "planning_estimate_fallback"
+                aged_charges_trusted = False
+                warnings.append(
+                    "Aged Inv: could not load the Aged Inventory Surcharge charges "
+                    "report (create FATAL and no reusable DONE report). Showing "
+                    "Inventory Planning estimated-ais totals — these will NOT match "
+                    "Seller Central amount-charged. Retry later."
+                )
+            else:
+                aged_charges_by_sku = None
+                aged_charges_meta["source"] = "finances_fallback"
+                aged_charges_trusted = False
+
+    async def _load_removal():
+        # Removal / Disposal: Seller Central Removal Order Detail only
+        # (GET_FBA_FULFILLMENT_REMOVAL_ORDER_DETAIL_DATA), request-date / Event Date.
+        # Always BLENDED on Totals (like inbound placement) — never Finances
+        # ServiceFee spread across sold SKUs (that invents wrong per-row amounts).
+        # Report is requested per calendar month in the filter, then clipped to the
+        # customer's exact [start, end) date range.
+        nonlocal removal_fees_by_sku, removal_fees_trusted, removal_report_total
+        try:
+            removal_cache = await get_removal_fees_cache(
+                charges_start_iso, charges_end_iso, max_age_hours=24,
+            )
+            if removal_cache and not removal_cache.get("access_denied"):
+                removal_fees_by_sku = _build_removal_fees(
+                    removal_cache.get("per_sku") or {},
+                )
+                removal_report_total = round(
+                    float(removal_cache.get("report_total") or 0)
+                    or sum(removal_fees_by_sku.values()),
+                    2,
+                )
+                removal_meta["source"] = "charges_cache"
+                removal_fees_trusted = True
+            else:
+                async with _REPORT_SEM:
+                    removal_raw = await fetch_removal_fees_per_sku(
+                        start_dt, end_dt, time_zone=mp_tz,
+                    )
+                await put_removal_fees_cache(
+                    removal_raw, charges_start_iso, charges_end_iso,
+                )
+                removal_fees_by_sku = _build_removal_fees(removal_raw)
+                removal_report_total = round(
+                    sum(removal_fees_by_sku.values()), 2,
+                )
+                removal_meta["source"] = "charges_report"
+                removal_fees_trusted = True
+            removal_meta["report_total"] = removal_report_total
+        except Exception as e:
+            warnings.append(_sp_report_warning("Removal Order Detail", e))
+            if _is_sp_access_denied(e):
+                removal_meta["access_denied"] = True
+                await put_removal_fees_cache(
+                    {}, charges_start_iso, charges_end_iso, access_denied=True,
+                )
+            removal_fees_by_sku = {}
+            removal_fees_trusted = False
+            removal_report_total = 0.0
+            removal_meta["source"] = "unavailable"
+
+    async def _load_product_fees_and_batch():
+        # products.fees is primary (same as Aurora Products). Fees API only for SKUs
+        # missing that sync — do not prefer stale order-line fees.
+        nonlocal product_fee_fallback, fees_by_asin, fee_errors_pre
+        if use_db:
+            product_fee_fallback = await aurora_data.product_fee_estimates_by_sku(
+                require_user(), skus,
+            )
+            fee_skus = data_resolver.skus_needing_fees_api(sku_data, product_fee_fallback)
+            batch_items = [
+                (sku_data[sku]["asin"], sku_data[sku]["revenue"] / sku_data[sku]["units"])
+                for sku in fee_skus
+                if sku_data[sku].get("asin") and sku_data[sku]["units"]
+                and sku_data[sku]["revenue"] > 0
+            ]
+        else:
+            product_fee_fallback = {}
+            batch_items = [
+                (sku_data[sku]["asin"], sku_data[sku]["revenue"] / sku_data[sku]["units"])
+                for sku in skus
+                if sku_data[sku].get("asin") and sku_data[sku]["units"]
+                and sku_data[sku]["revenue"] > 0
+            ]
+
+        if batch_items:
+            try:
+                fees_by_asin = await amazon_sp.get_fees_estimates_batch(
+                    batch_items, is_fba=True,
+                )
+            except Exception as e:
+                fee_errors_pre = [f"batch fees fetch failed: {str(e)[:200]}"]
+
+    async def _load_ads():
+        # Per-SKU when a campaign lists its SKUs (Aurora Ad.skus[]); campaigns
+        # without a SKU list fall into `unattributed` and get spread uniformly
+        # per unit (legacy behavior).
+        nonlocal ad_window
+        try:
+            ad_window = await get_ad_spend_for_range(start=start_dt, end=end_dt)
+        except Exception as e:
+            warnings.append(f"Ad spend fetch failed ({e}); ad cost set to 0.")
+
+
+    # Storage report generation on Amazon's side can take 30-240s for months
+    # not yet published. Dedupe concurrent callers on the same (user, months)
+    # key so rapid reloads don't pile on Amazon.
+    storage_bg_key = (
+        str(user.get("_id")) if isinstance(user, dict) else str(user),
+        tuple(storage_months_in_window),
+    )
+    existing_storage_task = _STORAGE_BG_TASKS.get(storage_bg_key)
+    if existing_storage_task is not None and not existing_storage_task.done():
+        storage_task = existing_storage_task
+    else:
+        storage_task = _fire_bg(_load_storage())
+        _STORAGE_BG_TASKS[storage_bg_key] = storage_task
+        storage_task.add_done_callback(
+            lambda t, k=storage_bg_key: _STORAGE_BG_TASKS.pop(k, None)
+        )
+
+    # COGS is critical — the response is wrong without it. Everything else
+    # is best-effort: give it a soft deadline and return whatever came back.
+    # Slow loaders keep running via _fire_bg and warm the cache for the
+    # next call, which will read them near-instantly.
+    cogs_task = _fire_bg(_load_cogs())
+    await cogs_task
+    if cogs_error:
+        return {"error": cogs_error}
+
+    other_tasks: dict[str, asyncio.Task] = {
+        "storage": storage_task,
+        "finances": _fire_bg(_load_finances()),
+        "returns": _fire_bg(_load_returns()),
+        "placement": _fire_bg(_load_placement()),
+        "aged inventory": _fire_bg(_load_aged()),
+        "removal": _fire_bg(_load_removal()),
+        "product fees": _fire_bg(_load_product_fees_and_batch()),
+        "ads": _fire_bg(_load_ads()),
+    }
+    # Soft deadline — pick something that comfortably fits the fast loaders
+    # (Aurora + Finances + Ads usually <2s) but drops slow SP-API report
+    # loaders so the UI isn't blocked on them.
+    _, pending = await asyncio.wait(
+        list(other_tasks.values()), timeout=5.0,
+    )
+    incomplete = sorted(name for name, task in other_tasks.items() if task in pending)
+    if incomplete:
+        warnings.append(
+            "Still loading in background: " + ", ".join(incomplete)
+            + ". These sections may show as 0 in this response — reload in "
+            "~30 seconds to pick up the warmed cache."
+        )
 
     storage_fees_by_asin, storage_report_total, storage_month_fractions = (
         storage_fees_by_asin_for_window(
@@ -1100,58 +1623,6 @@ async def compute_profitability_data(
         if _asin and _d.get("units"):
             storage_units_by_asin[_asin] += float(_d["units"])
 
-    product_fee_fallback: dict[str, dict] = {}
-    fin_by_sku: dict[str, dict] = {}
-    unattributed_fees = amazon_sp._empty_fee_bucket()
-    placement_avg_per_unit: dict[str, float] | None = None
-    placement_avg_per_asin: dict[str, float] = {}
-    placement_charges_by_sku: dict[str, float] = {}
-    placement_charges_by_asin: dict[str, float] = {}
-    placement_meta: dict[str, object] = {"source": "none", "sku_count": 0}
-    aged_charges_by_sku: dict[str, float] | None = {}
-    aged_charges_meta: dict = {"source": None, "access_denied": False}
-    aged_report_total = 0.0
-    aged_charges_trusted = False  # True when SC charges report/cache was used
-    fees_by_asin: dict[str, dict] = {}
-    fee_errors_pre: list[str] = []
-
-    # Finances fees (low inv, placement settlements) often post weeks
-    # after the related sale/inbound event — look back 45 days before
-    # the window for those. But refunds must be bounded to the actual
-    # window: counting May's refund events against a June 1–10 window
-    # inflates return_processing_fee and returned_units for pre-window
-    # sales that the seller doesn't see as returns "in" the window.
-    fin_posted_after = utc_instant_to_iso_z(start_dt - timedelta(days=45))
-    refund_posted_after = utc_instant_to_iso_z(start_dt)
-    try:
-        fin = await amazon_sp.get_financial_events(
-            posted_after=fin_posted_after,
-            posted_before=created_before,
-            paginate=True,
-            refund_posted_after=refund_posted_after,
-        )
-        fin_by_sku = fin.get("by_sku") or {}
-        unattributed_fees = fin.get("unattributed") or unattributed_fees
-    except Exception as e:
-        warnings.append(_sp_report_warning("Finances", e))
-
-    # Returns come from Aurora's Order.customerReturns (populated by
-    # customerReturnsService from GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA),
-    # NOT from Finances. Bounded by the ORDER's purchaseDate — matches
-    # the same sale-window the rest of the tab uses, so a return counts
-    # in the window the item was SOLD (regardless of when the customer
-    # actually returned it). `orderItems[].referralFee` gives the exact
-    # referral Amazon charged at sale time, so 0.20 × that × units is
-    # per-order-line accurate rather than a window average.
-    returns_by_sku: dict[str, dict] = {}
-    if use_db:
-        try:
-            returns_by_sku = await aurora_data.fba_returns_by_sku(
-                require_user(), start_dt, end_dt,
-            )
-        except Exception as e:
-            warnings.append(_sp_report_warning("Customer returns (Aurora)", e))
-
     total_units_window = sum(d["units"] for d in sku_data.values())
     unattr_per_unit = {
         k: (unattributed_fees.get(k, 0.0) / total_units_window
@@ -1160,363 +1631,8 @@ async def compute_profitability_data(
                   "aged_inventory", "removal")
     }
 
-    # Prefer Aurora's fbainboundplacementfees dated events filtered by the
-    # profitability window (same Event Date filter as Seller Central).
-    # When dated events exist, placement is account-level BLENDED: do NOT
-    # allocate by SKU/ASIN — totals use the report window sum only.
-    # Fall back to fee_rate × units sold only when no dated events exist.
-    placement_from_aurora: dict | None = None
-    placement_blended = False
-    placement_window_total = 0.0
-    if use_db:
-        try:
-            (
-                placement_charges_by_sku,
-                placement_charges_by_asin,
-                win_meta,
-            ) = await aurora_data.fba_inbound_placement_charges_for_window(
-                require_user(), start_dt, end_dt, marketplace_tz=mp_tz,
-            )
-            # Any stored dated events ⇒ always use report window total
-            # (even if $0 for this filter). Never fall back to rate × units,
-            # which disagrees with Seller Central's Event Date totals.
-            if int(win_meta.get("event_count") or 0) > 0:
-                placement_blended = True
-                placement_window_total = float(win_meta.get("window_total") or 0)
-                placement_meta["source"] = "aurora_events_window"
-                placement_meta["blended"] = True
-                placement_meta["matched_events"] = win_meta.get("matched_events")
-                placement_meta["event_count"] = win_meta.get("event_count")
-                placement_meta["window_total"] = placement_window_total
-                placement_meta["window_start"] = win_meta.get("window_start")
-                placement_meta["window_end"] = win_meta.get("window_end")
-                placement_meta["sku_count"] = 0
-            else:
-                placement_from_aurora = await aurora_data.fba_inbound_placement_by_sku(
-                    require_user(),
-                )
-        except Exception as e:
-            warnings.append(_sp_report_warning("Inbound placement (Aurora)", e))
-
-    placement_cache_meta = await get_placement_fee_cache(max_age_hours=24)
-    try:
-        placement_per_sku: dict = {}
-        need_placement_fetch = False
-        if placement_blended:
-            pass  # account-level report total only — no per-SKU rates
-        elif placement_from_aurora:
-            placement_per_sku = placement_from_aurora
-            placement_meta["source"] = "aurora_db"
-            placement_meta["sku_count"] = len(placement_per_sku)
-            placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
-                placement_per_sku
-            )
-            placement_meta["resolved_skus"] = len(placement_avg_per_unit)
-        elif placement_cache_meta and placement_cache_meta.get("access_denied"):
-            placement_meta["access_denied"] = True
-            placement_per_sku = placement_cache_meta.get("per_sku") or {}
-            if not placement_per_sku and use_db:
-                placement_per_sku = await _placement_rates_from_finances_join(use_db)
-            if placement_per_sku:
-                placement_meta["source"] = "finances_shipment_join"
-                placement_meta["sku_count"] = len(placement_per_sku)
-                placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
-                    placement_per_sku
-                )
-                placement_meta["resolved_skus"] = len(placement_avg_per_unit)
-            else:
-                placement_meta["source"] = "finances_fallback"
-                warnings.append(
-                    "Inbound placement report unavailable — Amazon denied access "
-                    "(403) and no placement fee events were found in Finances. "
-                    "Placement fees may show as 0."
-                )
-        elif placement_cache_meta:
-            placement_per_sku = placement_cache_meta.get("per_sku") or {}
-            if placement_per_sku and not any(
-                isinstance(b, dict) and "fee_bearing_units" in b
-                for b in placement_per_sku.values()
-            ):
-                need_placement_fetch = True
-            elif placement_per_sku:
-                placement_meta["source"] = "report_cache"
-                placement_meta["sku_count"] = len(placement_per_sku)
-                placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
-                    placement_per_sku
-                )
-                placement_meta["resolved_skus"] = len(placement_avg_per_unit)
-            else:
-                need_placement_fetch = True
-        else:
-            need_placement_fetch = True
-
-        if need_placement_fetch:
-            placement_per_sku, months, events = (
-                await amazon_sp.fetch_inbound_placement_fees_per_sku(months_back=3)
-            )
-            if use_db and placement_per_sku:
-                placement_per_sku = await aurora_data.resolve_placement_report_to_skus(
-                    require_user(), placement_per_sku,
-                )
-            if use_db and events:
-                events = await aurora_data.resolve_placement_events_to_skus(
-                    require_user(), events,
-                )
-            await put_placement_fee_cache(placement_per_sku, months)
-            placement_meta["source"] = "report_live"
-            placement_meta["sku_count"] = len(placement_per_sku)
-            if placement_per_sku:
-                placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
-                    placement_per_sku
-                )
-                placement_meta["resolved_skus"] = len(placement_avg_per_unit)
-            else:
-                placement_avg_per_unit = None
-    except Exception as e:
-        warnings.append(_sp_report_warning("Inbound placement", e))
-        if _is_sp_access_denied(e):
-            placement_meta["access_denied"] = True
-            placement_per_sku = {}
-            if use_db:
-                try:
-                    placement_per_sku = await _placement_rates_from_finances_join(use_db)
-                except Exception as join_err:
-                    warnings.append(
-                        f"Inbound placement Finances join failed ({join_err}); "
-                        "placement fees may show as 0."
-                    )
-                    await put_placement_fee_cache({}, [], access_denied=True)
-            else:
-                await put_placement_fee_cache({}, [], access_denied=True)
-            if placement_per_sku:
-                placement_meta["source"] = "finances_shipment_join"
-                placement_meta["sku_count"] = len(placement_per_sku)
-                placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
-                    placement_per_sku
-                )
-                placement_meta["resolved_skus"] = len(placement_avg_per_unit)
-            else:
-                placement_avg_per_unit = None
-                placement_avg_per_asin = {}
-                placement_meta["source"] = "finances_fallback"
-        else:
-            placement_avg_per_unit = None
-            placement_avg_per_asin = {}
-            placement_meta["source"] = "finances_fallback"
-
-    planning_aged_by_sku: dict[str, float] = {}
-    # Prefer Aurora's fbaagedinventoryfees snapshot (populated by
-    # auroraBackend's fbaAgedInventorySyncService from the FBA Inventory
-    # Planning report). This is the SAME source the legacy planning path
-    # uses — Aurora just runs it on its side and hands us the result.
-    # NOTE: this feeds planning_aged_by_sku only. The actual Aged Inventory
-    # Surcharge dollars used in /profitability come from the CHARGES report
-    # (further below), which Aurora doesn't ingest.
-    aged_from_aurora: dict | None = None
-    if use_db:
-        try:
-            aged_from_aurora = await aurora_data.fba_aged_inventory_by_sku(require_user())
-        except Exception as e:
-            warnings.append(_sp_report_warning("Aged inventory (Aurora)", e))
-
-    aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
-    # Force a refetch when the cache pre-dates the HDoS / recommended-ship-qty
-    # extraction — an old-shape cache is technically fresh (< 24h) but missing
-    # the fields the Restock table needs. Detect it by looking for any entry
-    # carrying the new keys; if none do, treat as stale.
-    aged_needs_refresh = bool(aged_cache_meta) and not any(
-        (
-            "historical_days_of_supply" in v
-            or "recommended_ship_in_quantity" in v
-        )
-        for v in (aged_cache_meta.get("per_sku") or {}).values()
-    )
-    try:
-        aged_per_sku: dict = {}
-        if aged_from_aurora is not None:
-            # Aurora synced this planning report — use it, skip our fetch.
-            aged_per_sku = aged_from_aurora
-        else:
-            need_aged_fetch = True
-            if aged_cache_meta and not aged_needs_refresh:
-                aged_per_sku = aged_cache_meta.get("per_sku") or {}
-                if aged_per_sku:
-                    need_aged_fetch = False
-            if need_aged_fetch:
-                aged_per_sku = await amazon_sp.fetch_aged_inventory_fees_per_sku()
-                await put_aged_inventory_cache(aged_per_sku)
-        for psku, b in (aged_per_sku or {}).items():
-            if not isinstance(b, dict):
-                continue
-            fee = float(b.get("monthly_fee") or 0)
-            if fee > 0:
-                planning_aged_by_sku[psku] = fee
-        # Planning report is cached for Restock (HDOS / recommended qty).
-        # Profitability uses the actual AIS charges report below.
-    except Exception as e:
-        warnings.append(_sp_report_warning("Aged inventory planning", e))
-        if _is_sp_access_denied(e):
-            await put_aged_inventory_cache({})
-
-    # Actual Aged Inventory Surcharge charges (Seller Central report).
-    charges_start_iso = utc_instant_to_iso_z(start_dt)
-    charges_end_iso = utc_instant_to_iso_z(end_dt)
-    try:
-        charges_cache = await get_aged_surcharge_charges_cache(
-            charges_start_iso, charges_end_iso, max_age_hours=24,
-        )
-        if charges_cache and not charges_cache.get("access_denied"):
-            aged_charges_by_sku = _build_aged_charges(
-                charges_cache.get("per_sku") or {}
-            )
-            aged_charges_meta["source"] = "charges_cache"
-            aged_charges_trusted = True
-        else:
-            charges_per_sku = await amazon_sp.fetch_aged_surcharge_charges_per_sku(
-                start_dt, end_dt, time_zone=mp_tz,
-            )
-            await put_aged_surcharge_charges_cache(
-                charges_per_sku, charges_start_iso, charges_end_iso,
-            )
-            aged_charges_by_sku = _build_aged_charges(charges_per_sku)
-            aged_charges_meta["source"] = "charges_report"
-            aged_charges_trusted = True
-        aged_report_total = round(
-            sum(float(v or 0) for v in (aged_charges_by_sku or {}).values()), 2,
-        )
-        aged_charges_meta["report_total"] = aged_report_total
-    except Exception as e:
-        warnings.append(_sp_report_warning("Aged inventory surcharge charges", e))
-        if _is_sp_access_denied(e):
-            aged_charges_meta["access_denied"] = True
-            await put_aged_surcharge_charges_cache(
-                {}, charges_start_iso, charges_end_iso, access_denied=True,
-            )
-        # Prefer planning estimated-ais (SKU-only) over Finances only when
-        # BOTH create and DONE-report reuse failed. Finances posts AIS as a
-        # lumped unattributed total (no SellerSKU), which left every row at $0.
-        if planning_aged_by_sku:
-            aged_charges_by_sku = dict(planning_aged_by_sku)
-            aged_charges_meta["source"] = "planning_estimate_fallback"
-            aged_charges_trusted = False
-            warnings.append(
-                "Aged Inv: could not load the Aged Inventory Surcharge charges "
-                "report (create FATAL and no reusable DONE report). Showing "
-                "Inventory Planning estimated-ais totals — these will NOT match "
-                "Seller Central amount-charged. Retry later."
-            )
-        else:
-            aged_charges_by_sku = None
-            aged_charges_meta["source"] = "finances_fallback"
-            aged_charges_trusted = False
-
-    # Removal / Disposal: Seller Central Removal Order Detail only
-    # (GET_FBA_FULFILLMENT_REMOVAL_ORDER_DETAIL_DATA), request-date / Event Date.
-    # Always BLENDED on Totals (like inbound placement) — never Finances
-    # ServiceFee spread across sold SKUs (that invents wrong per-row amounts).
-    # Report is requested per calendar month in the filter, then clipped to the
-    # customer's exact [start, end) date range.
-    removal_fees_by_sku: dict[str, float] = {}
-    removal_fees_trusted = False
-    removal_blended = True
-    removal_report_total = 0.0
-    removal_months = calendar_months_in_window(start_dt, end_dt, mp_tz)
-    removal_meta: dict = {
-        "source": None,
-        "access_denied": False,
-        "blended": True,
-        "months": removal_months,
-    }
-    try:
-        removal_cache = await get_removal_fees_cache(
-            charges_start_iso, charges_end_iso, max_age_hours=24,
-        )
-        if removal_cache and not removal_cache.get("access_denied"):
-            removal_fees_by_sku = _build_removal_fees(
-                removal_cache.get("per_sku") or {},
-            )
-            removal_report_total = round(
-                float(removal_cache.get("report_total") or 0)
-                or sum(removal_fees_by_sku.values()),
-                2,
-            )
-            removal_meta["source"] = "charges_cache"
-            removal_fees_trusted = True
-        else:
-            removal_raw = await fetch_removal_fees_per_sku(
-                start_dt, end_dt, time_zone=mp_tz,
-            )
-            await put_removal_fees_cache(
-                removal_raw, charges_start_iso, charges_end_iso,
-            )
-            removal_fees_by_sku = _build_removal_fees(removal_raw)
-            removal_report_total = round(
-                sum(removal_fees_by_sku.values()), 2,
-            )
-            removal_meta["source"] = "charges_report"
-            removal_fees_trusted = True
-        removal_meta["report_total"] = removal_report_total
-    except Exception as e:
-        warnings.append(_sp_report_warning("Removal Order Detail", e))
-        if _is_sp_access_denied(e):
-            removal_meta["access_denied"] = True
-            await put_removal_fees_cache(
-                {}, charges_start_iso, charges_end_iso, access_denied=True,
-            )
-        removal_fees_by_sku = {}
-        removal_fees_trusted = False
-        removal_report_total = 0.0
-        removal_meta["source"] = "unavailable"
-
-    # products.fees is primary (same as Aurora Products). Fees API only for SKUs
-    # missing that sync — do not prefer stale order-line fees.
-    if use_db:
-        product_fee_fallback = await aurora_data.product_fee_estimates_by_sku(
-            require_user(), skus,
-        )
-        fee_skus = data_resolver.skus_needing_fees_api(sku_data, product_fee_fallback)
-        batch_items = [
-            (sku_data[sku]["asin"], sku_data[sku]["revenue"] / sku_data[sku]["units"])
-            for sku in fee_skus
-            if sku_data[sku].get("asin") and sku_data[sku]["units"]
-            and sku_data[sku]["revenue"] > 0
-        ]
-    else:
-        product_fee_fallback = {}
-        batch_items = [
-            (sku_data[sku]["asin"], sku_data[sku]["revenue"] / sku_data[sku]["units"])
-            for sku in skus
-            if sku_data[sku].get("asin") and sku_data[sku]["units"]
-            and sku_data[sku]["revenue"] > 0
-        ]
-
-    if batch_items:
-        try:
-            fees_by_asin = await amazon_sp.get_fees_estimates_batch(
-                batch_items, is_fba=True,
-            )
-        except Exception as e:
-            fee_errors_pre = [f"batch fees fetch failed: {str(e)[:200]}"]
-        else:
-            fee_errors_pre = []
-    else:
-        fee_errors_pre = []
-
-    # ── Ad allocation (Aurora `ads` collection when DB mode) ─────────────
-    # Per-SKU when a campaign lists its SKUs (Aurora Ad.skus[]); campaigns
-    # without a SKU list fall into `unattributed` and get spread uniformly
-    # per unit (legacy behavior).
-    ad_window = {
-        "total_window": 0.0, "campaign_count": 0,
-        "by_sku": {}, "unattributed": 0.0,
-    }
-    try:
-        ad_window = await get_ad_spend_for_range(start=start_dt, end=end_dt)
-    except Exception as e:
-        warnings.append(f"Ad spend fetch failed ({e}); ad cost set to 0.")
     ad_by_sku: dict[str, float] = ad_window.get("by_sku") or {}
     ad_unattributed: float = float(ad_window.get("unattributed") or 0.0)
-    total_units_window = sum(d["units"] for d in sku_data.values())
     ad_unattr_per_unit = (
         ad_unattributed / total_units_window if total_units_window > 0 else 0.0
     )
