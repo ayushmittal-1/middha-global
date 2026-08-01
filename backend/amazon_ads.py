@@ -215,20 +215,25 @@ async def _post_json(label: str, path: str, content_type: str, payload: dict) ->
         return resp.json()
 
 
+_SP_KW_RECO_MEDIA = "application/vnd.spkeywordsrecommendation.v5+json"
+
+_LOCALE_BY_REGION = {"NA": "en_US", "EU": "en_GB", "FE": "ja_JP"}
+
+
 async def fetch_suggested_keywords(
     asin: str,
     max_suggestions: int = 100,
 ) -> dict:
     """Return Amazon-recommended keywords for a product (Sponsored Products).
 
-    Wraps GET /v2/sp/asins/{asin}/suggested/keywords. Fast (<1s), no report
-    generation. Amazon's response is a raw JSON list of
-    `{"keywordText": "...", "matchType": "..."}` items — we normalize to
-    `{"asin": ..., "suggestedKeywords": [...]}` here so callers don't have
-    to deal with the top-level list shape (which broke code that assumed
-    the newer wrapped shape documented in some Amazon guides).
-    Bid data is not included here — use POST /sp/targets/bid/recommendations
-    with an adGroupId if you need per-keyword bid ranges.
+    Amazon retired the legacy `GET /v2/sp/asins/{asin}/suggested/keywords`
+    endpoint in mid-2026 (it now returns `{"code":"NOT_FOUND","details":
+    "Method Not Found"}`). This wraps the v5 replacement
+    `POST /sp/targets/keywords/recommendations` in `KEYWORDS_FOR_ASINS`
+    mode (no ad-group required) and flattens the response back to the
+    same `{"keywordText": ..., "matchType": ...}` list shape the old
+    endpoint returned, so callers (e.g. `keyword_matrix._source_amazon_asin`)
+    don't have to change.
     """
     user = require_user()
     token = await get_ads_access_token(user)
@@ -238,27 +243,48 @@ async def fetch_suggested_keywords(
             "No Ads profile id available for this user. Complete the Ads OAuth "
             "flow (POST /amazon/profiles/{profile_id}/select) or set AMAZON_PROFILE_ID."
         )
+    region = _user_region(user)
     headers = {
         "Authorization": f"Bearer {token}",
         "Amazon-Advertising-API-ClientId": ADS_LWA_CLIENT_ID,
         "Amazon-Advertising-API-Scope": profile_id,
-        "Accept": "application/json",
+        "Content-Type": _SP_KW_RECO_MEDIA,
+        "Accept": _SP_KW_RECO_MEDIA,
     }
-    params = {"maxNumSuggestions": max(1, min(max_suggestions, 1000))}
-    url = f"{_ads_base(user)}/v2/sp/asins/{asin}/suggested/keywords"
-    print(f"[amazon_ads] -> GET suggestedKeywords {url} params={params}")
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers=headers, params=params)
+    body = {
+        "recommendationType": "KEYWORDS_FOR_ASINS",
+        "asins": [asin],
+        "sortDimension": "CLICKS",
+        "locale": _LOCALE_BY_REGION.get(region, "en_US"),
+        "maxRecommendations": max(1, min(max_suggestions, 200)),
+    }
+    url = f"{_ads_base(user)}/sp/targets/keywords/recommendations"
+    print(f"[amazon_ads] -> POST keywordRecommendations {url} asin={asin}")
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(url, headers=headers, json=body)
         if resp.is_error:
-            print(f"[amazon_ads] <- suggestedKeywords FAILED status={resp.status_code} body={resp.text}")
+            print(f"[amazon_ads] <- keywordRecommendations FAILED status={resp.status_code} body={resp.text}")
             resp.raise_for_status()
         raw = resp.json()
-    if isinstance(raw, list):
-        suggestions = raw
-    elif isinstance(raw, dict):
-        suggestions = raw.get("suggestedKeywords") or []
-    else:
-        suggestions = []
+    targets = raw.get("keywordTargetList") if isinstance(raw, dict) else None
+    suggestions: list[dict] = []
+    for t in targets or []:
+        kw = (t.get("keyword") or "").strip()
+        if not kw:
+            continue
+        bid_infos = t.get("bidInfo") or []
+        # Emit one entry per (keyword, matchType) — mirrors the legacy
+        # endpoint's flat shape so downstream dedup by (keywordText,
+        # matchType) keeps working.
+        seen_mt: set[str] = set()
+        for bi in bid_infos:
+            mt = (bi.get("matchType") or "").upper()
+            if not mt or mt in seen_mt:
+                continue
+            seen_mt.add(mt)
+            suggestions.append({"keywordText": kw, "matchType": mt})
+        if not bid_infos:
+            suggestions.append({"keywordText": kw, "matchType": "BROAD"})
     return {"asin": asin, "suggestedKeywords": suggestions}
 
 
