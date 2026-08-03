@@ -1362,6 +1362,8 @@ async def get_financial_events(
     max_pages: int = 40,
     refund_posted_after: str | None = None,
     removal_posted_after: str | None = None,
+    placement_posted_after: str | None = None,
+    placement_posted_before: str | None = None,
 ) -> dict:
     """Pull ListFinancialEvents for the window and normalize into per-SKU
     fee buckets. Returns:
@@ -1372,6 +1374,7 @@ async def get_financial_events(
                                   removal}},
           "unattributed":  {…same keys… — fees we couldn't map to a SKU},
           "totals":        {…same keys, summed across all…},
+          "placement_window_total": float,  # inbound_placement in PostedDate window
           "pages":         int,
           "posted_after":  str,
         }
@@ -1379,6 +1382,11 @@ async def get_financial_events(
     Covers the 5 fees the FBA calculator PDF lists that aren't in Product
     Fees API: return processing, low inventory, inbound placement, aged
     inventory surcharge, and removal fees.
+
+    When ``placement_posted_after`` / ``placement_posted_before`` are set,
+    inbound_placement ServiceFee/Adjustment rows are kept only if PostedDate
+    falls in that half-open window (profitability filter) — same idea as
+    removal's PostedDate bound.
 
     Rate-limited: Finances API is 0.5 req/s sustained (2 burst). We sleep
     2 s between pages so a busy quota doesn't drop us. `max_pages` caps
@@ -1507,6 +1515,13 @@ async def get_financial_events(
                 if bucket == "removal" and removal_posted_after:
                     if posted and posted < removal_posted_after:
                         continue
+                # Inbound placement: only count posts inside the profitability
+                # filter (PostedDate), not the wider 45-day Finances lookback.
+                if bucket == "inbound_placement":
+                    if placement_posted_after and posted and posted < placement_posted_after:
+                        continue
+                    if placement_posted_before and posted and posted >= placement_posted_before:
+                        continue
                 target = by_sku[sku] if sku else unattributed
                 target[bucket] += abs(amt)
                 if bucket == "removal" and removal_order_id:
@@ -1514,7 +1529,12 @@ async def get_financial_events(
 
         for evt in events.get("AdjustmentEventList") or []:
             adj_type = (evt.get("AdjustmentType") or "").lower()
+            adj_posted = evt.get("PostedDate") or ""
             if any(h in adj_type for h in _PLACEMENT_ADJUSTMENT_HINTS):
+                if placement_posted_after and adj_posted and adj_posted < placement_posted_after:
+                    continue
+                if placement_posted_before and adj_posted and adj_posted >= placement_posted_before:
+                    continue
                 # Prefer per-item amounts (may carry a SellerSKU); only fall
                 # back to the event-level total when no item amounts exist —
                 # counting both double-counts the same charge.
@@ -1591,6 +1611,7 @@ async def get_financial_events(
             totals[k] += bucket[k]
     for k in totals:
         totals[k] = round(totals[k] + unattributed[k], 2)
+    placement_window_total = round(float(totals.get("inbound_placement") or 0), 2)
 
     return {
         "by_sku": {sku: {k: round(v, 2) for k, v in bucket.items()}
@@ -1598,6 +1619,7 @@ async def get_financial_events(
         "unattributed": {k: round(v, 2) for k, v in unattributed.items()},
         "removal_by_order": {k: round(v, 2) for k, v in removal_by_order.items()},
         "totals": totals,
+        "placement_window_total": placement_window_total,
         "pages": pages,
         "posted_after": posted_after,
     }

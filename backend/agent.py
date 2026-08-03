@@ -1071,6 +1071,7 @@ async def compute_profitability_data(
     placement_meta: dict[str, object] = {"source": "none", "sku_count": 0}
     placement_blended = False
     placement_window_total = 0.0
+    fin_placement_window_total = 0.0
     aged_charges_by_sku: dict[str, float] | None = {}
     aged_charges_meta: dict = {"source": None, "access_denied": False}
     aged_report_total = 0.0
@@ -1169,36 +1170,42 @@ async def compute_profitability_data(
             warnings.append(_sp_report_warning("Storage", e))
 
     async def _load_finances():
-        nonlocal fin_by_sku, unattributed_fees
+        nonlocal fin_by_sku, unattributed_fees, fin_placement_window_total
         # Finances fees (low inv, placement settlements) often post weeks
         # after the related sale/inbound event — look back 45 days before
         # the window for those. But refunds must be bounded to the actual
         # window: counting May's refund events against a June 1–10 window
         # inflates return_processing_fee and returned_units for pre-window
         # sales that the seller doesn't see as returns "in" the window.
+        # Placement is also bounded to the profitability PostedDate window
+        # so July UI gets July posts only (not the 45-day lookback).
         fin_posted_after = utc_instant_to_iso_z(start_dt - timedelta(days=45))
         refund_posted_after = utc_instant_to_iso_z(start_dt)
+        placement_posted_after = utc_instant_to_iso_z(start_dt)
+        placement_posted_before = created_before
         try:
             fin = await amazon_sp.get_financial_events(
                 posted_after=fin_posted_after,
                 posted_before=created_before,
                 paginate=True,
                 refund_posted_after=refund_posted_after,
+                placement_posted_after=placement_posted_after,
+                placement_posted_before=placement_posted_before,
             )
             fin_by_sku = fin.get("by_sku") or {}
             unattributed_fees = fin.get("unattributed") or unattributed_fees
+            fin_placement_window_total = float(fin.get("placement_window_total") or 0)
         except Exception as e:
             warnings.append(_sp_report_warning("Finances", e))
 
     async def _load_returns():
-        # Returns come from Aurora's Order.customerReturns (populated by
-        # customerReturnsService from GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA),
-        # NOT from Finances. Bounded by the ORDER's purchaseDate — matches
-        # the same sale-window the rest of the tab uses, so a return counts
-        # in the window the item was SOLD (regardless of when the customer
-        # actually returned it). `orderItems[].referralFee` gives the exact
-        # referral Amazon charged at sale time, so 0.20 × that × units is
-        # per-order-line accurate rather than a window average.
+        # Returns come from Aurora orders — same sources as the Returned Orders
+        # tab: Order.customerReturns (FBA physical returns) AND Order.refunds
+        # (Finances "Refund applied", including returnless refunds). Bounded by
+        # the ORDER's purchaseDate — matches the same sale-window the rest of
+        # the tab uses. `orderItems[].referralFee` gives the exact referral
+        # Amazon charged at sale time, so 0.20 × that × units is per-order-line
+        # accurate rather than a window average.
         nonlocal returns_by_sku
         if not use_db:
             return
@@ -1209,12 +1216,17 @@ async def compute_profitability_data(
         except Exception as e:
             warnings.append(_sp_report_warning("Customer returns (Aurora)", e))
 
+    # Started before placement so placement can await Finances for its
+    # PostedDate-window fallback without a second Finances walk.
+    finances_task = _fire_bg(_load_finances())
+
     async def _load_placement():
         # Prefer Aurora's fbainboundplacementfees dated events filtered by the
-        # profitability window (same Event Date filter as Seller Central).
-        # When dated events exist, placement is account-level BLENDED: do NOT
-        # allocate by SKU/ASIN — totals use the report window sum only.
-        # Fall back to fee_rate × units sold only when no dated events exist.
+        # profitability window (Transaction/Posted date from API sync).
+        # Only blend from stored events when they MATCH the filter. If older
+        # events exist but none match, fall back to live Finances PostedDate-
+        # window blended total — never lock $0 just because unrelated months
+        # are stored. Rate × units only when neither has data.
         nonlocal placement_charges_by_sku, placement_charges_by_asin
         nonlocal placement_blended, placement_window_total
         nonlocal placement_avg_per_unit, placement_avg_per_asin
@@ -1228,26 +1240,59 @@ async def compute_profitability_data(
                 ) = await aurora_data.fba_inbound_placement_charges_for_window(
                     require_user(), start_dt, end_dt, marketplace_tz=mp_tz,
                 )
-                # Any stored dated events ⇒ always use report window total
-                # (even if $0 for this filter). Never fall back to rate × units,
-                # which disagrees with Seller Central's Event Date totals.
-                if int(win_meta.get("event_count") or 0) > 0:
+                matched_events = int(win_meta.get("matched_events") or 0)
+                placement_meta["matched_events"] = matched_events
+                placement_meta["event_count"] = win_meta.get("event_count")
+                placement_meta["window_start"] = win_meta.get("window_start")
+                placement_meta["window_end"] = win_meta.get("window_end")
+                if matched_events > 0:
                     placement_blended = True
                     placement_window_total = float(win_meta.get("window_total") or 0)
                     placement_meta["source"] = "aurora_events_window"
                     placement_meta["blended"] = True
-                    placement_meta["matched_events"] = win_meta.get("matched_events")
-                    placement_meta["event_count"] = win_meta.get("event_count")
                     placement_meta["window_total"] = placement_window_total
-                    placement_meta["window_start"] = win_meta.get("window_start")
-                    placement_meta["window_end"] = win_meta.get("window_end")
                     placement_meta["sku_count"] = 0
                 else:
-                    placement_from_aurora = await aurora_data.fba_inbound_placement_by_sku(
-                        require_user(),
-                    )
+                    try:
+                        await finances_task
+                    except Exception:
+                        pass
+                    if fin_placement_window_total > 0:
+                        placement_blended = True
+                        placement_window_total = fin_placement_window_total
+                        placement_meta["source"] = "finances_posted_window"
+                        placement_meta["blended"] = True
+                        placement_meta["window_total"] = placement_window_total
+                        placement_meta["sku_count"] = 0
+                    else:
+                        placement_from_aurora = await aurora_data.fba_inbound_placement_by_sku(
+                            require_user(),
+                        )
             except Exception as e:
                 warnings.append(_sp_report_warning("Inbound placement (Aurora)", e))
+                try:
+                    await finances_task
+                except Exception:
+                    pass
+                if fin_placement_window_total > 0:
+                    placement_blended = True
+                    placement_window_total = fin_placement_window_total
+                    placement_meta["source"] = "finances_posted_window"
+                    placement_meta["blended"] = True
+                    placement_meta["window_total"] = placement_window_total
+                    placement_meta["sku_count"] = 0
+        else:
+            try:
+                await finances_task
+            except Exception:
+                pass
+            if fin_placement_window_total > 0:
+                placement_blended = True
+                placement_window_total = fin_placement_window_total
+                placement_meta["source"] = "finances_posted_window"
+                placement_meta["blended"] = True
+                placement_meta["window_total"] = placement_window_total
+                placement_meta["sku_count"] = 0
 
         placement_cache_meta = await get_placement_fee_cache(max_age_hours=24)
         try:
@@ -1585,7 +1630,7 @@ async def compute_profitability_data(
 
     other_tasks: dict[str, asyncio.Task] = {
         "storage": storage_task,
-        "finances": _fire_bg(_load_finances()),
+        "finances": finances_task,
         "returns": _fire_bg(_load_returns()),
         "placement": _fire_bg(_load_placement()),
         "aged inventory": _fire_bg(_load_aged()),
@@ -1952,29 +1997,34 @@ async def compute_profitability_data(
         "(same rules as the Aurora dashboard).",
     ]
     if placement_blended:
-        caveats.append(
-            "Inbound placement is BLENDED (not allocated by SKU/ASIN). The Totals "
-            "row is the sum of Seller Central Total charge for Transaction dates "
-            "inside the selected filter — same as SC Event Date on FBA inbound "
-            "placement service fees."
-        )
-        if float(placement_window_total or 0) <= 0:
-            ev_range = ""
+        src = placement_meta.get("source")
+        if src == "finances_posted_window":
+            caveats.append(
+                "Inbound placement is BLENDED from Finances (PostedDate in the "
+                "selected filter). Aurora's API-synced dated charge events had no "
+                "rows in this window — Totals follow Payments → Transactions timing."
+            )
+        else:
+            caveats.append(
+                "Inbound placement is BLENDED (not allocated by SKU/ASIN). The Totals "
+                "row sums API-synced placement charges whose Transaction/Posted "
+                "date falls inside the selected filter."
+            )
+        if float(placement_window_total or 0) <= 0 and src != "finances_posted_window":
             ws = placement_meta.get("window_start")
             we = placement_meta.get("window_end")
             n_ev = placement_meta.get("event_count") or 0
             caveats.append(
-                f"Inbound placement Totals is $0 because no Seller Central placement "
-                f"charges have a Transaction date in {ws} → {we}. "
-                f"({n_ev} charge rows are loaded for this account, but none fall "
-                f"in this filter — try a month that appears on the SC placement "
-                f"report, e.g. June 2026.)"
+                f"Inbound placement Totals is $0 because no API-synced placement "
+                f"charges have a date in {ws} → {we}. "
+                f"({n_ev} charge rows are loaded — run inventory sync so Finances/"
+                f"report data refreshes, or pick a month with posted placement fees.)"
             )
     else:
         caveats.append(
-            "Inbound placement uses fee_rate × units sold when dated Seller Central "
-            "charge events are not available for this account (upload the FBA "
-            "inbound placement service fees CSV, or wait for SP-API report access)."
+            "Inbound placement uses fee_rate × units sold when dated API charge "
+            "events are not available yet for this account (inventory sync pulls "
+            "them from Finances or the SP-API placement report)."
         )
     caveats.extend([
         "Storage uses GET_FBA_STORAGE_FEE_CHARGES_DATA for the calendar month(s) "
