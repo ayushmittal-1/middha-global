@@ -8,6 +8,7 @@ fields trigger live Amazon API calls via data_resolver.
 
 from __future__ import annotations
 
+import html
 import os
 import re
 from collections import defaultdict
@@ -230,78 +231,109 @@ async def fba_returns_by_sku(
     start: datetime,
     end: datetime,
 ) -> dict[str, dict]:
-    """Per-SKU customer returns for orders PURCHASED in [start, end],
-    using the ORDER's own referral fee (per line item) as the
-    refunded_referral input.
+    """Per-SKU returned/refunded units for orders PURCHASED in [start, end].
 
-    Bound by `purchaseDate`, not `customerReturns.returnDate`: the
-    Profitability tab treats a window as "orders placed in this window",
-    so a return of one of those orders belongs to the same window even
-    if the customer returned it later (or hasn't yet). Returns of
-    earlier orders don't count.
+    Matches the Aurora Returned Orders tab:
+      - physical FBA returns (`customerReturns` / hasCustomerReturn)
+      - Finances refunds (`refunds` / hasRefund), including returnless refunds
+        that never appear in the FBA Customer Returns report
 
-    Aurora's customerReturnsService populates Order.customerReturns from
-    GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA, and orderItems[].referralFee
-    carries the actual Amazon-charged referral. So:
+    Bound by `purchaseDate` (same sale-window as the rest of Profitability),
+    not return/refund date. For an order that has BOTH a physical return and a
+    refund for the same SKU, units are counted once (max of the two) so the
+    20% return-processing fee is not double-charged.
 
-        refunded_referral += (referralFee.amount / quantityOrdered) × qty_returned
+    Referral base uses the order line's own referralFee:
 
-    Returns {sku: {returned_units, refunded_referral, asin}}. Empty dict
-    when the seller has no returns for orders purchased in the window.
+        refunded_referral += (referralFee.amount / quantityOrdered) × qty
+
+    Returns {sku: {returned_units, refunded_referral, asin}}.
     """
     seller_id = ObjectId(str(user["_id"]))
-    pipeline = [
-        {"$match": {
+    cursor = _db().orders.find(
+        {
             "sellerId": seller_id,
-            "hasCustomerReturn": True,
             "purchaseDate": {"$gte": start, "$lte": end},
-        }},
-        {"$unwind": "$customerReturns"},
-        # Find the orderItem with a matching seller SKU on the same order —
-        # that carries the referralFee we want.
-        {"$addFields": {
-            "matchingItem": {
-                "$first": {
-                    "$filter": {
-                        "input": "$orderItems",
-                        "as": "it",
-                        "cond": {"$eq": ["$$it.sellerSku", "$customerReturns.sku"]},
-                    }
-                }
-            }
-        }},
-        {"$addFields": {
-            "referralPerUnit": {
-                "$cond": [
-                    {"$gt": [{"$ifNull": ["$matchingItem.quantityOrdered", 0]}, 0]},
-                    {"$divide": [
-                        {"$ifNull": ["$matchingItem.referralFee.amount", 0]},
-                        "$matchingItem.quantityOrdered",
-                    ]},
-                    0,
-                ]
-            },
-            "returnedUnits": {"$ifNull": ["$customerReturns.quantity", 0]},
-        }},
-        {"$group": {
-            "_id": "$customerReturns.sku",
-            "returned_units": {"$sum": "$returnedUnits"},
-            "refunded_referral": {
-                "$sum": {"$multiply": ["$referralPerUnit", "$returnedUnits"]}
-            },
-            "asin": {"$first": "$customerReturns.asin"},
-        }},
-    ]
+            "$or": [
+                {"hasCustomerReturn": True},
+                {"hasRefund": True},
+            ],
+        },
+        {
+            "orderItems": 1,
+            "customerReturns": 1,
+            "refunds": 1,
+        },
+    )
+
     out: dict[str, dict] = {}
-    async for doc in _db().orders.aggregate(pipeline):
-        sku = (doc.get("_id") or "").strip()
-        if not sku:
-            continue
-        out[sku] = {
-            "returned_units": int(doc.get("returned_units") or 0),
-            "refunded_referral": abs(float(doc.get("refunded_referral") or 0.0)),
-            "asin": doc.get("asin"),
+    async for order in cursor:
+        items = list(order.get("orderItems") or [])
+        items_by_sku = {
+            html.unescape(str(it.get("sellerSku") or "")).strip(): it
+            for it in items
+            if str(it.get("sellerSku") or "").strip()
         }
+        primary = items[0] if items else {}
+
+        return_units: dict[str, int] = {}
+        refund_units: dict[str, int] = {}
+        asin_by_sku: dict[str, str] = {}
+
+        for row in order.get("customerReturns") or []:
+            sku = html.unescape(str(row.get("sku") or "")).strip()
+            if not sku:
+                sku = html.unescape(str(primary.get("sellerSku") or "")).strip()
+            if not sku:
+                continue
+            qty = int(row.get("quantity") or 0)
+            if qty <= 0:
+                continue
+            return_units[sku] = return_units.get(sku, 0) + qty
+            if row.get("asin"):
+                asin_by_sku[sku] = str(row["asin"])
+
+        for row in order.get("refunds") or []:
+            sku = html.unescape(str(row.get("sku") or "")).strip()
+            if not sku:
+                sku = html.unescape(str(primary.get("sellerSku") or "")).strip()
+            if not sku:
+                continue
+            qty = int(row.get("quantity") or 0)
+            if qty <= 0:
+                continue
+            refund_units[sku] = refund_units.get(sku, 0) + qty
+            if row.get("asin") and sku not in asin_by_sku:
+                asin_by_sku[sku] = str(row["asin"])
+
+        for sku in set(return_units) | set(refund_units):
+            # Same unit often appears as both an FBA return and a Finances refund.
+            qty = max(return_units.get(sku, 0), refund_units.get(sku, 0))
+            if qty <= 0:
+                continue
+
+            item = items_by_sku.get(sku) or primary
+            ordered = float(item.get("quantityOrdered") or 0)
+            referral_total = float((item.get("referralFee") or {}).get("amount") or 0)
+            referral_per_unit = (referral_total / ordered) if ordered > 0 else 0.0
+
+            entry = out.setdefault(
+                sku,
+                {"returned_units": 0, "refunded_referral": 0.0, "asin": None},
+            )
+            entry["returned_units"] += qty
+            entry["refunded_referral"] += referral_per_unit * qty
+            if not entry["asin"]:
+                entry["asin"] = (
+                    asin_by_sku.get(sku)
+                    or item.get("asin")
+                    or None
+                )
+
+    for entry in out.values():
+        entry["returned_units"] = int(entry["returned_units"] or 0)
+        entry["refunded_referral"] = abs(float(entry["refunded_referral"] or 0.0))
+
     return out
 
 
