@@ -1252,6 +1252,7 @@ async def compute_profitability_data(
                     placement_meta["blended"] = True
                     placement_meta["window_total"] = placement_window_total
                     placement_meta["sku_count"] = 0
+                    return
                 else:
                     try:
                         await finances_task
