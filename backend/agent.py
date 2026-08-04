@@ -1802,17 +1802,17 @@ async def compute_profitability_data(
         # categories; matches Amazon's standard FBA Returns Processing
         # Fee rate card.
         #
-        # Source: Aurora's Order.customerReturns joined against the same
-        # order's orderItems.referralFee (returned to us as
-        # `refunded_referral`). Using Aurora is strictly better than the
-        # earlier Finances-refund-events path — customerReturns.returnDate
-        # bounds the count precisely to the seller's actual return window,
-        # and orderItems.referralFee is the exact per-order-line referral
-        # Amazon charged at sale time.
+        # Source: Aurora's Order.customerReturns / Order.refunds joined against
+        # the same order's orderItems.referralFee (returned to us as
+        # `refunded_referral`). Must match by exact seller SKU only — many
+        # replenishment / amazon.gr SKUs share one ASIN, and falling back by
+        # ASIN incorrectly charged Return Proc on never-returned SKUs.
         ret = returns_by_sku.get(sku)
-        if not ret and asin:
+        if not ret and sku:
+            # Case-insensitive SKU match only (no ASIN fallback).
+            sku_l = sku.lower()
             ret = next(
-                (v for v in returns_by_sku.values() if v.get("asin") == asin),
+                (v for k, v in returns_by_sku.items() if str(k).lower() == sku_l),
                 None,
             )
         refunded_referral = float((ret or {}).get("refunded_referral") or 0.0)
