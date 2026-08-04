@@ -327,6 +327,11 @@ async def fba_returns_by_sku(
 
             item = items_by_sku.get(sku) or primary
             ordered = float(item.get("quantityOrdered") or 0)
+            # Cap at units ordered — multiple Finances refund txs can each repeat
+            # ProductContext.quantityShipped (e.g. fee adjustments), which would
+            # otherwise double returned_units above what the customer bought.
+            if ordered > 0:
+                qty = min(qty, int(ordered))
             referral_total = float((item.get("referralFee") or {}).get("amount") or 0)
             referral_per_unit = (referral_total / ordered) if ordered > 0 else 0.0
 
