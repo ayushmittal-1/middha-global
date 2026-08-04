@@ -293,6 +293,10 @@ async def fba_returns_by_sku(
             if row.get("asin"):
                 asin_by_sku[sku] = str(row["asin"])
 
+        # listTransactions often stores DEFERRED then RELEASED for the same
+        # refundId. Summing both would double returned_units — keep the max
+        # qty per (refundId, sku), or sum rows that have no refundId.
+        refund_id_qty: dict[str, int] = {}
         for row in order.get("refunds") or []:
             sku = html.unescape(str(row.get("sku") or "")).strip()
             if not sku:
@@ -302,9 +306,18 @@ async def fba_returns_by_sku(
             qty = int(row.get("quantity") or 0)
             if qty <= 0:
                 continue
-            refund_units[sku] = refund_units.get(sku, 0) + qty
             if row.get("asin") and sku not in asin_by_sku:
                 asin_by_sku[sku] = str(row["asin"])
+
+            rid = str(row.get("refundId") or "").strip()
+            if rid:
+                key = f"{rid}|{sku}"
+                prev = refund_id_qty.get(key, 0)
+                if qty > prev:
+                    refund_units[sku] = refund_units.get(sku, 0) - prev + qty
+                    refund_id_qty[key] = qty
+            else:
+                refund_units[sku] = refund_units.get(sku, 0) + qty
 
         for sku in set(return_units) | set(refund_units):
             # Same unit often appears as both an FBA return and a Finances refund.
