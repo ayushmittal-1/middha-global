@@ -6,7 +6,7 @@ Aurora Orders / Seller Central.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -204,3 +204,58 @@ def utc_instant_to_iso_z(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def inclusive_ymd_bounds(
+    start_dt: datetime,
+    end_dt: datetime,
+    timezone_name: str,
+    display_start: Optional[str] = None,
+    display_end: Optional[str] = None,
+) -> tuple[date, date]:
+    """Inclusive marketplace calendar days for a profitability filter.
+
+    Prefer the FE picker's YYYY-MM-DD (`display_start` / `display_end`) — those
+    are the same Event Date bounds Seller Central uses. Deriving the day from
+    a UTC instant can shift the first/last day near midnight.
+    """
+    tz = ZoneInfo(timezone_name or "UTC")
+    start_parts = parse_ymd_parts(display_start)
+    end_parts = parse_ymd_parts(display_end)
+    if start_parts:
+        start_day = date(start_parts["year"], start_parts["month"], start_parts["day"])
+    else:
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
+        start_day = start_dt.astimezone(tz).date()
+    if end_parts:
+        end_day = date(end_parts["year"], end_parts["month"], end_parts["day"])
+    else:
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        end_day = end_dt.astimezone(tz).date()
+    if end_day < start_day:
+        end_day = start_day
+    return start_day, end_day
+
+
+def marketplace_day_start_utc(day: date, timezone_name: str) -> datetime:
+    """00:00:00 on `day` in marketplace TZ, as UTC."""
+    return zoned_time_to_utc(
+        {
+            "year": day.year,
+            "month": day.month,
+            "day": day.day,
+            "hour": 0,
+            "minute": 0,
+            "second": 0,
+            "microsecond": 0,
+        },
+        timezone_name or "UTC",
+    )
+
+
+def marketplace_day_end_exclusive_utc(day: date, timezone_name: str) -> datetime:
+    """First instant AFTER `day` in marketplace TZ (Amazon PostedBefore exclusive)."""
+    next_day = day + timedelta(days=1)
+    return marketplace_day_start_utc(next_day, timezone_name)
