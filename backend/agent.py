@@ -21,6 +21,7 @@ from aurora_data import aurora_db_enabled
 import data_resolver
 from auth import require_user
 from marketplace_timezone import (
+    inclusive_ymd_bounds,
     parse_date_range_for_query,
     parse_ymd_parts,
     resolve_dashboard_timezone,
@@ -965,6 +966,21 @@ async def compute_profitability_data(
     if not display_end:
         display_end = end_dt.astimezone(ZoneInfo(mp_tz)).date().isoformat()
 
+    # Placement Finances / report Transaction date bounds: picker calendar
+    # days as UTC midnights (matches Amazon placement-fee report Transaction
+    # date column — NOT marketplace Event Date). PostedBefore is exclusive.
+    place_start_day, place_end_day = inclusive_ymd_bounds(
+        start_dt, end_dt, mp_tz, display_start, display_end,
+    )
+    placement_posted_after = f"{place_start_day.isoformat()}T00:00:00Z"
+    placement_posted_before = utc_instant_to_iso_z(
+        datetime.combine(
+            place_end_day + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        ),
+    )
+
     use_db = aurora_db_enabled()
     partial_warning: str | None = None
     na_price_rows: list[dict] = []
@@ -1181,8 +1197,6 @@ async def compute_profitability_data(
         # so July UI gets July posts only (not the 45-day lookback).
         fin_posted_after = utc_instant_to_iso_z(start_dt - timedelta(days=45))
         refund_posted_after = utc_instant_to_iso_z(start_dt)
-        placement_posted_after = utc_instant_to_iso_z(start_dt)
-        placement_posted_before = created_before
         try:
             fin = await amazon_sp.get_financial_events(
                 posted_after=fin_posted_after,
@@ -1239,10 +1253,13 @@ async def compute_profitability_data(
                     win_meta,
                 ) = await aurora_data.fba_inbound_placement_charges_for_window(
                     require_user(), start_dt, end_dt, marketplace_tz=mp_tz,
+                    display_start=display_start, display_end=display_end,
                 )
                 matched_events = int(win_meta.get("matched_events") or 0)
                 placement_meta["matched_events"] = matched_events
                 placement_meta["event_count"] = win_meta.get("event_count")
+                placement_meta["charge_count"] = win_meta.get("charge_count")
+                placement_meta["totals_from"] = win_meta.get("totals_from")
                 placement_meta["window_start"] = win_meta.get("window_start")
                 placement_meta["window_end"] = win_meta.get("window_end")
                 if matched_events > 0:
@@ -1254,13 +1271,45 @@ async def compute_profitability_data(
                     placement_meta["sku_count"] = 0
                     return
                 else:
+                    # Shared Finances walk uses start-45d + max_pages=40, so on
+                    # busy accounts it never reaches the selected month's
+                    # placement posts (asglobal March needs ~70 pages in-window).
+                    # Do an exact-window walk so BLENDED totals aren't $0.
                     try:
                         await finances_task
                     except Exception:
                         pass
-                    if fin_placement_window_total > 0:
+                    exact_placement_total = 0.0
+                    if fin_placement_window_total <= 0:
+                        try:
+                            fin_exact = await amazon_sp.get_financial_events(
+                                posted_after=placement_posted_after,
+                                posted_before=placement_posted_before,
+                                paginate=True,
+                                max_pages=200,
+                                placement_posted_after=placement_posted_after,
+                                placement_posted_before=placement_posted_before,
+                            )
+                            exact_placement_total = float(
+                                fin_exact.get("placement_window_total") or 0
+                            )
+                            placement_meta["finances_exact_window_pages"] = (
+                                fin_exact.get("pages")
+                            )
+                        except Exception as e:
+                            warnings.append(
+                                _sp_report_warning(
+                                    "Inbound placement (Finances window)", e,
+                                )
+                            )
+                    use_placement_total = (
+                        fin_placement_window_total
+                        if fin_placement_window_total > 0
+                        else exact_placement_total
+                    )
+                    if use_placement_total > 0:
                         placement_blended = True
-                        placement_window_total = fin_placement_window_total
+                        placement_window_total = use_placement_total
                         placement_meta["source"] = "finances_posted_window"
                         placement_meta["blended"] = True
                         placement_meta["window_total"] = placement_window_total
@@ -1824,7 +1873,8 @@ async def compute_profitability_data(
 
         # Inbound placement: when dated Seller Central events exist, do NOT
         # allocate by SKU/ASIN — rows show BLENDED and the Totals row carries
-        # the report window sum (same Event Date filter as SC). Otherwise
+        # the report window sum (same Transaction date filter as the Amazon
+        # placement fee report / CSV). Otherwise
         # fall back to fee_rate × units sold / Finances SKU attribution.
         if placement_blended:
             inbound_placement_fee = 0.0
@@ -1932,8 +1982,8 @@ async def compute_profitability_data(
         totals["removal_fee"] += removal_fee
         totals["net"] += net
 
-    # Blended placement: rows carry $0 / BLENDED; apply the Seller Central
-    # report window total once on account totals (matches SC Event Date sum).
+    # Blended placement: rows carry $0 / BLENDED; apply the Amazon placement
+    # fee report window total once on account totals (Transaction date sum).
     if placement_blended:
         fee_r = round(float(placement_window_total), 2)
         totals["inbound_placement_fee"] = fee_r
@@ -2001,22 +2051,22 @@ async def compute_profitability_data(
         src = placement_meta.get("source")
         if src == "finances_posted_window":
             caveats.append(
-                "Inbound placement is BLENDED from Finances (PostedDate in the "
-                "selected filter). Aurora's API-synced dated charge events had no "
-                "rows in this window — Totals follow Payments → Transactions timing."
+                "Inbound placement is BLENDED from Amazon Finances for this date "
+                "filter — Totals match the placement-fee report Transaction date "
+                "(UTC calendar day of each charge). SKU rows show BLENDED."
             )
         else:
             caveats.append(
-                "Inbound placement is BLENDED (not allocated by SKU/ASIN). The Totals "
-                "row sums API-synced placement charges whose Transaction/Posted "
-                "date falls inside the selected filter."
+                "Inbound placement is BLENDED to match Amazon (placement-fee report "
+                "Total charge sum for the Transaction date filter). SKU rows show "
+                "BLENDED; see Totals / Inbound Placement."
             )
         if float(placement_window_total or 0) <= 0 and src != "finances_posted_window":
             ws = placement_meta.get("window_start")
             we = placement_meta.get("window_end")
             n_ev = placement_meta.get("event_count") or 0
             caveats.append(
-                f"Inbound placement Totals is $0 because no API-synced placement "
+                f"Inbound placement Totals is $0 because no Amazon placement "
                 f"charges have a date in {ws} → {we}. "
                 f"({n_ev} charge rows are loaded — run inventory sync so Finances/"
                 f"report data refreshes, or pick a month with posted placement fees.)"

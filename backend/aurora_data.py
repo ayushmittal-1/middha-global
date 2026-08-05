@@ -12,7 +12,7 @@ import html
 import os
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from bson import ObjectId
@@ -280,6 +280,10 @@ async def fba_returns_by_sku(
         refund_units: dict[str, int] = {}
         asin_by_sku: dict[str, str] = {}
 
+        # One physical unit == one license-plate-number. Amazon can emit multiple
+        # disposition/status rows for the same LPN; counting each would inflate
+        # Return Proc. Rows without LPN are summed as before.
+        seen_lpn: set[str] = set()
         for row in order.get("customerReturns") or []:
             sku = html.unescape(str(row.get("sku") or "")).strip()
             if not sku:
@@ -289,6 +293,15 @@ async def fba_returns_by_sku(
             qty = int(row.get("quantity") or 0)
             if qty <= 0:
                 continue
+            lpn = str(
+                row.get("licensePlateNumber")
+                or row.get("license_plate_number")
+                or ""
+            ).strip()
+            if lpn:
+                if lpn in seen_lpn:
+                    continue
+                seen_lpn.add(lpn)
             return_units[sku] = return_units.get(sku, 0) + qty
             if row.get("asin"):
                 asin_by_sku[sku] = str(row["asin"])
@@ -429,24 +442,82 @@ async def fba_inbound_placement_by_sku(user: dict) -> Optional[dict[str, dict]]:
 
 
 def _parse_placement_tx_date(raw: str | None) -> datetime | None:
+    """Parse a placement event timestamp.
+
+    Finances / SP-API PostedDate values are UTC (ISO, often without a trailing
+    Z). Date-only strings from Seller Central CSV are handled separately by
+    `_placement_event_calendar_day` — do not use this for YYYY-MM-DD alone.
+    """
     if not raw:
         return None
     s = str(raw).strip().replace("/", "-")
     if " " in s and "T" not in s:
         s = s.replace(" ", "T", 1)
-    # Truncate fractional seconds / timezone noise for fromisoformat
-    if len(s) >= 19:
-        s = s[:19]
+    # Preserve trailing Z / offset so fromisoformat keeps the correct tz.
     try:
-        dt = datetime.fromisoformat(s)
+        if s.endswith("Z"):
+            dt = datetime.fromisoformat(s[:-1] + "+00:00")
+        else:
+            dt = datetime.fromisoformat(s)
     except ValueError:
         try:
-            dt = datetime.strptime(s[:10], "%Y-%m-%d")
+            if len(s) >= 19:
+                dt = datetime.fromisoformat(s[:19])
+            else:
+                dt = datetime.strptime(s[:10], "%Y-%m-%d")
         except ValueError:
             return None
     if dt.tzinfo is None:
+        # Naive timed values from Finances join are UTC wall clocks.
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _placement_event_calendar_day(raw, tz=None) -> date | None:
+    """Calendar day matching the Amazon placement-fee report Transaction date.
+
+    Seller Central's FBA Inbound Placement Fee report / CSV filters on
+    Transaction date using the UTC calendar day of the charge (the date
+    digits of PostedDate / report Transaction date) — NOT marketplace
+    Event Date. Example: ``2026-02-01T05:13:42Z`` is still Feb 1 on the
+    report even though it is Jan 31 evening in America/Los_Angeles.
+
+    - Date-only (YYYY-MM-DD): use as written (CSV Transaction date).
+    - Midnight wall clock without Z/offset: calendar day as written.
+    - Timed ISO (Finances PostedDate): UTC calendar day.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().replace("/", "-")
+    if not s:
+        return None
+    # Pure calendar day from Seller Central CSV — do not shift by timezone.
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        try:
+            return date.fromisoformat(s)
+        except ValueError:
+            return None
+
+    # Local midnight without explicit offset → calendar day as written.
+    has_explicit_tz = (
+        s.endswith("Z") or s.endswith("z")
+        or (len(s) > 19 and ("+" in s[19:] or s[19:].startswith("-")))
+    )
+    midnight = re.match(
+        r"^(\d{4}-\d{2}-\d{2})[T ]00:00:00(\.\d+)?$", s,
+    )
+    if midnight and not has_explicit_tz:
+        try:
+            return date.fromisoformat(midnight.group(1))
+        except ValueError:
+            return None
+
+    tx = _parse_placement_tx_date(s)
+    if tx is None:
+        return None
+    # Match Amazon report Transaction date (= UTC date of the charge).
+    _ = tz  # retained for call-site compat; report does not use marketplace TZ
+    return tx.astimezone(timezone.utc).date()
 
 
 async def fba_inbound_placement_charges_for_window(
@@ -454,17 +525,26 @@ async def fba_inbound_placement_charges_for_window(
     start_dt: datetime,
     end_dt: datetime,
     marketplace_tz: str | None = None,
+    display_start: str | None = None,
+    display_end: str | None = None,
 ) -> tuple[dict[str, float], dict[str, float], dict]:
-    """Sum Seller Central placement charges whose Transaction date falls in
-    the profitability filter — same Event Date window as Seller Central.
+    """Sum placement charges whose report Transaction date falls in the
+    profitability filter — same filter as the Amazon placement fee report.
 
-    Transaction dates from SC have no timezone; compare calendar days in the
-    marketplace timezone (same day boundaries as Orders / display_start/end).
+    Attribute each charge by the report Transaction date (UTC calendar day
+    of PostedDate / CSV Transaction date). Do NOT convert to marketplace
+    Event Date — that under-counts months vs the SC Excel Total charge sum
+    (e.g. andexports Feb: report $302.22 vs Pacific Event Date $248.22).
+
+    When `display_start` / `display_end` (YYYY-MM-DD from the date picker)
+    are provided, those exact calendar days are the inclusive bounds.
 
     Returns (by_sku_fee_total, by_asin_fee_total, meta).
     ASIN map only includes events that could not be resolved to a seller SKU
     (avoids double-counting when both maps are used).
     """
+    from marketplace_timezone import inclusive_ymd_bounds
+
     seller_id = ObjectId(str(user["_id"]))
     doc = await _db().fbainboundplacementfees.find_one({"sellerId": seller_id})
     meta: dict = {"source": None, "event_count": 0, "matched_events": 0}
@@ -472,8 +552,19 @@ async def fba_inbound_placement_charges_for_window(
         return {}, {}, meta
 
     meta["source"] = doc.get("source") or "unknown"
-    events = doc.get("events") or []
-    if not events:
+    # Prefer Amazon-authoritative `charges` (SC Total charge / Finances tx
+    # amounts) for BLENDED window totals so Aurora matches Seller Central.
+    # Fall back to SKU-split `events` for legacy docs.
+    charge_rows = doc.get("charges") or []
+    event_rows = doc.get("events") or []
+    if charge_rows:
+        total_rows = charge_rows
+        meta["totals_from"] = "amazon_charges"
+    else:
+        total_rows = event_rows
+        meta["totals_from"] = "events_fallback"
+    events = event_rows  # still used for optional per-SKU maps
+    if not total_rows and not events:
         return {}, {}, meta
 
     if start_dt.tzinfo is None:
@@ -484,42 +575,72 @@ async def fba_inbound_placement_charges_for_window(
     by_sku: dict[str, float] = defaultdict(float)
     by_asin: dict[str, float] = defaultdict(float)
     meta["event_count"] = len(events)
+    meta["charge_count"] = len(charge_rows)
     window_total = 0.0
+    matched_charges = 0
 
-    # Marketplace-local calendar days (matches display_start / display_end).
-    try:
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo(marketplace_tz) if marketplace_tz else timezone.utc
-    except Exception:
-        tz = timezone.utc
-    start_day = start_dt.astimezone(tz).date()
-    end_day = end_dt.astimezone(tz).date()
+    # Inclusive picker calendar days (= report Transaction date filter).
+    start_day, end_day = inclusive_ymd_bounds(
+        start_dt, end_dt, marketplace_tz or "UTC", display_start, display_end,
+    )
     meta["window_start"] = start_day.isoformat()
     meta["window_end"] = end_day.isoformat()
+    meta["date_basis"] = "report_transaction_date_utc"
+    meta["bounds_from_display"] = bool(
+        display_start and display_end
+        and len(str(display_start).strip()) == 10
+        and len(str(display_end).strip()) == 10
+    )
 
+    # BLENDED Totals: sum Amazon charge rows in the report Transaction window.
+    # Collapse SKU-split rows that share shipment_id + transaction_date into one
+    # charge first (seed/legacy docs stored per-SKU event rows as `charges`).
+    # Sum of shares == Amazon shipment charge; collapsing prevents double-count
+    # if shipment-level and SKU-level rows ever coexist.
+    collapsed: dict[tuple, float] = {}
+    for row in total_rows:
+        if not isinstance(row, dict):
+            continue
+        tx_raw = row.get("transaction_date")
+        tx_day = _placement_event_calendar_day(tx_raw)
+        if tx_day is None:
+            continue
+        if tx_day < start_day or tx_day > end_day:
+            continue
+        fee = round(float(row.get("fee_total") or 0), 2)
+        if fee <= 0:
+            continue
+        ship = (row.get("shipment_id") or row.get("amazon_shipment_id") or "").strip()
+        key = (ship or id(row), str(tx_raw or ""), tx_day.isoformat())
+        collapsed[key] = round(collapsed.get(key, 0.0) + fee, 2)
+
+    for fee in collapsed.values():
+        matched_charges += 1
+        window_total = round(window_total + fee, 2)
+
+    meta["matched_events"] = matched_charges
+    meta["window_total"] = round(window_total, 2)
+    meta["collapsed_charge_keys"] = len(collapsed)
+
+    # Optional per-SKU map from split events (not used for BLENDED Totals).
     for ev in events:
         if not isinstance(ev, dict):
             continue
-        tx = _parse_placement_tx_date(ev.get("transaction_date"))
-        if tx is None:
+        tx_day = _placement_event_calendar_day(ev.get("transaction_date"))
+        if tx_day is None:
             continue
-        # SC Transaction date is marketplace-local wall time without TZ.
-        tx_day = tx.replace(tzinfo=None).date()
         if tx_day < start_day or tx_day > end_day:
             continue
-        fee = float(ev.get("fee_total") or 0)
+        fee = round(float(ev.get("fee_total") or 0), 2)
         if fee <= 0:
             continue
-        meta["matched_events"] += 1
-        window_total += fee
         sku = (ev.get("sku") or "").strip()
         asin = (ev.get("asin") or "").strip().upper()
         if sku:
-            by_sku[sku] += fee
+            by_sku[sku] = round(by_sku[sku] + fee, 2)
         elif asin:
-            by_asin[asin] += fee
+            by_asin[asin] = round(by_asin[asin] + fee, 2)
 
-    meta["window_total"] = round(window_total, 2)
     return (
         {k: round(v, 2) for k, v in by_sku.items()},
         {k: round(v, 2) for k, v in by_asin.items()},

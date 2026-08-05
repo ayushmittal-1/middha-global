@@ -926,6 +926,118 @@
       display: inline-block;
       padding: 4px 0;
     }
+    #profit-columns-wrap {
+      position: relative;
+      align-self: flex-end;
+    }
+    #profit-toolbar #profit-columns-btn {
+      background: #f1f5f9;
+      color: #0f172a;
+      border: 1px solid #cbd5e1;
+    }
+    #profit-columns-panel {
+      display: none;
+      position: absolute;
+      right: 0;
+      top: calc(100% + 6px);
+      z-index: 40;
+      width: 280px;
+      max-height: min(420px, 70vh);
+      overflow: auto;
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      box-shadow: 0 12px 32px rgba(15, 23, 42, 0.14);
+      padding: 10px;
+    }
+    #profit-columns-panel.open { display: block; }
+    #profit-columns-panel .profit-col-panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #0f172a;
+    }
+    #profit-columns-panel .profit-col-reset {
+      padding: 4px 8px;
+      font-size: 11px;
+      background: transparent !important;
+      color: #1e8bff !important;
+      border: none !important;
+      cursor: pointer;
+      box-shadow: none !important;
+    }
+    #profit-columns-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    #profit-columns-list li {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      cursor: grab;
+      font-size: 12px;
+      color: #0f172a;
+      user-select: none;
+    }
+    #profit-columns-list li.dragging { opacity: 0.55; cursor: grabbing; }
+    #profit-columns-list li.drag-over {
+      outline: 1px dashed #93c5fd;
+      background: #eff6ff;
+    }
+    #profit-columns-list .profit-col-handle {
+      color: #94a3b8;
+      font-size: 14px;
+      line-height: 1;
+      cursor: grab;
+    }
+    #profit-columns-list label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: 1;
+      cursor: pointer;
+      text-transform: none;
+      letter-spacing: 0;
+      font-size: 12px;
+      color: inherit;
+    }
+    #profit-table-wrap thead th[draggable="true"] { cursor: grab; }
+    #profit-table-wrap thead th.profit-th-dragging { opacity: 0.5; }
+    #profit-table-wrap thead th.profit-th-drag-over {
+      box-shadow: inset 3px 0 0 #1e8bff;
+    }
+    body.embedded-in-aurora #profit-toolbar #profit-columns-btn {
+      background: #1e293b;
+      color: #e2e8f0;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
+    body.embedded-in-aurora #profit-columns-panel {
+      background: #1e293b;
+      border-color: rgba(255, 255, 255, 0.12);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+    }
+    body.embedded-in-aurora #profit-columns-panel .profit-col-panel-head { color: #f8fafc; }
+    body.embedded-in-aurora #profit-columns-list li {
+      background: #0f172a;
+      border-color: rgba(255, 255, 255, 0.1);
+      color: #e2e8f0;
+    }
+    body.embedded-in-aurora #profit-columns-list li.drag-over {
+      background: rgba(30, 139, 255, 0.12);
+      outline-color: #1e8bff;
+    }
     #profit-table-wrap tfoot .profit-totals-label {
       font-weight: 700;
       color: #0f172a;
@@ -1831,32 +1943,23 @@
         </label>
         <button id="profit-refresh">Apply</button>
         <input type="text" id="profit-search" placeholder="Filter by SKU or ASIN" style="min-width:180px;padding:4px 8px;font-size:12px;border:1px solid #cbd5e1;border-radius:4px;">
+        <div id="profit-columns-wrap">
+          <button type="button" id="profit-columns-btn" title="Show, hide, and reorder columns">Columns</button>
+          <div id="profit-columns-panel" role="dialog" aria-label="Profitability columns">
+            <div class="profit-col-panel-head">
+              <span>Columns</span>
+              <button type="button" class="profit-col-reset" id="profit-columns-reset">Reset</button>
+            </div>
+            <ul id="profit-columns-list"></ul>
+          </div>
+        </div>
       </div>
       <div id="profit-kpis"></div>
       <div id="profit-caveats"></div>
       <div id="profit-table-wrap" style="overflow-x:auto;">
         <table class="restock profit">
           <thead>
-            <tr>
-              <th>SKU</th>
-              <th title="Amazon Standard Identification Number">ASIN</th>
-              <th class="num">Units</th>
-              <th class="num" title="Revenue ÷ units">Avg Price</th>
-              <th class="num">Revenue</th>
-              <th class="num" title="Selling Price × category referral fee % (Product Fees API)">Referral</th>
-              <th class="num" title="Base FBA fulfillment fee × units — from the same products.fees as the Products page. Products 'FBA Fee' = this column + Fuel.">FBA</th>
-              <th class="num" title="Fuel & inflation surcharge × units — split from Products FBA Fee so FBA + Fuel matches that column.">Fuel</th>
-              <th class="num" title="Seller Central FBA inbound placement service fees — account total for the selected Event/Transaction date filter. Not allocated by SKU (shown as BLENDED).">Inbound Placement</th>
-              <th class="num" title="Low Inventory Level Fee from Finances API (45-day lookback)">Low Inv</th>
-              <th class="num" title="FBA storage report: monthly fee ÷ avg units on hand × units sold">Storage</th>
-              <th class="num" title="Seller Central Aged Inventory Surcharge report: sum of amount-charged per SKU for months in the window">Aged Inv</th>
-              <th class="num" title="Amazon's Ads API doesn't expose per-SKU spend, so ads are blended across the account. See the account-level total in the top 'Ad spend' KPI tile.">Ads</th>
-              <th class="num" title="Product cost + your inbound shipping to Amazon (from your CSV)">COGS</th>
-              <th class="num" title="20% of referral fee on returned/refunded units (Aurora FBA returns + Finances refunds, same as Returned Orders)">Return Proc</th>
-              <th class="num" title="FBA Removal Order Return/Disposal fees from Payments → Transactions (PostedDate in the selected filter)">Removal</th>
-              <th class="num">Net</th>
-              <th class="num">Margin %</th>
-            </tr>
+            <tr id="profit-head-row"></tr>
           </thead>
           <tbody id="profit-body"></tbody>
           <tfoot id="profit-foot"></tfoot>
@@ -3011,17 +3114,429 @@
     campaignsRefreshBtn.addEventListener('click', loadCampaignsPerformance);
 
     // ── Profitability tab ───────────────────────────────
+    const PROFIT_COL_PREFS_KEY = 'aurora.profit.columns.v1';
+    const profitHeadRowEl = document.getElementById('profit-head-row');
+    const profitColumnsBtn = document.getElementById('profit-columns-btn');
+    const profitColumnsPanel = document.getElementById('profit-columns-panel');
+    const profitColumnsList = document.getElementById('profit-columns-list');
+    const profitColumnsReset = document.getElementById('profit-columns-reset');
+    let lastProfitData = null;
+    let profitColumnPrefs = null;
+
+    const profitMoney = (v) => `$${(Number(v) || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+
+    const PROFIT_COLUMNS = [
+      {
+        id: 'sku',
+        label: 'SKU',
+        pinned: true,
+        defaultVisible: true,
+        thClass: '',
+        cell: (r) => {
+          const skuLabel = r.cogs_uploaded
+            ? `<strong>${escapeHtml(r.sku)}</strong>`
+            : `<strong>${escapeHtml(r.sku)}</strong> <span title="No COGS uploaded" style="color:#b35200;">⚠</span>`;
+          return `<td>${skuLabel}</td>`;
+        },
+        total: () => `<td class="profit-totals-label">Totals</td>`,
+      },
+      {
+        id: 'asin',
+        label: 'ASIN',
+        title: 'Amazon Standard Identification Number',
+        defaultVisible: true,
+        cell: (r) => `<td title="ASIN ${escapeHtml(r.asin || '—')}">${escapeHtml(r.asin || '—')}</td>`,
+        total: () => `<td>—</td>`,
+      },
+      {
+        id: 'units',
+        label: 'Units',
+        num: true,
+        defaultVisible: true,
+        cell: (r) => `<td class="num">${r.units}</td>`,
+        total: (_r, t) => `<td class="num">${t.units}</td>`,
+      },
+      {
+        id: 'avg_price',
+        label: 'Avg Price',
+        title: 'Revenue ÷ units',
+        num: true,
+        defaultVisible: true,
+        cell: (r) => `<td class="num"><a href="#" class="profit-price-link" data-sku="${escapeHtml(r.sku)}" title="Click to see every unit's price">${profitMoney(r.avg_price)}</a></td>`,
+        total: () => `<td class="num">—</td>`,
+      },
+      {
+        id: 'revenue',
+        label: 'Revenue',
+        num: true,
+        defaultVisible: true,
+        cell: (r) => `<td class="num">${profitMoney(r.revenue)}</td>`,
+        total: (_r, t) => `<td class="num">${profitMoney(t.revenue)}</td>`,
+      },
+      {
+        id: 'referral',
+        label: 'Referral',
+        title: 'Selling Price × category referral fee % (Product Fees API)',
+        num: true,
+        defaultVisible: true,
+        cell: (r) => `<td class="num">${profitMoney(r.referral_fee)}</td>`,
+        total: (_r, t) => `<td class="num">${profitMoney(t.referral_fee)}</td>`,
+      },
+      {
+        id: 'fba',
+        label: 'FBA',
+        title: "Base FBA fulfillment fee × units — from the same products.fees as the Products page. Products 'FBA Fee' = this column + Fuel.",
+        num: true,
+        defaultVisible: true,
+        cell: (r) => `<td class="num">${profitMoney(r.fba_fee)}</td>`,
+        total: (_r, t) => `<td class="num">${profitMoney(t.fba_fee)}</td>`,
+      },
+      {
+        id: 'fuel',
+        label: 'Fuel',
+        title: 'Fuel & inflation surcharge × units — split from Products FBA Fee so FBA + Fuel matches that column.',
+        num: true,
+        defaultVisible: true,
+        cell: (r) => `<td class="num">${profitMoney(r.fuel_surcharge)}</td>`,
+        total: (_r, t) => `<td class="num">${profitMoney(t.fuel_surcharge)}</td>`,
+      },
+      {
+        id: 'inbound_placement',
+        label: 'Inbound Placement',
+        title: 'Seller Central FBA inbound placement service fees — account total for the selected Event/Transaction date filter. Not allocated by SKU (shown as BLENDED).',
+        num: true,
+        defaultVisible: false,
+        cell: (r, data) => `<td class="num" title="Inbound placement is blended from the Seller Central report for the date filter — see Totals">${(data.placement_blended || (data.placement_meta && data.placement_meta.blended)) ? `<span class="profit-ads-blended">BLENDED</span>` : profitMoney(r.inbound_placement_fee)}</td>`,
+        total: (_r, t) => `<td class="num" title="Seller Central placement Total charge for Transaction dates in this filter">${profitMoney(t.inbound_placement_fee)}</td>`,
+      },
+      {
+        id: 'low_inv',
+        label: 'Low Inv',
+        title: 'Low Inventory Level Fee from Finances API (45-day lookback)',
+        num: true,
+        defaultVisible: false,
+        cell: (r) => `<td class="num">${profitMoney(r.low_inventory_fee)}</td>`,
+        total: (_r, t) => `<td class="num">${profitMoney(t.low_inventory_fee)}</td>`,
+      },
+      {
+        id: 'storage',
+        label: 'Storage',
+        title: 'FBA storage report: monthly fee ÷ avg units on hand × units sold',
+        num: true,
+        defaultVisible: false,
+        cell: (r) => `<td class="num">${profitMoney(r.storage_fee)}</td>`,
+        total: (_r, t) => `<td class="num">${profitMoney(t.storage_fee)}</td>`,
+      },
+      {
+        id: 'aged_inv',
+        label: 'Aged Inv',
+        title: 'Seller Central Aged Inventory Surcharge report: sum of amount-charged per SKU for months in the window',
+        num: true,
+        defaultVisible: false,
+        cell: (r) => `<td class="num">${profitMoney(r.aged_inventory_fee)}</td>`,
+        total: (_r, t) => `<td class="num">${profitMoney(t.aged_inventory_fee)}</td>`,
+      },
+      {
+        id: 'ads',
+        label: 'Ads',
+        title: "Amazon's Ads API doesn't expose per-SKU spend, so ads are blended across the account. See the account-level total in the top 'Ad spend' KPI tile.",
+        num: true,
+        defaultVisible: true,
+        cell: () => `<td class="num" title="Ads are blended across the account — see the top KPI tile"><span class="profit-ads-blended">BLENDED</span></td>`,
+        total: (_r, t) => `<td class="num" title="Account-level total — same as the 'Ad spend' KPI tile"><span class="profit-ads-blended">${profitMoney(t.ad_cost)}</span></td>`,
+      },
+      {
+        id: 'cogs',
+        label: 'COGS',
+        title: 'Product cost + your inbound shipping to Amazon (from your CSV)',
+        num: true,
+        defaultVisible: true,
+        cell: (r) => `<td class="num profit-cogs-cell" data-sku="${escapeHtml(r.sku)}" data-unit-cost="${r.unit_cost ?? ''}" data-inbound-per-unit="${r.inbound_shipping_per_unit ?? ''}" data-units="${r.units}" title="Click to edit COGS">${profitMoney(r.cogs_total)}${r.cogs_uploaded ? '' : ' <span style="color:#b35200;">⚠</span>'}</td>`,
+        total: (_r, t) => `<td class="num">${profitMoney(t.cogs_total)}</td>`,
+      },
+      {
+        id: 'return_proc',
+        label: 'Return Proc',
+        title: '20% of referral fee on returned/refunded units (Aurora FBA returns + Finances refunds, same as Returned Orders)',
+        num: true,
+        defaultVisible: true,
+        cell: (r) => `<td class="num">${profitMoney(r.return_processing_fee)}</td>`,
+        total: (_r, t) => `<td class="num">${profitMoney(t.return_processing_fee)}</td>`,
+      },
+      {
+        id: 'removal',
+        label: 'Removal',
+        title: 'FBA Removal Order Return/Disposal fees from Payments → Transactions (PostedDate in the selected filter)',
+        num: true,
+        defaultVisible: false,
+        cell: (r, data) => `<td class="num" title="Removal is blended from Seller Central Removal Order Detail for the date filter — see Totals / Removal KPI">${data.removal_blended ? `<span class="profit-ads-blended">BLENDED</span>` : profitMoney(r.removal_fee)}</td>`,
+        total: (_r, t) => `<td class="num" title="Seller Central Removal Order Detail total for request-dates in this filter">${profitMoney(t.removal_fee)}</td>`,
+      },
+      {
+        id: 'net',
+        label: 'Net',
+        num: true,
+        defaultVisible: true,
+        cell: (r) => `<td class="num ${marginClass(r.margin)}">${profitMoney(r.net)}</td>`,
+        total: (_r, t) => `<td class="num ${marginClass(t.margin)}">${profitMoney(t.net)}</td>`,
+      },
+      {
+        id: 'margin',
+        label: 'Margin %',
+        num: true,
+        defaultVisible: true,
+        cell: (r) => `<td class="num ${marginClass(r.margin)}">${r.margin}%</td>`,
+        total: (_r, t) => `<td class="num ${marginClass(t.margin)}">${t.margin}%</td>`,
+      },
+    ];
+
+    const PROFIT_COLUMN_BY_ID = Object.fromEntries(PROFIT_COLUMNS.map((c) => [c.id, c]));
+    const PROFIT_DEFAULT_ORDER = PROFIT_COLUMNS.map((c) => c.id);
+
+    function defaultProfitColumnPrefs() {
+      return {
+        order: [...PROFIT_DEFAULT_ORDER],
+        visible: Object.fromEntries(PROFIT_COLUMNS.map((c) => [c.id, !!c.defaultVisible])),
+      };
+    }
+
+    function loadProfitColumnPrefs() {
+      try {
+        const raw = localStorage.getItem(PROFIT_COL_PREFS_KEY);
+        if (!raw) return defaultProfitColumnPrefs();
+        const parsed = JSON.parse(raw);
+        const base = defaultProfitColumnPrefs();
+        const known = new Set(PROFIT_DEFAULT_ORDER);
+        const order = [];
+        for (const id of parsed.order || []) {
+          if (known.has(id) && !order.includes(id)) order.push(id);
+        }
+        for (const id of PROFIT_DEFAULT_ORDER) {
+          if (!order.includes(id)) order.push(id);
+        }
+        // SKU always first
+        const withoutSku = order.filter((id) => id !== 'sku');
+        const visible = { ...base.visible, ...(parsed.visible || {}) };
+        visible.sku = true;
+        return { order: ['sku', ...withoutSku], visible };
+      } catch {
+        return defaultProfitColumnPrefs();
+      }
+    }
+
+    function saveProfitColumnPrefs() {
+      try {
+        localStorage.setItem(PROFIT_COL_PREFS_KEY, JSON.stringify(profitColumnPrefs));
+      } catch { /* ignore quota */ }
+    }
+
+    function getVisibleProfitColumns() {
+      if (!profitColumnPrefs) profitColumnPrefs = loadProfitColumnPrefs();
+      const cols = [];
+      for (const id of profitColumnPrefs.order) {
+        const col = PROFIT_COLUMN_BY_ID[id];
+        if (!col) continue;
+        if (col.pinned || profitColumnPrefs.visible[id]) cols.push(col);
+      }
+      // Ensure pinned SKU is first even if prefs corrupted
+      const sku = cols.find((c) => c.id === 'sku') || PROFIT_COLUMN_BY_ID.sku;
+      return [sku, ...cols.filter((c) => c.id !== 'sku')];
+    }
+
+    function profitColspan() {
+      return Math.max(getVisibleProfitColumns().length, 1);
+    }
+
+    function renderProfitHeader() {
+      const cols = getVisibleProfitColumns();
+      profitHeadRowEl.innerHTML = cols.map((col) => {
+        const cls = [col.num ? 'num' : '', col.pinned ? '' : ''].filter(Boolean).join(' ');
+        const drag = col.pinned ? '' : ' draggable="true"';
+        const title = col.title ? ` title="${escapeHtml(col.title)}"` : '';
+        return `<th class="${cls}" data-col-id="${col.id}"${drag}${title}>${escapeHtml(col.label)}</th>`;
+      }).join('');
+      bindProfitHeaderDrag();
+    }
+
+    function renderProfitTableFromData(data) {
+      if (!data) return;
+      const cols = getVisibleProfitColumns();
+      renderProfitHeader();
+      const rows = data.rows || [];
+      const t = data.totals;
+      if (!rows.length) {
+        profitBodyEl.innerHTML = '';
+        profitFootEl.innerHTML = '';
+        profitEmptyEl.style.display = 'block';
+        return;
+      }
+      profitEmptyEl.style.display = 'none';
+      profitBodyEl.innerHTML = rows.map((r) => `
+        <tr data-sku="${escapeHtml((r.sku || '').toLowerCase())}" data-asin="${escapeHtml((r.asin || '').toLowerCase())}">
+          ${cols.map((col) => col.cell(r, data)).join('')}
+        </tr>`).join('');
+      applyProfitSearchFilter();
+      if (t) {
+        profitFootEl.innerHTML = `
+          <tr class="profit-totals-row">
+            ${cols.map((col) => col.total(null, t, data)).join('')}
+          </tr>`;
+      } else {
+        profitFootEl.innerHTML = '';
+      }
+    }
+
+    function moveProfitColumnOrder(fromId, toId) {
+      if (!fromId || !toId || fromId === toId || fromId === 'sku') return;
+      if (!profitColumnPrefs) profitColumnPrefs = loadProfitColumnPrefs();
+      const order = profitColumnPrefs.order.filter((id) => id !== 'sku');
+      const fromIdx = order.indexOf(fromId);
+      const toIdx = order.indexOf(toId);
+      if (fromIdx < 0 || toIdx < 0) return;
+      order.splice(fromIdx, 1);
+      order.splice(toIdx, 0, fromId);
+      profitColumnPrefs.order = ['sku', ...order];
+      saveProfitColumnPrefs();
+      renderProfitColumnsPanelList();
+      if (lastProfitData) renderProfitTableFromData(lastProfitData);
+      else renderProfitHeader();
+    }
+
+    function bindProfitHeaderDrag() {
+      let dragId = null;
+      profitHeadRowEl.querySelectorAll('th[data-col-id]').forEach((th) => {
+        if (th.dataset.colId === 'sku') return;
+        th.addEventListener('dragstart', (e) => {
+          dragId = th.dataset.colId;
+          th.classList.add('profit-th-dragging');
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', dragId);
+        });
+        th.addEventListener('dragend', () => {
+          th.classList.remove('profit-th-dragging');
+          profitHeadRowEl.querySelectorAll('th').forEach((el) => el.classList.remove('profit-th-drag-over'));
+          dragId = null;
+        });
+        th.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          if (th.dataset.colId === 'sku') return;
+          th.classList.add('profit-th-drag-over');
+        });
+        th.addEventListener('dragleave', () => th.classList.remove('profit-th-drag-over'));
+        th.addEventListener('drop', (e) => {
+          e.preventDefault();
+          th.classList.remove('profit-th-drag-over');
+          const from = e.dataTransfer.getData('text/plain') || dragId;
+          moveProfitColumnOrder(from, th.dataset.colId);
+        });
+      });
+    }
+
+    function renderProfitColumnsPanelList() {
+      if (!profitColumnPrefs) profitColumnPrefs = loadProfitColumnPrefs();
+      const order = profitColumnPrefs.order.filter((id) => id !== 'sku');
+      profitColumnsList.innerHTML = order.map((id) => {
+        const col = PROFIT_COLUMN_BY_ID[id];
+        if (!col) return '';
+        const checked = profitColumnPrefs.visible[id] ? 'checked' : '';
+        return `
+          <li draggable="true" data-col-id="${col.id}">
+            <span class="profit-col-handle" aria-hidden="true">⋮⋮</span>
+            <label>
+              <input type="checkbox" data-col-id="${col.id}" ${checked}>
+              <span>${escapeHtml(col.label)}</span>
+            </label>
+          </li>`;
+      }).join('');
+
+      let dragId = null;
+      profitColumnsList.querySelectorAll('li').forEach((li) => {
+        li.addEventListener('dragstart', (e) => {
+          dragId = li.dataset.colId;
+          li.classList.add('dragging');
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', dragId);
+        });
+        li.addEventListener('dragend', () => {
+          li.classList.remove('dragging');
+          profitColumnsList.querySelectorAll('li').forEach((el) => el.classList.remove('drag-over'));
+          dragId = null;
+        });
+        li.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          li.classList.add('drag-over');
+        });
+        li.addEventListener('dragleave', () => li.classList.remove('drag-over'));
+        li.addEventListener('drop', (e) => {
+          e.preventDefault();
+          li.classList.remove('drag-over');
+          const from = e.dataTransfer.getData('text/plain') || dragId;
+          moveProfitColumnOrder(from, li.dataset.colId);
+        });
+      });
+
+      profitColumnsList.querySelectorAll('input[type="checkbox"]').forEach((input) => {
+        input.addEventListener('change', () => {
+          const id = input.dataset.colId;
+          if (!id || id === 'sku') return;
+          profitColumnPrefs.visible[id] = !!input.checked;
+          // Keep at least one non-SKU column visible
+          const anyVisible = PROFIT_COLUMNS.some((c) => !c.pinned && profitColumnPrefs.visible[c.id]);
+          if (!anyVisible) {
+            input.checked = true;
+            profitColumnPrefs.visible[id] = true;
+            return;
+          }
+          saveProfitColumnPrefs();
+          if (lastProfitData) renderProfitTableFromData(lastProfitData);
+          else renderProfitHeader();
+        });
+      });
+    }
+
+    function openProfitColumnsPanel() {
+      renderProfitColumnsPanelList();
+      profitColumnsPanel.classList.add('open');
+    }
+
+    function closeProfitColumnsPanel() {
+      profitColumnsPanel.classList.remove('open');
+    }
+
+    profitColumnPrefs = loadProfitColumnPrefs();
+    renderProfitHeader();
+
+    profitColumnsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (profitColumnsPanel.classList.contains('open')) closeProfitColumnsPanel();
+      else openProfitColumnsPanel();
+    });
+    profitColumnsReset.addEventListener('click', () => {
+      profitColumnPrefs = defaultProfitColumnPrefs();
+      saveProfitColumnPrefs();
+      renderProfitColumnsPanelList();
+      if (lastProfitData) renderProfitTableFromData(lastProfitData);
+      else renderProfitHeader();
+    });
+    document.addEventListener('click', (e) => {
+      if (!profitColumnsPanel.classList.contains('open')) return;
+      if (e.target.closest('#profit-columns-wrap')) return;
+      closeProfitColumnsPanel();
+    });
+
     async function loadProfitability() {
-      profitBodyEl.innerHTML = '<tr><td colspan="18" style="padding:20px;color:#888;">Loading… (first call may take 1–2 min: orders + items + fees per SKU + storage report + finances events)</td></tr>';
+      const span = profitColspan();
+      profitBodyEl.innerHTML = `<tr><td colspan="${span}" style="padding:20px;color:#888;">Loading… (first call may take 1–2 min: orders + items + fees per SKU + storage report + finances events)</td></tr>`;
       profitFootEl.innerHTML = '';
       profitKpisEl.innerHTML = '';
       profitCaveatsEl.classList.remove('visible');
       profitEmptyEl.style.display = 'none';
       profitRefreshBtn.disabled = true;
+      renderProfitHeader();
       const start = profitStartEl.value;
       const end = profitEndEl.value;
       if (!start || !end || start > end) {
-        profitBodyEl.innerHTML = `<tr><td colspan="18" style="padding:20px;color:#c62828;">Pick a valid start ≤ end date.</td></tr>`;
+        profitBodyEl.innerHTML = `<tr><td colspan="${profitColspan()}" style="padding:20px;color:#c62828;">Pick a valid start ≤ end date.</td></tr>`;
         profitRefreshBtn.disabled = false;
         return;
       }
@@ -3031,6 +3546,7 @@
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
         if (data.error) throw new Error(data.error);
+        lastProfitData = data;
 
         profitStampEl.textContent = `${data.orders_count} orders, ${data.skus_count} SKUs · ${data.start ?? start} → ${data.end ?? end} (${data.window_days ?? '?'}d${data.timeZone ? ` · ${data.timeZone}` : ''})`;
 
@@ -3049,63 +3565,7 @@
           ].join('');
         }
 
-        const rows = data.rows || [];
-        if (!rows.length) {
-          profitBodyEl.innerHTML = '';
-          profitEmptyEl.style.display = 'block';
-        } else {
-          const money = v => `$${(Number(v) || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}`;
-          profitBodyEl.innerHTML = rows.map(r => {
-            const skuLabel = r.cogs_uploaded
-              ? `<strong>${escapeHtml(r.sku)}</strong>`
-              : `<strong>${escapeHtml(r.sku)}</strong> <span title="No COGS uploaded" style="color:#b35200;">⚠</span>`;
-            return `
-              <tr data-sku="${escapeHtml((r.sku || '').toLowerCase())}" data-asin="${escapeHtml((r.asin || '').toLowerCase())}">
-                <td>${skuLabel}</td>
-                <td title="ASIN ${escapeHtml(r.asin || '—')}">${escapeHtml(r.asin || '—')}</td>
-                <td class="num">${r.units}</td>
-                <td class="num"><a href="#" class="profit-price-link" data-sku="${escapeHtml(r.sku)}" title="Click to see every unit's price">${money(r.avg_price)}</a></td>
-                <td class="num">${money(r.revenue)}</td>
-                <td class="num">${money(r.referral_fee)}</td>
-                <td class="num">${money(r.fba_fee)}</td>
-                <td class="num">${money(r.fuel_surcharge)}</td>
-                <td class="num" title="Inbound placement is blended from the Seller Central report for the date filter — see Totals">${(data.placement_blended || (data.placement_meta && data.placement_meta.blended)) ? `<span class="profit-ads-blended">BLENDED</span>` : money(r.inbound_placement_fee)}</td>
-                <td class="num">${money(r.low_inventory_fee)}</td>
-                <td class="num">${money(r.storage_fee)}</td>
-                <td class="num">${money(r.aged_inventory_fee)}</td>
-                <td class="num" title="Ads are blended across the account — see the top KPI tile"><span class="profit-ads-blended">BLENDED</span></td>
-                <td class="num profit-cogs-cell" data-sku="${escapeHtml(r.sku)}" data-unit-cost="${r.unit_cost ?? ''}" data-inbound-per-unit="${r.inbound_shipping_per_unit ?? ''}" data-units="${r.units}" title="Click to edit COGS">${money(r.cogs_total)}${r.cogs_uploaded ? '' : ' <span style=\"color:#b35200;\">⚠</span>'}</td>
-                <td class="num">${money(r.return_processing_fee)}</td>
-                <td class="num" title="Removal is blended from Seller Central Removal Order Detail for the date filter — see Totals / Removal KPI">${data.removal_blended ? `<span class="profit-ads-blended">BLENDED</span>` : money(r.removal_fee)}</td>
-                <td class="num ${marginClass(r.margin)}">${money(r.net)}</td>
-                <td class="num ${marginClass(r.margin)}">${r.margin}%</td>
-              </tr>`;
-          }).join('');
-          applyProfitSearchFilter();
-          if (t) {
-            profitFootEl.innerHTML = `
-              <tr class="profit-totals-row">
-                <td class="profit-totals-label">Totals</td>
-                <td>—</td>
-                <td class="num">${t.units}</td>
-                <td class="num">—</td>
-                <td class="num">${money(t.revenue)}</td>
-                <td class="num">${money(t.referral_fee)}</td>
-                <td class="num">${money(t.fba_fee)}</td>
-                <td class="num">${money(t.fuel_surcharge)}</td>
-                <td class="num" title="Seller Central placement Total charge for Transaction dates in this filter">${money(t.inbound_placement_fee)}</td>
-                <td class="num">${money(t.low_inventory_fee)}</td>
-                <td class="num">${money(t.storage_fee)}</td>
-                <td class="num">${money(t.aged_inventory_fee)}</td>
-                <td class="num" title="Account-level total — same as the 'Ad spend' KPI tile"><span class="profit-ads-blended">${money(t.ad_cost)}</span></td>
-                <td class="num">${money(t.cogs_total)}</td>
-                <td class="num">${money(t.return_processing_fee)}</td>
-                <td class="num" title="Seller Central Removal Order Detail total for request-dates in this filter">${money(t.removal_fee)}</td>
-                <td class="num ${marginClass(t.margin)}">${money(t.net)}</td>
-                <td class="num ${marginClass(t.margin)}">${t.margin}%</td>
-              </tr>`;
-          }
-        }
+        renderProfitTableFromData(data);
 
         // Only show real warnings/errors — never methodology text.
         const caveats = [];
@@ -3125,7 +3585,8 @@
           profitCaveatsEl.classList.remove('visible');
         }
       } catch (err) {
-        profitBodyEl.innerHTML = `<tr><td colspan="18" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
+        lastProfitData = null;
+        profitBodyEl.innerHTML = `<tr><td colspan="${profitColspan()}" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
       } finally {
         profitRefreshBtn.disabled = false;
       }
