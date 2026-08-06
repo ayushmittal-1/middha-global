@@ -1610,34 +1610,38 @@ async def compute_profitability_data(
             removal_meta["source"] = "unavailable"
 
     async def _load_product_fees_and_batch():
-        # products.fees is primary (same as Aurora Products). Fees API only for SKUs
-        # missing that sync — do not prefer stale order-line fees.
+        # Live Fees API at window avg selling price is preferred for
+        # Profitability (matches Amazon Fee Preview). products.fees is the
+        # fallback when the live call is missing/errors. Always pass the
+        # correct IsAmazonFulfilled flag so FBM SKUs are not charged FBA.
         nonlocal product_fee_fallback, fees_by_asin, fee_errors_pre
         if use_db:
             product_fee_fallback = await aurora_data.product_fee_estimates_by_sku(
                 require_user(), skus,
             )
             fee_skus = data_resolver.skus_needing_fees_api(sku_data, product_fee_fallback)
-            batch_items = [
-                (sku_data[sku]["asin"], sku_data[sku]["revenue"] / sku_data[sku]["units"])
-                for sku in fee_skus
-                if sku_data[sku].get("asin") and sku_data[sku]["units"]
-                and sku_data[sku]["revenue"] > 0
+            # Also estimate every sold SKU at sale price when we have few
+            # enough unique ASINs — keeps Profitability aligned with Fee Preview.
+            sold_skus = [
+                s for s in skus
+                if int((sku_data.get(s) or {}).get("units") or 0) > 0
+                and (sku_data.get(s) or {}).get("asin")
+                and float((sku_data.get(s) or {}).get("revenue") or 0) > 0
             ]
+            # Cap live refresh to sold SKUs; merge with divergence misses.
+            fee_sku_set = set(fee_skus) | set(sold_skus)
+            batch_items = data_resolver.fee_batch_items_for_skus(
+                sorted(fee_sku_set), sku_data, product_fee_fallback,
+            )
         else:
             product_fee_fallback = {}
-            batch_items = [
-                (sku_data[sku]["asin"], sku_data[sku]["revenue"] / sku_data[sku]["units"])
-                for sku in skus
-                if sku_data[sku].get("asin") and sku_data[sku]["units"]
-                and sku_data[sku]["revenue"] > 0
-            ]
+            batch_items = data_resolver.fee_batch_items_for_skus(
+                skus, sku_data, {},
+            )
 
         if batch_items:
             try:
-                fees_by_asin = await amazon_sp.get_fees_estimates_batch(
-                    batch_items, is_fba=True,
-                )
+                fees_by_asin = await amazon_sp.get_fees_estimates_batch(batch_items)
             except Exception as e:
                 fee_errors_pre = [f"batch fees fetch failed: {str(e)[:200]}"]
 
@@ -1688,12 +1692,24 @@ async def compute_profitability_data(
         "product fees": _fire_bg(_load_product_fees_and_batch()),
         "ads": _fire_bg(_load_ads()),
     }
-    # Soft deadline — pick something that comfortably fits the fast loaders
-    # (Aurora + Finances + Ads usually <2s) but drops slow SP-API report
-    # loaders so the UI isn't blocked on them.
+    # Soft deadline for fast loaders; then keep waiting on fee-critical
+    # report sections so Referral/FBA/Fuel/Storage/Aged/Removal are not
+    # returned as silent $0 on the first click.
+    fee_critical = {"storage", "aged inventory", "removal", "product fees"}
     _, pending = await asyncio.wait(
-        list(other_tasks.values()), timeout=5.0,
+        list(other_tasks.values()), timeout=8.0,
     )
+    pending_fee = [
+        other_tasks[name] for name in fee_critical
+        if other_tasks[name] in pending
+    ]
+    if pending_fee:
+        # Storage/aged/removal share a report semaphore and can take several
+        # minutes on cold cache — wait long enough for a full create+poll.
+        await asyncio.wait(pending_fee, timeout=180.0)
+        _, pending = await asyncio.wait(
+            list(other_tasks.values()), timeout=0,
+        )
     incomplete = sorted(name for name, task in other_tasks.items() if task in pending)
     if incomplete:
         warnings.append(
@@ -1745,11 +1761,11 @@ async def compute_profitability_data(
         avg_price = revenue / units if units else 0.0
         asin = d["asin"]
 
-        # Referral / base FBA / fuel — match Aurora Products + Revenue Calculator.
+        # Referral / base FBA / fuel — match Amazon Fee Preview at sale price.
         # Priority:
-        #   1) products.fees (same Fees API sync the Products page shows — user source of truth)
-        #   2) live Product Fees API at this window's avg selling price
-        #   3) order line totals (often incomplete — last resort only)
+        #   1) live Product Fees API at this window's avg selling price (correct is_fba)
+        #   2) products.fees (listing-price sync — same as Products page)
+        #   3) order line totals (last resort)
         referral_total = 0.0
         fba_total = 0.0
         fuel_total = 0.0
@@ -1783,7 +1799,11 @@ async def compute_profitability_data(
             )
         )
 
-        if pf_ok:
+        if est_ok:
+            referral_total = round(float(est.get("referral", 0.0)) * units, 2)
+            fba_total = round(float(est.get("fba", 0.0)) * units, 2)
+            fuel_total = round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
+        elif pf_ok:
             # Same source as Aurora Products (`products.fees`). FBA + Fuel
             # equals the Products "FBA Fee" column (fulfillment total).
             listing_price = float(pf.get("listing_price") or 0)
@@ -1802,10 +1822,6 @@ async def compute_profitability_data(
             fuel_total = round(fuel_unit * units, 2)
             if not asin and pf.get("asin"):
                 asin = pf["asin"]
-        elif est_ok:
-            referral_total = round(float(est.get("referral", 0.0)) * units, 2)
-            fba_total = round(float(est.get("fba", 0.0)) * units, 2)
-            fuel_total = round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
         else:
             line_ref = round(float(d.get("referral_total") or 0), 2)
             line_fba = round(float(d.get("fba_total") or 0), 2)

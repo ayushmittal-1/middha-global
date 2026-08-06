@@ -139,7 +139,7 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
     wanted_lower = {s.lower(): s for s in wanted}
     cursor = _db().products.find(
         {"sellerId": seller_id, "sku": {"$in": wanted}},
-        {"sku": 1, "asin": 1, "fees": 1, "price": 1},
+        {"sku": 1, "asin": 1, "fees": 1, "price": 1, "fulfillmentType": 1},
     )
     out: dict[str, dict] = {}
     found_lower: set[str] = set()
@@ -171,6 +171,10 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
                 p_fuel = float(parsed.get("fuel_surcharge") or 0)
                 if p_fba > 0 and abs((p_fba + p_fuel) - stored_fba) <= 0.02:
                     fba, fuel = p_fba, p_fuel
+                elif p_fba > 0 and p_fuel > 0:
+                    # Explicit base+fuel lines — trust breakdown even when
+                    # legacy stored fbaFee was base-only (missing fuel).
+                    fba, fuel = p_fba, p_fuel
                 else:
                     fba, fuel = split_bundled_fulfillment_total(stored_fba)
             else:
@@ -181,6 +185,8 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
             fuel = float(parsed.get("fuel_surcharge") or 0)
         if referral <= 0 and fba <= 0 and fuel <= 0:
             return None
+        ft = str(doc.get("fulfillmentType") or "").upper()
+        is_fba = ft != "FBM"
         return {
             "referral_per_unit": referral,
             "fba_per_unit": fba,
@@ -189,6 +195,8 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
             "fulfillment_per_unit": round(fba + fuel, 4) if (fba + fuel) > 0 else stored_fba,
             "listing_price": price,
             "asin": doc.get("asin"),
+            "is_fba": is_fba,
+            "fulfillment_type": doc.get("fulfillmentType") or None,
         }
 
     async for doc in cursor:
@@ -211,7 +219,7 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
         or_clauses = [{"sku": {"$regex": f"^{re.escape(s)}$", "$options": "i"}} for s in missing]
         async for doc in _db().products.find(
             {"sellerId": seller_id, "$or": or_clauses},
-            {"sku": 1, "asin": 1, "fees": 1, "price": 1},
+            {"sku": 1, "asin": 1, "fees": 1, "price": 1, "fulfillmentType": 1},
         ):
             sku = doc.get("sku")
             if not sku:
