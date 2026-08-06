@@ -24,6 +24,7 @@ caller sees a clear error instead of a silent corruption.
 """
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
@@ -320,9 +321,59 @@ async def get_cogs(skus: list[str] | None = None) -> list[dict]:
 
 # ── Storage fee cache (24h TTL for FBA storage report) ────────────────────
 
+# When Amazon returns only a neighboring month_of_charge (requested July,
+# report has June), do not permanently mark July covered. Use a short
+# empty-check so every account retries after Amazon publishes, without
+# re-creating a storage report on every profitability page load.
+_STORAGE_EMPTY_CHECK_HOURS = 6.0
+
+
+def _parse_cache_dt(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _fresh_empty_checked_months(
+    empty_checked_at: dict | None,
+    *,
+    now: datetime | None = None,
+    max_age_hours: float = _STORAGE_EMPTY_CHECK_HOURS,
+) -> set[str]:
+    """Months recently confirmed empty / unpublished (short negative cache)."""
+    now = now or datetime.now(timezone.utc)
+    fresh: set[str] = set()
+    for month, raw_ts in (empty_checked_at or {}).items():
+        key = str(month).strip()
+        if not re.match(r"^\d{4}-\d{2}$", key):
+            continue
+        ts = _parse_cache_dt(raw_ts)
+        if ts is None:
+            continue
+        age_h = (now - ts).total_seconds() / 3600.0
+        if 0 <= age_h <= max_age_hours:
+            fresh.add(key)
+    return fresh
+
 
 async def get_storage_cache(max_age_hours: int = 24) -> dict | None:
-    """Return cached per-SKU monthly storage fee map or None if stale/missing."""
+    """Return cached per-SKU monthly storage fee map or None if stale/missing.
+
+    ``months_covered`` is effective coverage for the current user only:
+    months with real fee rows, plus months empty-checked within 6h.
+    Phantom monthsCovered entries from older builds are ignored (and healed).
+    """
+    from amazon_sp import storage_months_with_fees
+
     user_id = _user_oid()
     doc = await _storage_cache().find_one({"userId": user_id})
     if not doc:
@@ -336,23 +387,59 @@ async def get_storage_cache(max_age_hours: int = 24) -> dict | None:
     age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
     if age_hours > max_age_hours:
         return None
+
+    per_sku = doc.get("perSkuMonthly", {}) or {}
+    fee_months = storage_months_with_fees(per_sku)
+    claimed = set(_normalize_month_keys(doc.get("monthsCovered", [])))
+    empty_checked = _fresh_empty_checked_months(doc.get("emptyCheckedAt") or {})
+    # Never treat a phantom monthsCovered entry as covered.
+    effective = sorted(set(fee_months) | (empty_checked - set(fee_months)))
+
+    # Self-heal poisoned docs for this seller (any account / any month).
+    # Older builds wrote missing months into monthsCovered / emptyCheckedAt
+    # after Amazon returned only a neighboring month_of_charge.
+    if claimed - set(fee_months):
+        try:
+            await _storage_cache().update_one(
+                {"userId": user_id},
+                {
+                    "$set": {
+                        "monthsCovered": fee_months,
+                        "emptyCheckedAt": {},
+                    },
+                },
+            )
+        except Exception:
+            pass
+        # Do not honor stale empty-checks from the poisoned doc.
+        empty_checked = set()
+        effective = list(fee_months)
+
     return {
-        "per_sku_monthly": doc.get("perSkuMonthly", {}),
-        "months_covered": _normalize_month_keys(doc.get("monthsCovered", [])),
+        "per_sku_monthly": per_sku,
+        "months_covered": effective,
+        "months_with_fees": fee_months,
         "updated_at": updated.isoformat(),
     }
 
 
-async def put_storage_cache(per_sku_monthly: dict, months_covered: list[str]) -> None:
+async def put_storage_cache(
+    per_sku_monthly: dict,
+    months_covered: list[str],
+    empty_checked_at: dict | None = None,
+) -> None:
     user_id = _user_oid()
+    payload: dict = {
+        "perSkuMonthly": per_sku_monthly,
+        "monthsCovered": months_covered,
+        "updatedAt": datetime.now(timezone.utc),
+    }
+    if empty_checked_at is not None:
+        payload["emptyCheckedAt"] = empty_checked_at
     await _storage_cache().update_one(
         {"userId": user_id},
         {
-            "$set": {
-                "perSkuMonthly": per_sku_monthly,
-                "monthsCovered": months_covered,
-                "updatedAt": datetime.now(timezone.utc),
-            },
+            "$set": payload,
             "$setOnInsert": {"userId": user_id},
         },
         upsert=True,
@@ -361,8 +448,6 @@ async def put_storage_cache(per_sku_monthly: dict, months_covered: list[str]) ->
 
 def _normalize_month_keys(months) -> list[str]:
     """Coerce monthsCovered from Mongo to sorted YYYY-MM strings only."""
-    import re
-
     out: list[str] = []
     for m in months or []:
         s = str(m).strip()
@@ -374,26 +459,60 @@ def _normalize_month_keys(months) -> list[str]:
 async def merge_storage_cache(
     new_per_asin_month: dict,
     new_months: list[str],
+    empty_months: list[str] | None = None,
 ) -> dict:
-    """Merge freshly fetched months into the seller's storage cache (all accounts)."""
+    """Merge freshly fetched months into the seller's storage cache.
+
+    Works for every authenticated seller (current + future accounts):
+    - ``monthsCovered`` is always derived from months that have fee rows.
+    - ``empty_months`` get a short empty-check stamp so unpublished months
+      retry after ``_STORAGE_EMPTY_CHECK_HOURS`` instead of being poisoned
+      for the full 24h cache TTL.
+    """
+    from amazon_sp import (
+        merge_storage_by_asin_month,
+        normalize_storage_fee_map,
+        storage_months_with_fees,
+    )
+
     user_id = _user_oid()
     doc = await _storage_cache().find_one({"userId": user_id})
     old_map = (doc or {}).get("perSkuMonthly") or {}
-    old_months = _normalize_month_keys((doc or {}).get("monthsCovered"))
-    new_months_norm = _normalize_month_keys(new_months)
-
-    from amazon_sp import merge_storage_by_asin_month, normalize_storage_fee_map
+    old_empty = dict((doc or {}).get("emptyCheckedAt") or {})
 
     merged_map = normalize_storage_fee_map(
         merge_storage_by_asin_month(old_map, new_per_asin_month)
     )
-    merged_months = sorted(set(old_months) | set(new_months_norm))
+    fee_months = storage_months_with_fees(merged_map)
 
-    await put_storage_cache(merged_map, merged_months)
+    now = datetime.now(timezone.utc)
+    # Drop empty-checks for months that now have fees.
+    cleaned_empty: dict[str, datetime] = {}
+    for month, raw_ts in old_empty.items():
+        key = str(month).strip()
+        if key in fee_months:
+            continue
+        ts = _parse_cache_dt(raw_ts)
+        if ts is None:
+            continue
+        cleaned_empty[key] = ts
+
+    for month in _normalize_month_keys(empty_months):
+        if month in fee_months:
+            continue
+        cleaned_empty[month] = now
+
+    # new_months arg kept for call-site compat; coverage is fee-derived.
+    _ = new_months
+
+    await put_storage_cache(merged_map, fee_months, empty_checked_at=cleaned_empty)
+    empty_fresh = _fresh_empty_checked_months(cleaned_empty, now=now)
+    effective = sorted(set(fee_months) | empty_fresh)
     return {
         "per_sku_monthly": merged_map,
-        "months_covered": merged_months,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "months_covered": effective,
+        "months_with_fees": fee_months,
+        "updated_at": now.isoformat(),
     }
 
 
