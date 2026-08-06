@@ -3272,10 +3272,10 @@
       {
         id: 'storage',
         label: 'Storage',
-        title: 'FBA monthly storage — Seller Central Monthly Storage Fees report when available; otherwise Finances FBAStorageFee for the date filter (BLENDED)',
+        title: 'FBA monthly storage — Seller Central Monthly Storage Fees report (per ASIN), or Finances FBAStorageFee per SKU when the report is unavailable. Never BLENDED.',
         num: true,
         defaultVisible: false,
-        cell: (r, data) => `<td class="num" title="${data.storage_blended ? 'Storage is blended from Finances FBAStorageFee for the date filter — see Totals' : 'Monthly Storage Fees report for months in the filter'}">${data.storage_blended ? `<span class="profit-ads-blended">BLENDED</span>` : profitMoney(r.storage_fee)}</td>`,
+        cell: (r) => `<td class="num">${profitMoney(r.storage_fee)}</td>`,
         total: (_r, t) => `<td class="num">${profitMoney(t.storage_fee)}</td>`,
       },
       {

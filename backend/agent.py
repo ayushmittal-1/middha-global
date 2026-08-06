@@ -1089,7 +1089,6 @@ async def compute_profitability_data(
     placement_window_total = 0.0
     fin_placement_window_total = 0.0
     fin_storage_window_total = 0.0
-    storage_blended = False
     storage_meta: dict[str, object] = {"source": "none"}
     aged_charges_by_sku: dict[str, float] | None = {}
     aged_charges_meta: dict = {"source": None, "access_denied": False}
@@ -1136,16 +1135,16 @@ async def compute_profitability_data(
 
     async def _load_storage():
         nonlocal storage_by_asin_month, storage_cached_at, covered_months
-        storage_meta = await get_storage_cache(max_age_hours=24)
-        if storage_meta:
-            cached_map = storage_meta.get("per_sku_monthly") or {}
+        storage_cache_meta = await get_storage_cache(max_age_hours=24)
+        if storage_cache_meta:
+            cached_map = storage_cache_meta.get("per_sku_monthly") or {}
             if is_per_asin_by_month_storage_cache(cached_map):
                 storage_by_asin_month = amazon_sp.normalize_storage_fee_map(cached_map)
-                storage_cached_at = storage_meta.get("updated_at")
+                storage_cached_at = storage_cache_meta.get("updated_at")
                 # Effective coverage from get_storage_cache: fee months plus
                 # short-lived empty-checks. Phantom monthsCovered are ignored.
                 covered_months = {
-                    str(m) for m in (storage_meta.get("months_covered") or [])
+                    str(m) for m in (storage_cache_meta.get("months_covered") or [])
                     if re.match(r"^\d{4}-\d{2}$", str(m))
                 }
         missing_months = [m for m in storage_months_in_window if m not in covered_months]
@@ -1189,10 +1188,10 @@ async def compute_profitability_data(
             still_missing = [m for m in missing_months if m not in found]
             if still_missing:
                 warnings.append(
-                    f"Storage: no FBA storage report data yet for "
+                    f"Storage: no Monthly Storage Fees report rows yet for "
                     f"{', '.join(still_missing)} — using Finances FBAStorageFee "
-                    "for this date filter when available; will retry the "
-                    "Monthly Storage Fees report on the next load."
+                    "per SKU when SellerSKU is present (not BLENDED); report "
+                    "retry on next load."
                 )
         except Exception as e:
             warnings.append(_sp_report_warning("Storage", e))
@@ -1740,16 +1739,18 @@ async def compute_profitability_data(
             time_zone=mp_tz,
         )
     )
-    # Prefer Monthly Storage Fees report (month_of_charge). When Amazon has
-    # not published that month via SP-API yet — or the report create is still
-    # running / 429'd — fall back to Finances FBAStorageFee PostedDate sum
-    # for the same profitability filter (BLENDED on Totals, like placement).
+    # Storage is NEVER BLENDED (only placement / ads / removal are).
+    # Primary: Monthly Storage Fees report → per-ASIN → split to sold SKUs.
+    # Fallback when report has no rows for the filter months: Finances
+    # FBAStorageFee attributed by SellerSKU (and unattributed residual on
+    # Totals). Same dollars as Payments → Transactions, per-SKU when Amazon
+    # sends a SKU — never a BLENDED column.
+    storage_from_finances = False
     if float(storage_report_total or 0) <= 0 and fin_storage_window_total > 0:
-        storage_blended = True
+        storage_from_finances = True
         storage_report_total = round(float(fin_storage_window_total), 2)
         storage_fees_by_asin = {}
-        storage_meta["source"] = "finances_posted_window"
-        storage_meta["blended"] = True
+        storage_meta["source"] = "finances_per_sku"
         storage_meta["window_total"] = storage_report_total
     elif float(storage_report_total or 0) > 0:
         storage_meta["source"] = "storage_report"
@@ -1766,7 +1767,7 @@ async def compute_profitability_data(
         k: (unattributed_fees.get(k, 0.0) / total_units_window
             if total_units_window > 0 else 0.0)
         for k in ("return_processing", "low_inventory", "inbound_placement",
-                  "aged_inventory", "removal")
+                  "aged_inventory", "removal", "storage")
     }
 
     ad_by_sku: dict[str, float] = ad_window.get("by_sku") or {}
@@ -1867,21 +1868,6 @@ async def compute_profitability_data(
 
         amazon_fees = round(referral_total + fba_total + fuel_total, 2)
 
-        # Storage: use Seller Central Monthly Storage Fees $ for this ASIN
-        # (month_of_charge in filter), split across SKUs that sold that ASIN.
-        # This matches the downloaded report total — NOT fee÷qty × units sold.
-        # When report is empty we BLENDED Finances FBAStorageFee on Totals.
-        if storage_blended:
-            storage = 0.0
-        else:
-            asin_key = (asin or "").upper()
-            asin_storage_fee = float(storage_fees_by_asin.get(asin_key, 0.0) or 0.0)
-            asin_sold_units = float(storage_units_by_asin.get(asin_key, 0.0) or 0.0)
-            if asin_storage_fee > 0 and asin_sold_units > 0 and units > 0:
-                storage = round(asin_storage_fee * (units / asin_sold_units), 2)
-            else:
-                storage = 0.0
-
         # Ads: per-campaign attribution when the campaign lists this SKU,
         # plus a share of the unattributed pool spread per unit.
         ad_cost = round(
@@ -1896,6 +1882,26 @@ async def compute_profitability_data(
                 (v for k, v in fin_by_sku.items() if str(k).lower() == sku.lower()),
                 {},
             )
+
+        # Storage: Monthly Storage Fees report $ for this ASIN (month_of_charge
+        # in filter), split across SKUs that sold that ASIN. Never BLENDED —
+        # only placement / ads / removal use that pattern. If the report has
+        # no rows yet, use Finances FBAStorageFee for this SellerSKU (+ share
+        # of unattributed storage posts).
+        asin_key = (asin or "").upper()
+        asin_storage_fee = float(storage_fees_by_asin.get(asin_key, 0.0) or 0.0)
+        asin_sold_units = float(storage_units_by_asin.get(asin_key, 0.0) or 0.0)
+        if asin_storage_fee > 0 and asin_sold_units > 0 and units > 0:
+            storage = round(asin_storage_fee * (units / asin_sold_units), 2)
+        elif storage_from_finances:
+            storage = round(
+                float(fin_sku.get("storage", 0.0) or 0)
+                + unattr_per_unit.get("storage", 0.0) * units,
+                2,
+            )
+        else:
+            storage = 0.0
+
         # Return processing fee = 20% × the actual referral fee for the
         # returned units. Client-confirmed policy for this seller's
         # categories; matches Amazon's standard FBA Returns Processing
@@ -2130,11 +2136,12 @@ async def compute_profitability_data(
         )
     caveats.extend([
         (
-            "Storage is BLENDED from Amazon Finances FBAStorageFee for this date "
-            "filter (Monthly Storage Fees report has no month_of_charge rows yet "
-            f"for {', '.join(storage_months_in_window) or 'this window'}). "
-            "SKU rows show BLENDED; Totals / Storage KPI hold the PostedDate sum."
-            if storage_blended else
+            "Storage uses Finances FBAStorageFee for this date filter (per SellerSKU "
+            "when Amazon sends one; unattributed posts are spread per unit sold). "
+            "Monthly Storage Fees report rows were not available for "
+            f"{', '.join(storage_months_in_window) or 'this window'} yet — Storage "
+            "is never BLENDED (unlike placement / ads / removal)."
+            if storage_from_finances else
             "Storage uses GET_FBA_STORAGE_FEE_CHARGES_DATA for the calendar month(s) "
             f"in your filter ({', '.join(storage_months_in_window) or 'none'}): the "
             "estimated_monthly_storage_fee total from Seller Central's Monthly Storage "
@@ -2190,9 +2197,9 @@ async def compute_profitability_data(
             "Removal: Removal Order Detail unavailable for this window — "
             "showing $0 (retry; Finances spread is disabled so totals stay accurate)."
         )
-    if not storage_by_asin_month and not storage_blended:
+    if not storage_by_asin_month and not storage_from_finances:
         caveats.append("Storage fees: report unavailable for this window; values are 0.")
-    elif storage_blended and float(storage_report_total or 0) <= 0:
+    elif storage_from_finances and float(storage_report_total or 0) <= 0:
         caveats.append(
             "Storage fees: Monthly Storage Fees report and Finances FBAStorageFee "
             "are both empty for this date filter."
@@ -2263,7 +2270,8 @@ async def compute_profitability_data(
         "ad_window": ad_window,
         "storage_cached_at": storage_cached_at,
         "storage_months_in_window": storage_months_in_window,
-        "storage_blended": bool(storage_blended),
+        "storage_blended": False,
+        "storage_from_finances": bool(storage_from_finances),
         "storage_meta": storage_meta,
         "unattributed_fees": {k: round(v, 2) for k, v in unattributed_fees.items()},
         "placement_meta": placement_meta,
