@@ -521,6 +521,10 @@ async def get_aged_surcharge_charges_cache(
     age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
     if age_hours > max_age_hours:
         return None
+    # Poisoned 403 / empty denial — retry within 1h so a transient denial
+    # does not blank Storage/Aged/Removal for a full day.
+    if doc.get("accessDenied") and age_hours > 1:
+        return None
     return {
         "per_sku": doc.get("perSku", {}),
         "updated_at": updated.isoformat(),
@@ -578,6 +582,9 @@ async def get_removal_fees_cache(
     age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
     if age_hours > max_age_hours:
         return None
+    # Transient 403 should not blank Removal for a full day.
+    if doc.get("accessDenied") and age_hours > 1:
+        return None
     return {
         "per_sku": doc.get("perSku", {}),
         "updated_at": updated.isoformat(),
@@ -615,6 +622,27 @@ async def put_removal_fees_cache(
         },
         upsert=True,
     )
+
+
+async def clear_profitability_fee_caches(user_id: ObjectId | None = None) -> dict:
+    """Drop storage / aged / removal / placement fee caches for one seller.
+
+    Used after fee-pipeline fixes so a poisoned empty/403 cache cannot stick
+    for the normal 24h TTL. Pass ``user_id`` from scripts; defaults to the
+    authenticated request user.
+    """
+    oid = ObjectId(str(user_id)) if user_id is not None else _user_oid()
+    deleted = {}
+    for name, coll in (
+        ("storage", _storage_cache()),
+        ("aged_planning", _aged_inventory_cache()),
+        ("aged_charges", _aged_surcharge_charges_cache()),
+        ("removal", _removal_fees_cache()),
+        ("placement", _placement_fee_cache()),
+    ):
+        result = await coll.delete_many({"userId": oid})
+        deleted[name] = int(result.deleted_count or 0)
+    return deleted
 
 
 # ── Forecasting: salesDaily / inventorySnapshot / forecastCache ───────────

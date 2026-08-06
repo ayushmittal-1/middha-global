@@ -650,7 +650,7 @@ _last_fees_batch_ts = 0.0
 
 
 async def get_fees_estimates_batch(
-    items: list[tuple[str, float]],
+    items: list[tuple],
     *,
     is_fba: bool = True,
     marketplace: str | None = None,
@@ -666,9 +666,10 @@ async def get_fees_estimates_batch(
     dict with `status`/`error` populated so the caller can distinguish
     "no fees found" from "not queried".
 
-    `items` is a list of (asin, price) tuples. Duplicate ASINs are
-    de-duplicated by (asin, rounded price) — same as the singleton cache
-    key — since Amazon's fee estimate depends on price."""
+    `items` is a list of (asin, price) or (asin, price, is_fba) tuples.
+    Per-item `is_fba` overrides the keyword default (needed so FBM SKUs
+    are not estimated as Amazon-fulfilled). Duplicate ASINs are
+    de-duplicated by (asin, rounded price, is_fba)."""
     global _last_fees_batch_ts
     if not items:
         return {}
@@ -676,24 +677,28 @@ async def get_fees_estimates_batch(
     marketplace_id = resolve_marketplace(user, marketplace, multiple=False)
     now_ts = time.time()
     out: dict[str, dict] = {}
-    # De-dupe by (asin, rounded price) so a repeated ASIN doesn't waste
-    # a slot in the 20-item batch.
-    seen: set[tuple[str, float]] = set()
-    to_fetch: list[tuple[str, float]] = []
-    for asin, price in items:
+    # De-dupe by (asin, rounded price, is_fba).
+    seen: set[tuple[str, float, bool]] = set()
+    to_fetch: list[tuple[str, float, bool]] = []
+    for entry in items:
+        if not entry or len(entry) < 2:
+            continue
+        asin = entry[0]
+        price = entry[1]
+        item_is_fba = bool(entry[2]) if len(entry) >= 3 else bool(is_fba)
         if not asin or price is None or price <= 0:
             continue
         pr = round(float(price), 2)
-        key = (asin, pr)
+        key = (asin, pr, item_is_fba)
         if key in seen:
             continue
         seen.add(key)
-        cache_key = (asin, pr, bool(is_fba), marketplace_id, currency)
+        cache_key = (asin, pr, item_is_fba, marketplace_id, currency)
         cached = _FEES_ESTIMATE_CACHE.get(cache_key)
         if cached and now_ts - cached[0] < _FEES_ESTIMATE_TTL_S:
             out[asin] = cached[1]
         else:
-            to_fetch.append((asin, pr))
+            to_fetch.append((asin, pr, item_is_fba))
 
     if not to_fetch:
         return out
@@ -709,21 +714,22 @@ async def get_fees_estimates_batch(
 
         # Body is an array of FeesEstimateByIdRequest per the SP-API docs.
         # `Identifier` echoes back on the response so we can match ASINs
-        # even if Amazon changes the response order.
+        # even if Amazon changes the response order. Include is_fba in the
+        # identifier so FBA/FBM estimates for the same ASIN don't collide.
         body = [
             {
                 "FeesEstimateRequest": {
                     "MarketplaceId": marketplace_id,
-                    "IsAmazonFulfilled": bool(is_fba),
+                    "IsAmazonFulfilled": bool(item_fba),
                     "PriceToEstimateFees": {
                         "ListingPrice": {"Amount": pr, "CurrencyCode": currency},
                     },
-                    "Identifier": f"est-{asin}-{pr}",
+                    "Identifier": f"est-{asin}-{pr}-{'fba' if item_fba else 'fbm'}",
                 },
                 "IdType": "ASIN",
                 "IdValue": asin,
             }
-            for asin, pr in chunk
+            for asin, pr, item_fba in chunk
         ]
         try:
             resp = await _sp_request(
@@ -733,10 +739,10 @@ async def get_fees_estimates_batch(
             # Whole batch failed — fall back to the singleton loop for
             # this chunk so one broken ASIN doesn't lose all 20 estimates.
             print(f"[sp-api] batch feesEstimate failed ({e}); falling back to per-ASIN")
-            for asin, pr in chunk:
+            for asin, pr, item_fba in chunk:
                 try:
                     out[asin] = await get_fees_estimate(
-                        asin, pr, is_fba=is_fba,
+                        asin, pr, is_fba=item_fba,
                         marketplace=marketplace, currency=currency,
                     )
                 except Exception as e2:
@@ -779,8 +785,8 @@ async def get_fees_estimates_batch(
             if ident:
                 by_ident[ident] = r
 
-        for idx, (asin, pr) in enumerate(chunk):
-            ident = f"est-{asin}-{pr}"
+        for idx, (asin, pr, item_fba) in enumerate(chunk):
+            ident = f"est-{asin}-{pr}-{'fba' if item_fba else 'fbm'}"
             r = by_ident.get(ident)
             if r is None and idx < len(results):
                 r = results[idx]
@@ -796,7 +802,7 @@ async def get_fees_estimates_batch(
             out[asin] = parsed
             if (parsed.get("status") or "").lower() == "success" or parsed["total"] > 0:
                 _FEES_ESTIMATE_CACHE[
-                    (asin, pr, bool(is_fba), marketplace_id, currency)
+                    (asin, pr, bool(item_fba), marketplace_id, currency)
                 ] = (time.time(), parsed)
 
     return out
@@ -1195,24 +1201,122 @@ async def fetch_storage_fees_for_months(
             and _report_covers_month(r, report_start, report_end + timedelta(seconds=1))
         ]
         candidates.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+        # Fallback: any recent DONE storage report — Amazon often stamps a
+        # wider data window; we filter month_of_charge after download.
+        if not candidates:
+            candidates = [
+                r for r in existing
+                if r.get("processingStatus") == "DONE" and r.get("reportDocumentId")
+            ]
+            candidates.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+            candidates = candidates[:3]
         if candidates:
-            text = await download_report_raw(
-                candidates[0]["reportId"], max_polls=6, poll_interval=5,
-            )
+            for cand in candidates:
+                try:
+                    text = await download_report_raw(
+                        cand["reportId"], max_polls=6, poll_interval=5,
+                    )
+                    if text:
+                        break
+                except Exception:
+                    text = None
+                    continue
+        if text is None:
+            # Prefer waiting on an in-flight storage report over creating
+            # another (Amazon often CANCELLED's duplicates).
+            in_flight = [
+                r for r in existing
+                if r.get("processingStatus") in ("IN_QUEUE", "IN_PROGRESS")
+                and _report_covers_month(
+                    r, report_start, report_end + timedelta(seconds=1),
+                )
+            ]
+            in_flight.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+            for r in in_flight[:2]:
+                try:
+                    text = await download_report_raw(
+                        r["reportId"], max_polls=30, poll_interval=10,
+                    )
+                    if text is not None:
+                        break
+                except Exception:
+                    continue
     except Exception:
         text = None
 
     if text is None:
-        create_resp = await create_report(
-            "GET_FBA_STORAGE_FEE_CHARGES_DATA",
-            start_date=report_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            end_date=report_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            single_marketplace=True,
-        )
-        report_id = create_resp.get("reportId")
-        if not report_id:
-            raise RuntimeError(f"Storage report create returned no id: {create_resp}")
-        text = await download_report_raw(report_id, max_polls=24, poll_interval=10)
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                create_resp = await create_report(
+                    "GET_FBA_STORAGE_FEE_CHARGES_DATA",
+                    start_date=report_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    end_date=report_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    single_marketplace=True,
+                )
+                report_id = create_resp.get("reportId")
+                if not report_id:
+                    raise RuntimeError(
+                        f"Storage report create returned no id: {create_resp}"
+                    )
+                text = await download_report_raw(
+                    report_id, max_polls=24, poll_interval=10,
+                )
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                # Amazon occasionally CANCELLED/FATAL's a create when another
+                # storage report is in flight — wait, reuse any new DONE, retry.
+                if "CANCELLED" not in msg and "FATAL" not in msg:
+                    raise
+                await asyncio.sleep(8)
+                try:
+                    existing = await _list_storage_fee_reports(lookback)
+                    candidates = [
+                        r for r in existing
+                        if r.get("processingStatus") == "DONE"
+                        and r.get("reportDocumentId")
+                        and _report_covers_month(
+                            r, report_start, report_end + timedelta(seconds=1),
+                        )
+                    ]
+                    candidates.sort(
+                        key=lambda r: r.get("createdTime") or "", reverse=True,
+                    )
+                    if candidates:
+                        text = await download_report_raw(
+                            candidates[0]["reportId"], max_polls=6, poll_interval=5,
+                        )
+                        if text is not None:
+                            last_err = None
+                            break
+                    in_flight = [
+                        r for r in existing
+                        if r.get("processingStatus") in ("IN_QUEUE", "IN_PROGRESS")
+                        and _report_covers_month(
+                            r, report_start, report_end + timedelta(seconds=1),
+                        )
+                    ]
+                    for r in in_flight[:1]:
+                        try:
+                            text = await download_report_raw(
+                                r["reportId"], max_polls=24, poll_interval=10,
+                            )
+                            if text is not None:
+                                last_err = None
+                                break
+                        except Exception:
+                            continue
+                    if text is not None:
+                        break
+                except Exception:
+                    pass
+        if text is None and last_err is not None:
+            raise last_err
+        if text is None:
+            raise RuntimeError("Storage report unavailable after retries")
 
     per_asin, parsed_months = parse_storage_fee_report(text)
     filtered = filter_storage_to_months(per_asin, months)

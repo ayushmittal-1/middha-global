@@ -230,27 +230,72 @@ async def supplement_order_items_from_sp_api(
 def skus_needing_fees_api(
     sku_data: dict[str, dict],
     product_fee_fallback: dict[str, dict],
+    *,
+    price_divergence_pct: float = 0.01,
 ) -> list[str]:
-    """SKUs that still need a live Product Fees API estimate.
+    """SKUs that need a live Product Fees API estimate at sale price.
 
-    Prefer Aurora `products.fees` (same source as the Products page). Do **not**
-    skip the Fees API just because order line items have referral/FBA — those
-    line fees are often incomplete/stale and were the root cause of Profitability
-    disagreeing with Aurora Products / Revenue Calculator.
+    Always fetch when ``products.fees`` is missing. Also fetch when the
+    window avg selling price diverges from the listing price used for the
+    stored estimate (referral scales with price; stale listing fees drift
+    from Amazon Fee Preview / Revenue Calculator).
     """
     need: list[str] = []
-    # Case-insensitive index of products.fees rows already loaded.
     pf_lower = {str(k).lower(): v for k, v in (product_fee_fallback or {}).items()}
     for sku, d in sku_data.items():
-        if int(d.get("units") or 0) <= 0:
+        units = int(d.get("units") or 0)
+        if units <= 0:
+            continue
+        if not d.get("asin") or float(d.get("revenue") or 0) <= 0:
             continue
         pf = product_fee_fallback.get(sku) or pf_lower.get(str(sku).lower()) or {}
-        if (
+        has_pf = (
             float(pf.get("referral_per_unit") or 0) > 0
             or float(pf.get("fba_per_unit") or 0) > 0
             or float(pf.get("fulfillment_per_unit") or 0) > 0
-        ):
+        )
+        if not has_pf:
+            need.append(sku)
             continue
-        if d.get("asin") and float(d.get("revenue") or 0) > 0:
+        listing = float(pf.get("listing_price") or 0)
+        avg_sale = float(d.get("revenue") or 0) / units
+        if listing > 0 and avg_sale > 0:
+            drift = abs(avg_sale - listing) / listing
+            if drift >= price_divergence_pct:
+                need.append(sku)
+                continue
+        # Always refresh when we only have referral heuristic / no real FBA
+        # for an FBA SKU (or vice versa) — products.fees may be incomplete.
+        is_fba = pf.get("is_fba")
+        if is_fba is True and float(pf.get("fulfillment_per_unit") or 0) <= 0:
             need.append(sku)
     return need
+
+
+def fee_batch_items_for_skus(
+    skus: list[str],
+    sku_data: dict[str, dict],
+    product_fee_fallback: dict[str, dict] | None = None,
+) -> list[tuple[str, float, bool]]:
+    """Build (asin, avg_price, is_fba) tuples for ``get_fees_estimates_batch``."""
+    pf_lower = {
+        str(k).lower(): v for k, v in (product_fee_fallback or {}).items()
+    }
+    items: list[tuple[str, float, bool]] = []
+    for sku in skus:
+        d = sku_data.get(sku) or {}
+        asin = d.get("asin")
+        units = int(d.get("units") or 0)
+        revenue = float(d.get("revenue") or 0)
+        if not asin or units <= 0 or revenue <= 0:
+            continue
+        avg_price = revenue / units
+        pf = (product_fee_fallback or {}).get(sku) or pf_lower.get(str(sku).lower()) or {}
+        if "is_fba" in pf:
+            item_is_fba = bool(pf.get("is_fba"))
+        else:
+            # Default FBA when unknown — most Profitability rows are FBA;
+            # FBM products with synced fees expose is_fba=False via pf.
+            item_is_fba = True
+        items.append((asin, avg_price, item_is_fba))
+    return items
