@@ -4415,8 +4415,17 @@
       drawerEl.classList.add('visible');
       drawerOverlay.classList.add('visible');
       try {
-        const r = await fetch(`/forecasting/sku/${encodeURIComponent(sku)}`, { headers: authHeaders() });
+        // Fetch the production forecast + the dev-only 3-way comparison
+        // in parallel. Compare 404s when LGBM_BENCHMARK isn't set on the
+        // backend — we just skip the extra card and chart lines in that
+        // case, so this is safe to ship.
+        const [r, cmpR] = await Promise.all([
+          fetch(`/forecasting/sku/${encodeURIComponent(sku)}`, { headers: authHeaders() }),
+          fetch(`/forecasting/sku/${encodeURIComponent(sku)}/compare`, { headers: authHeaders() })
+            .catch(() => null),
+        ]);
         const data = await r.json();
+        const compare = (cmpR && cmpR.ok) ? await cmpR.json().catch(() => null) : null;
         if (data.error) {
           drawerKV.innerHTML = `<div>${escapeHtml(data.error)}</div>`;
           return;
@@ -4485,6 +4494,62 @@
                 </div>
               </div>`;
           })()}
+          ${(() => {
+            // Dev-only 3-way model comparison — Prophet vs LightGBM vs
+            // Naive on the same holdout. Only rendered when the backend
+            // has LGBM_BENCHMARK=1 set (otherwise `compare` is null).
+            if (!compare) return '';
+            const rows = [
+              { key: 'prophet',  label: 'Prophet',  color: '#f59e0b', data: compare.prophet },
+              { key: 'lgbm',     label: 'LightGBM', color: '#10b981', data: compare.lgbm },
+              { key: 'naive',    label: 'Naive',    color: '#8b5cf6', data: compare.naive },
+            ];
+            const bestAcc = Math.max(...rows
+              .map(r => (r.data && r.data.metrics && r.data.metrics.accuracy_pct) || -1));
+            const cell = (v, unit = '') => v == null ? '—' : `${v}${unit}`;
+            const bodyRows = rows.map(r => {
+              const m = (r.data && r.data.metrics) || {};
+              const isWinner = m.accuracy_pct != null && m.accuracy_pct === bestAcc;
+              const biasStr = m.bias == null ? '—' : (m.bias > 0 ? '+' : '') + m.bias;
+              return `
+                <tr style="${isWinner ? 'background:#ecfdf5;' : ''}">
+                  <td style="padding:6px 8px;">
+                    <span style="display:inline-block;width:10px;height:10px;background:${r.color};border-radius:2px;vertical-align:middle;margin-right:6px;"></span>
+                    <strong>${r.label}</strong>${isWinner ? ' <span style="font-size:10px;color:#059669;">★ best</span>' : ''}
+                  </td>
+                  <td style="padding:6px 8px;text-align:right;"><strong>${cell(m.accuracy_pct, '%')}</strong></td>
+                  <td style="padding:6px 8px;text-align:right;">${cell(m.mae)}</td>
+                  <td style="padding:6px 8px;text-align:right;">${cell(m.mape_pct, '%')}</td>
+                  <td style="padding:6px 8px;text-align:right;">${biasStr}</td>
+                  <td style="padding:6px 8px;text-align:right;">${cell(m.coverage_pct, '%')}</td>
+                  <td style="padding:6px 8px;text-align:right;">${cell(m.predicted_total)}</td>
+                </tr>`;
+            }).join('');
+            return `
+              <div class="sku-model-compare" style="margin-top:12px;padding:10px;border:1px solid #93c5fd;border-radius:6px;background:#eff6ff;">
+                <div style="font-weight:600;font-size:13px;margin-bottom:4px;">Model comparison (dev)</div>
+                <div style="font-size:11px;color:#6b7280;margin-bottom:8px;">
+                  Same 30-day holdout · trained on ${escapeHtml(compare.train_start)} → ${escapeHtml(compare.train_end)} · LightGBM trained across ${compare.n_user_skus} SKUs
+                </div>
+                <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                  <thead>
+                    <tr style="border-bottom:1px solid #cbd5e1;color:#6b7280;font-size:11px;">
+                      <th style="padding:4px 8px;text-align:left;">Model</th>
+                      <th style="padding:4px 8px;text-align:right;" title="Volume accuracy: 1 − |Σŷ − Σy| / Σy">Accuracy</th>
+                      <th style="padding:4px 8px;text-align:right;">MAE</th>
+                      <th style="padding:4px 8px;text-align:right;">MAPE</th>
+                      <th style="padding:4px 8px;text-align:right;">Bias</th>
+                      <th style="padding:4px 8px;text-align:right;">Coverage</th>
+                      <th style="padding:4px 8px;text-align:right;">Σ predicted</th>
+                    </tr>
+                  </thead>
+                  <tbody>${bodyRows}</tbody>
+                </table>
+                <div style="font-size:11px;color:#6b7280;margin-top:6px;">
+                  Each model's backtest prediction is overlaid on the chart below as a dashed line in its color.
+                </div>
+              </div>`;
+          })()}
         `;
         // Build a continuous timeline: 90 days of historical actuals,
         // then the 90-day forecast. We densify the history (fill missing
@@ -4534,6 +4599,31 @@
           })
           .concat(new Array(fcLabels.length).fill(null));
 
+        // 3-way comparison overlays. Only rendered when the compare
+        // endpoint returned data (LGBM_BENCHMARK=1 on backend).
+        const alignBtDays = (days) => {
+          const byDate = new Map();
+          for (const d of (days || [])) byDate.set(d.date.slice(0, 10), d);
+          return histLabels
+            .map(lbl => { const d = byDate.get(lbl); return d ? d.p50 : null; })
+            .concat(new Array(fcLabels.length).fill(null));
+        };
+        const compareOverlays = compare ? [
+          { label: 'Prophet backtest',  color: '#f59e0b', days: (compare.prophet || {}).days },
+          { label: 'LightGBM backtest', color: '#10b981', days: (compare.lgbm || {}).days },
+          { label: 'Naive backtest',    color: '#8b5cf6', days: (compare.naive || {}).days },
+        ] : [];
+        const compareDatasets = compareOverlays.map(o => ({
+          label: o.label,
+          data: alignBtDays(o.days),
+          borderColor: o.color,
+          backgroundColor: 'transparent',
+          pointRadius: 0,
+          borderWidth: 1.5,
+          tension: 0.2,
+          borderDash: [4, 4],
+        }));
+
         if (skuChart) skuChart.destroy();
         skuChart = new Chart(chartCanvas, {
           type: 'line',
@@ -4552,10 +4642,17 @@
               { label: 'p50 forecast', data: p50Aligned,
                 borderColor: '#4a6cf7', backgroundColor: 'rgba(74,108,247,0.05)',
                 pointRadius: 0, borderWidth: 2, tension: 0.2 },
-              { label: 'backtest predicted', data: btP50Aligned,
+              // Production single-model backtest line (kept for continuity
+              // with the existing accuracy card). Hidden when the 3-way
+              // compare overlays are present since they render the same
+              // information broken out per model.
+              ...(compare ? [] : [{
+                label: 'backtest predicted', data: btP50Aligned,
                 borderColor: '#f59e0b', backgroundColor: 'transparent',
                 pointRadius: 0, borderWidth: 1.5, tension: 0.2,
-                borderDash: [4, 4] },
+                borderDash: [4, 4],
+              }]),
+              ...compareDatasets,
             ],
           },
           options: {

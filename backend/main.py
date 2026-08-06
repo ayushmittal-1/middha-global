@@ -119,6 +119,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Dev-only LightGBM vs Prophet benchmark endpoint. No-op unless
+# LGBM_BENCHMARK=1 is set in the env — production stays untouched.
+from forecasting.lgbm.routes import mount_if_enabled as _mount_lgbm_benchmark
+_mount_lgbm_benchmark(app)
+
 
 @app.post("/api/auth/login")
 async def login(body: LoginRequest):
