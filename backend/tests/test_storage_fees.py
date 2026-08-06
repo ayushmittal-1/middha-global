@@ -137,6 +137,64 @@ def test_months_covered_union_not_concat():
         assert "set" in str(e) and "list" in str(e)
 
 
+def test_storage_months_with_fees_ignores_empty_buckets():
+    from amazon_sp import storage_months_with_fees
+
+    per = {
+        "B0001": {
+            "2026-06": {"monthly_fee": 10.0, "avg_quantity_on_hand": 5},
+            "2026-07": {"monthly_fee": 0.0, "avg_quantity_on_hand": 1},
+        },
+        "B0002": {
+            "2026-06": {"monthly_fee": 1.5, "avg_quantity_on_hand": 2},
+        },
+    }
+    assert storage_months_with_fees(per) == ["2026-06"]
+
+
+def test_fresh_empty_checked_months_ttl():
+    from datetime import datetime, timedelta, timezone
+
+    from database import _fresh_empty_checked_months
+
+    now = datetime(2026, 8, 6, 12, 0, 0, tzinfo=timezone.utc)
+    empty = {
+        "2026-07": now - timedelta(hours=2),   # fresh
+        "2026-08": now - timedelta(hours=7),   # expired
+        "bad": now,
+    }
+    assert _fresh_empty_checked_months(empty, now=now) == {"2026-07"}
+
+
+def test_neighbor_month_must_not_poison_requested_month():
+    """Amazon returns June while July was requested → July stays uncovered
+    after empty-check expires. Applies to every seller cache doc."""
+    from datetime import datetime, timedelta, timezone
+
+    from amazon_sp import storage_months_with_fees
+    from database import _fresh_empty_checked_months
+
+    # Cache only has June fees but monthsCovered falsely listed July (old bug).
+    per = {
+        "B0001": {"2026-06": {"monthly_fee": 9.1, "avg_quantity_on_hand": 3}},
+    }
+    fee_months = set(storage_months_with_fees(per))
+    claimed = {"2026-06", "2026-07", "2026-08"}
+    phantoms = claimed - fee_months
+    assert phantoms == {"2026-07", "2026-08"}
+
+    now = datetime(2026, 8, 6, 12, 0, 0, tzinfo=timezone.utc)
+    # Immediately after a neighbor-month fetch we empty-check July for 6h.
+    empty_at = {"2026-07": now}
+    covered_now = fee_months | _fresh_empty_checked_months(empty_at, now=now)
+    assert "2026-07" in covered_now
+    # After TTL, July must be missing again so the next load refetches.
+    later = now + timedelta(hours=7)
+    covered_later = fee_months | _fresh_empty_checked_months(empty_at, now=later)
+    assert "2026-07" not in covered_later
+    assert "2026-06" in covered_later
+
+
 def test_june_report_total_matches_csv_allocation():
     """Full June filter Storage KPI must equal Seller Central CSV total (~$39.44)."""
     from datetime import datetime, timezone

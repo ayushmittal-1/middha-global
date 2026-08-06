@@ -889,6 +889,26 @@ def normalize_storage_fee_map(
     return out
 
 
+def storage_months_with_fees(per_asin: dict | None) -> list[str]:
+    """YYYY-MM keys that actually have monthly_fee > 0 in a storage map.
+
+    Used as the source of truth for cache ``monthsCovered`` so a neighboring
+    month_of_charge from Amazon cannot permanently poison other months for
+    any seller account.
+    """
+    months: set[str] = set()
+    for by_month in (per_asin or {}).values():
+        if not isinstance(by_month, dict):
+            continue
+        for month, bucket in by_month.items():
+            month_key = _normalize_month_of_charge(str(month))
+            if not month_key or not isinstance(bucket, dict):
+                continue
+            if _coerce_float(bucket.get("monthly_fee")) > 0:
+                months.add(month_key)
+    return sorted(months)
+
+
 def parse_storage_fee_report(text: str) -> tuple[dict[str, dict[str, dict]], list[str]]:
     """Parse GET_FBA_STORAGE_FEE_CHARGES_DATA (TSV or CSV).
 
@@ -1374,6 +1394,9 @@ _FEE_TYPE_BUCKETS = [
     # Finances API FeeType strings, which have drifted over time)
     ("return_processing", ("returnfee", "refundcommission", "returnprocessingfee")),
     ("low_inventory", ("lowinventorylevelfee", "lowinventoryfee", "lowinventory")),
+    # Monthly FBA storage (NOT long-term / aged — those are aged_inventory).
+    # FeeType is exactly FBAStorageFee in ServiceFeeEventList.
+    ("storage", ("fbastoragefee",)),
     # FBAInboundConvenienceFee is how the inbound placement service fee posts
     # in the Finances API — a shipment-level lump sum with NO SellerSKU.
     ("inbound_placement", ("inboundplacement", "inboundconvenience",
@@ -1419,6 +1442,7 @@ def _empty_fee_bucket() -> dict:
     return {
         "return_processing": 0.0,
         "low_inventory": 0.0,
+        "storage": 0.0,
         "inbound_placement": 0.0,
         "aged_inventory": 0.0,
         "removal": 0.0,
@@ -1468,29 +1492,33 @@ async def get_financial_events(
     removal_posted_after: str | None = None,
     placement_posted_after: str | None = None,
     placement_posted_before: str | None = None,
+    storage_posted_after: str | None = None,
+    storage_posted_before: str | None = None,
 ) -> dict:
     """Pull ListFinancialEvents for the window and normalize into per-SKU
     fee buckets. Returns:
 
         {
-          "by_sku":        {sku: {return_processing, low_inventory,
+          "by_sku":        {sku: {return_processing, low_inventory, storage,
                                   inbound_placement, aged_inventory,
                                   removal}},
           "unattributed":  {…same keys… — fees we couldn't map to a SKU},
           "totals":        {…same keys, summed across all…},
           "placement_window_total": float,  # inbound_placement in PostedDate window
+          "storage_window_total": float,    # FBAStorageFee in PostedDate window
           "pages":         int,
           "posted_after":  str,
         }
 
-    Covers the 5 fees the FBA calculator PDF lists that aren't in Product
-    Fees API: return processing, low inventory, inbound placement, aged
-    inventory surcharge, and removal fees.
+    Covers fees the FBA calculator lists that aren't in Product Fees API:
+    return processing, low inventory, monthly storage, inbound placement,
+    aged inventory surcharge, and removal fees.
 
     When ``placement_posted_after`` / ``placement_posted_before`` are set,
     inbound_placement ServiceFee/Adjustment rows are kept only if PostedDate
     falls in that half-open window (profitability filter) — same idea as
-    removal's PostedDate bound.
+    removal's PostedDate bound. ``storage_posted_*`` does the same for
+    monthly FBAStorageFee (fallback when the storage report is empty).
 
     Rate-limited: Finances API is 0.5 req/s sustained (2 burst). We sleep
     2 s between pages so a busy quota doesn't drop us. `max_pages` caps
@@ -1509,6 +1537,11 @@ async def get_financial_events(
     removal_by_order: dict[str, float] = defaultdict(float)
     pages = 0
     page_params = dict(base_params)
+
+    if storage_posted_after is None:
+        storage_posted_after = placement_posted_after
+    if storage_posted_before is None:
+        storage_posted_before = placement_posted_before
 
     while True:
         resp = await _sp_request(
@@ -1626,6 +1659,12 @@ async def get_financial_events(
                         continue
                     if placement_posted_before and posted and posted >= placement_posted_before:
                         continue
+                # Monthly storage: same PostedDate window as placement.
+                if bucket == "storage":
+                    if storage_posted_after and posted and posted < storage_posted_after:
+                        continue
+                    if storage_posted_before and posted and posted >= storage_posted_before:
+                        continue
                 target = by_sku[sku] if sku else unattributed
                 target[bucket] += abs(amt)
                 if bucket == "removal" and removal_order_id:
@@ -1716,6 +1755,7 @@ async def get_financial_events(
     for k in totals:
         totals[k] = round(totals[k] + unattributed[k], 2)
     placement_window_total = round(float(totals.get("inbound_placement") or 0), 2)
+    storage_window_total = round(float(totals.get("storage") or 0), 2)
 
     return {
         "by_sku": {sku: {k: round(v, 2) for k, v in bucket.items()}
@@ -1724,6 +1764,7 @@ async def get_financial_events(
         "removal_by_order": {k: round(v, 2) for k, v in removal_by_order.items()},
         "totals": totals,
         "placement_window_total": placement_window_total,
+        "storage_window_total": storage_window_total,
         "pages": pages,
         "posted_after": posted_after,
     }

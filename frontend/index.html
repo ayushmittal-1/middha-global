@@ -805,7 +805,7 @@
       margin-right: auto;
       align-self: center;
     }
-    #profit-toolbar label {
+    #profit-toolbar > label {
       display: flex;
       flex-direction: column;
       gap: 4px;
@@ -814,14 +814,30 @@
       text-transform: uppercase;
       letter-spacing: 0.5px;
     }
-    #profit-toolbar input {
+    #profit-toolbar > label > input,
+    #profit-toolbar > input[type="text"],
+    #profit-toolbar > input[type="date"],
+    #profit-toolbar > input[type="search"] {
       padding: 7px 10px;
       border: 1px solid #d0d0d0;
       border-radius: 6px;
       font-size: 13px;
+    }
+    #profit-toolbar > label > input {
       width: 90px;
     }
-    #campaigns-toolbar button, #profit-toolbar button {
+    #profit-toolbar > #profit-search {
+      min-width: 180px;
+      width: auto;
+      padding: 7px 10px;
+      border: 1px solid #cbd5e1;
+      border-radius: 4px;
+      font-size: 12px;
+      align-self: flex-end;
+    }
+    #campaigns-toolbar > button,
+    #profit-toolbar > button,
+    #profit-toolbar #profit-columns-btn {
       padding: 8px 16px;
       background: #1a1a2e;
       color: #fff;
@@ -912,23 +928,25 @@
       outline: 1px dashed #93c5fd;
     }
     .profit-cogs-cell.editing { background: #fff8e1; }
-    /* Ads column: Amazon's Ads API doesn't expose per-SKU spend, so we
-       don't fake per-row attribution. Total lives on the top KPI tile.
-       Cells stack a small "BLENDED" tag vertically so the column reads
-       as intentionally not-per-SKU rather than empty. */
+    /* Account-level fees (ads / removal / placement when blended): show a
+       compact horizontal badge — not per-SKU. Totals / KPI hold the $. */
     .profit-ads-blended {
-      color: #94a3b8;
+      color: #64748b;
       font-size: 10px;
-      letter-spacing: 2px;
-      font-weight: 600;
-      writing-mode: vertical-rl;
-      transform: rotate(180deg);
+      letter-spacing: 0.06em;
+      font-weight: 700;
       display: inline-block;
-      padding: 4px 0;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: #f1f5f9;
+      white-space: nowrap;
     }
     #profit-columns-wrap {
       position: relative;
       align-self: flex-end;
+      margin-left: auto;
+      flex: 0 0 auto;
+      z-index: 50;
     }
     #profit-toolbar #profit-columns-btn {
       background: #f1f5f9;
@@ -939,16 +957,20 @@
       display: none;
       position: absolute;
       right: 0;
+      left: auto;
       top: calc(100% + 6px);
-      z-index: 40;
-      width: 280px;
+      z-index: 60;
+      width: 300px;
+      min-width: 260px;
       max-height: min(420px, 70vh);
-      overflow: auto;
+      overflow-x: hidden;
+      overflow-y: auto;
       background: #fff;
       border: 1px solid #e2e8f0;
       border-radius: 10px;
       box-shadow: 0 12px 32px rgba(15, 23, 42, 0.14);
       padding: 10px;
+      box-sizing: border-box;
     }
     #profit-columns-panel.open { display: block; }
     #profit-columns-panel .profit-col-panel-head {
@@ -960,13 +982,16 @@
       font-size: 12px;
       font-weight: 700;
       color: #0f172a;
+      text-transform: none;
+      letter-spacing: 0;
     }
     #profit-columns-panel .profit-col-reset {
-      padding: 4px 8px;
-      font-size: 11px;
+      padding: 4px 8px !important;
+      font-size: 11px !important;
       background: transparent !important;
       color: #1e8bff !important;
       border: none !important;
+      border-radius: 4px !important;
       cursor: pointer;
       box-shadow: none !important;
     }
@@ -980,6 +1005,7 @@
     }
     #profit-columns-list li {
       display: flex;
+      flex-direction: row;
       align-items: center;
       gap: 8px;
       padding: 6px 8px;
@@ -990,6 +1016,7 @@
       font-size: 12px;
       color: #0f172a;
       user-select: none;
+      box-sizing: border-box;
     }
     #profit-columns-list li.dragging { opacity: 0.55; cursor: grabbing; }
     #profit-columns-list li.drag-over {
@@ -1001,17 +1028,40 @@
       font-size: 14px;
       line-height: 1;
       cursor: grab;
+      flex: 0 0 auto;
     }
     #profit-columns-list label {
-      display: flex;
+      display: flex !important;
+      flex-direction: row !important;
       align-items: center;
-      gap: 6px;
-      flex: 1;
+      gap: 8px !important;
+      flex: 1 1 auto;
+      min-width: 0;
+      margin: 0;
       cursor: pointer;
-      text-transform: none;
-      letter-spacing: 0;
-      font-size: 12px;
-      color: inherit;
+      text-transform: none !important;
+      letter-spacing: 0 !important;
+      font-size: 12px !important;
+      font-weight: 500;
+      color: inherit !important;
+    }
+    #profit-columns-list label span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #profit-columns-list input[type="checkbox"] {
+      width: 14px !important;
+      min-width: 14px !important;
+      height: 14px !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      flex: 0 0 auto;
+      accent-color: #1e8bff;
+      border: none !important;
+      border-radius: 2px !important;
+      background: transparent !important;
+      box-shadow: none !important;
     }
     #profit-table-wrap thead th[draggable="true"] { cursor: grab; }
     #profit-table-wrap thead th.profit-th-dragging { opacity: 0.5; }
@@ -1559,12 +1609,13 @@
       color: #e2e8f0;
     }
     body.embedded-in-aurora #orders-toolbar label,
-    body.embedded-in-aurora #profit-toolbar label {
+    body.embedded-in-aurora #profit-toolbar > label {
       color: #94a3b8;
     }
     body.embedded-in-aurora #orders-toolbar select,
     body.embedded-in-aurora #orders-toolbar input,
-    body.embedded-in-aurora #profit-toolbar input {
+    body.embedded-in-aurora #profit-toolbar > label > input,
+    body.embedded-in-aurora #profit-toolbar > #profit-search {
       background: #1e293b;
       border-color: rgba(255, 255, 255, 0.12);
       color: #f8fafc;
@@ -1942,7 +1993,7 @@
           <input id="profit-end" type="date">
         </label>
         <button id="profit-refresh">Apply</button>
-        <input type="text" id="profit-search" placeholder="Filter by SKU or ASIN" style="min-width:180px;padding:4px 8px;font-size:12px;border:1px solid #cbd5e1;border-radius:4px;">
+        <input type="text" id="profit-search" placeholder="Filter by SKU or ASIN">
         <div id="profit-columns-wrap">
           <button type="button" id="profit-columns-btn" title="Show, hide, and reorder columns">Columns</button>
           <div id="profit-columns-panel" role="dialog" aria-label="Profitability columns">
@@ -3221,10 +3272,10 @@
       {
         id: 'storage',
         label: 'Storage',
-        title: 'FBA storage report: monthly fee ÷ avg units on hand × units sold',
+        title: 'FBA monthly storage — Seller Central Monthly Storage Fees report when available; otherwise Finances FBAStorageFee for the date filter (BLENDED)',
         num: true,
         defaultVisible: false,
-        cell: (r) => `<td class="num">${profitMoney(r.storage_fee)}</td>`,
+        cell: (r, data) => `<td class="num" title="${data.storage_blended ? 'Storage is blended from Finances FBAStorageFee for the date filter — see Totals' : 'Monthly Storage Fees report for months in the filter'}">${data.storage_blended ? `<span class="profit-ads-blended">BLENDED</span>` : profitMoney(r.storage_fee)}</td>`,
         total: (_r, t) => `<td class="num">${profitMoney(t.storage_fee)}</td>`,
       },
       {
@@ -3243,7 +3294,7 @@
         num: true,
         defaultVisible: true,
         cell: () => `<td class="num" title="Ads are blended across the account — see the top KPI tile"><span class="profit-ads-blended">BLENDED</span></td>`,
-        total: (_r, t) => `<td class="num" title="Account-level total — same as the 'Ad spend' KPI tile"><span class="profit-ads-blended">${profitMoney(t.ad_cost)}</span></td>`,
+        total: (_r, t) => `<td class="num" title="Account-level total — same as the 'Ad spend' KPI tile">${profitMoney(t.ad_cost)}</td>`,
       },
       {
         id: 'cogs',
@@ -3524,20 +3575,62 @@
       closeProfitColumnsPanel();
     });
 
-    async function loadProfitability() {
+    let profitAutoReloadTimer = null;
+    let profitAutoReloadCount = 0;
+    const PROFIT_AUTO_RELOAD_MAX = 3;
+
+    function clearProfitAutoReload() {
+      if (profitAutoReloadTimer) {
+        clearTimeout(profitAutoReloadTimer);
+        profitAutoReloadTimer = null;
+      }
+    }
+
+    function scheduleProfitAutoReload(data) {
+      clearProfitAutoReload();
+      const incomplete = (data.warnings || []).some(
+        (w) => /Still loading in background/i.test(String(w || '')),
+      );
+      if (!incomplete || profitAutoReloadCount >= PROFIT_AUTO_RELOAD_MAX) return;
+      profitAutoReloadCount += 1;
+      const delayMs = profitAutoReloadCount === 1 ? 8000 : 15000;
+      profitAutoReloadTimer = setTimeout(() => {
+        loadProfitability({ auto: true });
+      }, delayMs);
+    }
+
+    async function loadProfitability(opts = {}) {
+      const isAuto = !!opts.auto;
+      // Auto background refreshes must not lock Apply — that left the button
+      // disabled for minutes while aged/removal warmed. Manual Apply still
+      // disables to prevent double-submit.
+      if (!isAuto && profitRefreshBtn.disabled) return;
+      if (!isAuto) {
+        clearProfitAutoReload();
+        profitAutoReloadCount = 0;
+      }
       const span = profitColspan();
-      profitBodyEl.innerHTML = `<tr><td colspan="${span}" style="padding:20px;color:#888;">Loading… (first call may take 1–2 min: orders + items + fees per SKU + storage report + finances events)</td></tr>`;
-      profitFootEl.innerHTML = '';
-      profitKpisEl.innerHTML = '';
-      profitCaveatsEl.classList.remove('visible');
-      profitEmptyEl.style.display = 'none';
-      profitRefreshBtn.disabled = true;
+      if (!isAuto || !lastProfitData) {
+        profitBodyEl.innerHTML = `<tr><td colspan="${span}" style="padding:20px;color:#888;">Loading… (first call may take ~1 min while Finances + placement fees finish)</td></tr>`;
+        profitFootEl.innerHTML = '';
+        profitKpisEl.innerHTML = '';
+        profitCaveatsEl.classList.remove('visible');
+        profitEmptyEl.style.display = 'none';
+      } else {
+        profitStampEl.textContent = (profitStampEl.textContent || '')
+          .replace(/ · refreshing…$/, '') + ' · refreshing…';
+      }
+      if (!isAuto) {
+        profitRefreshBtn.disabled = true;
+        profitRefreshBtn.title = 'Loading profitability…';
+      }
       renderProfitHeader();
       const start = profitStartEl.value;
       const end = profitEndEl.value;
       if (!start || !end || start > end) {
         profitBodyEl.innerHTML = `<tr><td colspan="${profitColspan()}" style="padding:20px;color:#c62828;">Pick a valid start ≤ end date.</td></tr>`;
         profitRefreshBtn.disabled = false;
+        profitRefreshBtn.title = 'Apply date range';
         return;
       }
       try {
@@ -3584,14 +3677,17 @@
         } else {
           profitCaveatsEl.classList.remove('visible');
         }
+        scheduleProfitAutoReload(data);
       } catch (err) {
-        lastProfitData = null;
+        if (!isAuto) lastProfitData = null;
         profitBodyEl.innerHTML = `<tr><td colspan="${profitColspan()}" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
       } finally {
         profitRefreshBtn.disabled = false;
+        profitRefreshBtn.title = 'Apply date range';
       }
     }
-    profitRefreshBtn.addEventListener('click', loadProfitability);
+    profitRefreshBtn.addEventListener('click', () => loadProfitability());
+    profitRefreshBtn.title = 'Apply date range';
 
     // ── Avg-price drill-down: per-line-item price detail modal ────────
     async function openPricesModal(sku) {
