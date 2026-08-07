@@ -2864,6 +2864,389 @@ async def fetch_removal_fees_per_sku(
     }
 
 
+# ── FBA Reimbursements (inventory / SAFE-T cash credits) ─────────────────────
+
+
+async def _list_reimbursements_reports(created_since: datetime) -> list[dict]:
+    """Recent GET_FBA_REIMBURSEMENTS_DATA reports."""
+    params = {
+        "reportTypes": "GET_FBA_REIMBURSEMENTS_DATA",
+        "pageSize": "50",
+        "createdSince": created_since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    try:
+        resp = await _sp_request("GET", "/reports/2021-06-30/reports", params=params)
+    except Exception:
+        return []
+    if isinstance(resp, dict):
+        return list(resp.get("reports") or [])
+    return []
+
+
+def _norm_reimb_header(key: str | None) -> str:
+    return (
+        (key or "")
+        .strip()
+        .lstrip("\ufeff")
+        .strip('"')
+        .strip("'")
+        .lower()
+        .replace("_", "-")
+        .replace(" ", "-")
+    )
+
+
+def parse_reimbursements_report(
+    text: str,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+) -> tuple[dict[str, dict], float]:
+    """Parse GET_FBA_REIMBURSEMENTS_DATA (Seller Central CSV or SP-API TSV).
+
+    Filters on ``approval-date`` (SC "Event Date") in
+    ``[window_start, window_end)`` when set.
+
+    Sums signed cash ``amount-total`` — includes positive reimbursements and
+    negative ``Reimbursement_Reversal`` rows (same net as Seller Central).
+    Inventory-only $0 rows are ignored. Rows without a SKU still count toward
+    ``report_total`` (account-level BLENDED).
+
+    Returns ({sku: {reimbursement, qty, reasons}}, report_total).
+    """
+    if not (text or "").strip():
+        return {}, 0.0
+
+    cleaned = text.lstrip("\ufeff")
+    first = cleaned.splitlines()[0]
+    # SC downloads are comma CSV (often quoted); SP-API is usually TSV.
+    delim = "\t" if ("\t" in first and first.count("\t") >= first.count(",")) else ","
+    reader = csv.DictReader(io.StringIO(cleaned), delimiter=delim)
+
+    start = window_start
+    end = window_end
+    if start is not None and start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end is not None and end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+
+    per_sku: dict[str, dict] = {}
+    report_total = 0.0
+
+    for row in reader:
+        if not row:
+            continue
+        norm = {_norm_reimb_header(k): (v if v is not None else "") for k, v in row.items()}
+        approval_raw = str(
+            norm.get("approval-date")
+            or norm.get("approvaldate")
+            or norm.get("approved-date")
+            or norm.get("event-date")
+            or ""
+        ).strip().strip('"')
+        approval_dt = _parse_removal_request_dt(approval_raw)
+        if start is not None or end is not None:
+            if approval_dt is None:
+                continue
+            if start is not None and approval_dt < start:
+                continue
+            if end is not None and approval_dt >= end:
+                continue
+
+        amt_raw = (
+            norm.get("amount-total")
+            or norm.get("amounttotal")
+            or norm.get("total-amount")
+            or ""
+        )
+        amt = _coerce_float(str(amt_raw).strip().strip('"').replace(",", ""))
+        if abs(amt) < 0.0005:
+            continue
+
+        report_total += amt
+
+        sku = str(
+            norm.get("sku")
+            or norm.get("seller-sku")
+            or norm.get("merchant-sku")
+            or ""
+        ).strip().strip('"')
+        if not sku:
+            continue
+
+        qty = int(
+            _coerce_float(
+                str(
+                    norm.get("quantity-reimbursed-total")
+                    or norm.get("quantity-reimbursed-cash")
+                    or 0
+                ).strip().strip('"'),
+            )
+        )
+        reason = str(norm.get("reason") or "").strip().strip('"')
+        bucket = per_sku.setdefault(
+            sku,
+            {"reimbursement": 0.0, "qty": 0, "reasons": []},
+        )
+        bucket["reimbursement"] = _coerce_float(bucket["reimbursement"]) + amt
+        # qty can be negative on reversals — keep signed count for diagnostics
+        bucket["qty"] = int(bucket.get("qty") or 0) + qty
+        if reason and reason not in bucket["reasons"]:
+            bucket["reasons"].append(reason)
+
+    out = {
+        sku: {
+            "reimbursement": round(_coerce_float(v["reimbursement"]), 2),
+            "qty": int(v.get("qty") or 0),
+            "reasons": list(v.get("reasons") or []),
+        }
+        for sku, v in per_sku.items()
+        if abs(_coerce_float(v.get("reimbursement"))) >= 0.0005
+    }
+    return out, round(report_total, 2)
+
+
+async def fetch_reimbursements_for_window(
+    start: datetime,
+    end: datetime,
+    time_zone: str = "UTC",
+) -> dict:
+    """Pull FBA Reimbursements for the profitability window.
+
+    Strategy (mirrors Removal):
+      1. Resolve calendar months overlapping the window in marketplace TZ.
+      2. Prefer an existing DONE report covering each month; wait on IN_PROGRESS;
+         create only when needed.
+      3. Filter rows by exact [start, end) on approval-date.
+
+    Returns {"per_sku": {...}, "report_total": float}.
+    """
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if end <= start:
+        return {"per_sku": {}, "report_total": 0.0}
+
+    month_keys = calendar_months_in_window(start, end, time_zone)
+    if not month_keys:
+        return {"per_sku": {}, "report_total": 0.0}
+
+    now = datetime.now(timezone.utc)
+    lookback = now - timedelta(days=89)
+
+    def _refresh_lists(reports: list[dict]) -> tuple[list, list]:
+        done = [
+            r for r in reports
+            if r.get("processingStatus") == "DONE" and r.get("reportDocumentId")
+        ]
+        in_prog = [
+            r for r in reports
+            if r.get("processingStatus") in ("IN_QUEUE", "IN_PROGRESS")
+        ]
+        return done, in_prog
+
+    try:
+        existing = await _list_reimbursements_reports(lookback)
+    except Exception:
+        existing = []
+    existing_done, existing_inprog = _refresh_lists(existing)
+
+    merged: dict[str, dict] = {}
+    report_total = 0.0
+
+    def _merge(parsed: dict[str, dict], total: float) -> None:
+        nonlocal report_total
+        report_total += float(total or 0)
+        for sku, bucket in parsed.items():
+            dest = merged.setdefault(
+                sku, {"reimbursement": 0.0, "qty": 0, "reasons": []},
+            )
+            dest["reimbursement"] = float(dest["reimbursement"]) + float(
+                bucket.get("reimbursement") or 0
+            )
+            dest["qty"] = int(dest.get("qty") or 0) + int(bucket.get("qty") or 0)
+            for reason in bucket.get("reasons") or []:
+                if reason and reason not in dest["reasons"]:
+                    dest["reasons"].append(reason)
+
+    # Fast path: one report covering the full picker window (matches SC
+    # Event Date custom / Last 30 days downloads), then clip to [start, end).
+    report_end_full = min(end, now)
+    if report_end_full > start:
+        full_text: str | None = None
+        covering_full = [
+            r for r in existing_done
+            if _report_fully_covers_window(r, start, report_end_full)
+        ]
+        covering_full.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+        for report in covering_full[:1]:
+            try:
+                full_text = await download_report_raw(
+                    report["reportId"], max_polls=3, poll_interval=5,
+                )
+                break
+            except Exception:
+                pass
+        if full_text is None:
+            in_prog_full = [
+                r for r in existing_inprog
+                if _report_covers_month(r, start, report_end_full)
+            ]
+            in_prog_full.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+            if in_prog_full:
+                try:
+                    full_text = await download_report_raw(
+                        in_prog_full[0]["reportId"], max_polls=18, poll_interval=5,
+                    )
+                except Exception:
+                    full_text = None
+        if full_text is None:
+            try:
+                create_resp = await create_report(
+                    "GET_FBA_REIMBURSEMENTS_DATA",
+                    start_date=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    end_date=report_end_full.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    single_marketplace=True,
+                )
+                created_full = create_resp.get("reportId")
+                if created_full:
+                    full_text = await download_report_raw(
+                        created_full, max_polls=24, poll_interval=5,
+                    )
+            except Exception:
+                full_text = None
+        if full_text is not None:
+            parsed, total = parse_reimbursements_report(full_text, start, end)
+            _merge(parsed, total)
+            return {
+                "per_sku": {
+                    sku: {
+                        "reimbursement": round(float(v["reimbursement"]), 2),
+                        "qty": int(v.get("qty") or 0),
+                        "reasons": list(v.get("reasons") or []),
+                    }
+                    for sku, v in merged.items()
+                    if abs(float(v.get("reimbursement") or 0)) >= 0.0005
+                },
+                "report_total": round(report_total, 2),
+            }
+
+    for label in month_keys:
+        month_start, month_end_excl = month_start_end_excl(label, time_zone)
+        w_start = max(start, month_start)
+        w_end = min(end, month_end_excl)
+        if w_end <= w_start:
+            continue
+
+        report_end = min(month_end_excl, now)
+        if report_end <= month_start:
+            report_end = now
+
+        text: str | None = None
+
+        covering = [
+            r for r in existing_done
+            if _report_fully_covers_window(r, month_start, report_end)
+        ]
+        covering.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+        for report in covering[:1]:
+            try:
+                text = await download_report_raw(
+                    report["reportId"], max_polls=3, poll_interval=5,
+                )
+                break
+            except Exception:
+                pass
+
+        if text is not None:
+            parsed, total = parse_reimbursements_report(text, w_start, w_end)
+            _merge(parsed, total)
+            continue
+
+        in_prog_covering = [
+            r for r in existing_inprog
+            if _report_covers_month(r, month_start, report_end)
+        ]
+        in_prog_covering.sort(key=lambda r: r.get("createdTime") or "", reverse=True)
+        waited_id: str | None = None
+        if in_prog_covering:
+            waited_id = in_prog_covering[0]["reportId"]
+            try:
+                text = await download_report_raw(
+                    waited_id, max_polls=12, poll_interval=5,
+                )
+            except Exception:
+                text = None
+
+        created_id: str | None = None
+        if text is None and waited_id is None:
+            try:
+                create_resp = await create_report(
+                    "GET_FBA_REIMBURSEMENTS_DATA",
+                    start_date=month_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    end_date=report_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    single_marketplace=True,
+                )
+                created_id = create_resp.get("reportId")
+                if created_id:
+                    text = await download_report_raw(
+                        created_id, max_polls=18, poll_interval=5,
+                    )
+            except Exception:
+                created_id = None
+
+        if text is None:
+            try:
+                refreshed = await _list_reimbursements_reports(lookback)
+                refreshed_done, _ = _refresh_lists(refreshed)
+                existing_done = refreshed_done
+                for r in sorted(
+                    refreshed_done,
+                    key=lambda r: r.get("createdTime") or "",
+                    reverse=True,
+                )[:2]:
+                    if _report_fully_covers_window(r, month_start, report_end) or \
+                       _report_covers_month(r, month_start, report_end):
+                        try:
+                            text = await download_report_raw(
+                                r["reportId"], max_polls=3, poll_interval=5,
+                            )
+                            if text:
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        if text is None:
+            raise RuntimeError(
+                f"FBA Reimbursements unavailable for {label}: "
+                "report still IN_PROGRESS or create failed. "
+                "Refresh in ~1 minute once Amazon finishes processing."
+            )
+
+        parsed, total = parse_reimbursements_report(text, w_start, w_end)
+        _merge(parsed, total)
+        try:
+            existing = await _list_reimbursements_reports(lookback)
+            existing_done, existing_inprog = _refresh_lists(existing)
+        except Exception:
+            pass
+
+    return {
+        "per_sku": {
+            sku: {
+                "reimbursement": round(float(v["reimbursement"]), 2),
+                "qty": int(v.get("qty") or 0),
+                "reasons": list(v.get("reasons") or []),
+            }
+            for sku, v in merged.items()
+            if abs(float(v.get("reimbursement") or 0)) >= 0.0005
+        },
+        "report_total": round(report_total, 2),
+    }
+
+
 # ── FBA Inventory API (v1) ───────────────────────────────────────────────────
 
 

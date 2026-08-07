@@ -83,6 +83,11 @@ def _removal_fees_cache():
     return _db().removalFeesCache
 
 
+def _reimbursements_cache():
+    """FBA Reimbursements report (GET_FBA_REIMBURSEMENTS_DATA) for a date window."""
+    return _db().reimbursementsCache
+
+
 def _product_settings():
     return _db().productSettings
 
@@ -125,6 +130,9 @@ async def init_db():
         [("userId", 1)], unique=True
     )
     await _removal_fees_cache().create_index(
+        [("userId", 1)], unique=True
+    )
+    await _reimbursements_cache().create_index(
         [("userId", 1)], unique=True
     )
     await _product_settings().create_index(
@@ -743,8 +751,73 @@ async def put_removal_fees_cache(
     )
 
 
+async def get_reimbursements_cache(
+    start_iso: str,
+    end_iso: str,
+    max_age_hours: int = 24,
+) -> dict | None:
+    """Cached FBA Reimbursements for one profitability window."""
+    user_id = _user_oid()
+    doc = await _reimbursements_cache().find_one({"userId": user_id})
+    if not doc:
+        return None
+    if int(doc.get("schemaVersion") or 0) < 2:
+        return None
+    if doc.get("startIso") != start_iso or doc.get("endIso") != end_iso:
+        return None
+    updated = doc.get("updatedAt")
+    if not updated:
+        return None
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
+    if age_hours > max_age_hours:
+        return None
+    if doc.get("accessDenied") and age_hours > 1:
+        return None
+    return {
+        "per_sku": doc.get("perSku", {}),
+        "updated_at": updated.isoformat(),
+        "access_denied": bool(doc.get("accessDenied")),
+        "report_total": float(doc.get("reportTotal") or 0),
+    }
+
+
+async def put_reimbursements_cache(
+    per_sku: dict,
+    start_iso: str,
+    end_iso: str,
+    report_total: float | None = None,
+    access_denied: bool = False,
+) -> None:
+    user_id = _user_oid()
+    if report_total is None:
+        report_total = 0.0
+        for v in (per_sku or {}).values():
+            if isinstance(v, dict):
+                report_total += float(v.get("reimbursement") or 0)
+            else:
+                report_total += float(v or 0)
+    await _reimbursements_cache().update_one(
+        {"userId": user_id},
+        {
+            "$set": {
+                "perSku": per_sku or {},
+                "startIso": start_iso,
+                "endIso": end_iso,
+                "accessDenied": access_denied,
+                "reportTotal": round(float(report_total or 0), 2),
+                "schemaVersion": 2,
+                "updatedAt": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {"userId": user_id},
+        },
+        upsert=True,
+    )
+
+
 async def clear_profitability_fee_caches(user_id: ObjectId | None = None) -> dict:
-    """Drop storage / aged / removal / placement fee caches for one seller.
+    """Drop storage / aged / removal / placement / reimbursement fee caches.
 
     Used after fee-pipeline fixes so a poisoned empty/403 cache cannot stick
     for the normal 24h TTL. Pass ``user_id`` from scripts; defaults to the
@@ -758,6 +831,7 @@ async def clear_profitability_fee_caches(user_id: ObjectId | None = None) -> dic
         ("aged_charges", _aged_surcharge_charges_cache()),
         ("removal", _removal_fees_cache()),
         ("placement", _placement_fee_cache()),
+        ("reimbursements", _reimbursements_cache()),
     ):
         result = await coll.delete_many({"userId": oid})
         deleted[name] = int(result.deleted_count or 0)

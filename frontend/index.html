@@ -3324,6 +3324,15 @@
         total: (_r, t) => `<td class="num" title="Seller Central Removal Order Detail total for request-dates in this filter">${profitMoney(t.removal_fee)}</td>`,
       },
       {
+        id: 'reimbursement',
+        label: 'Reimbursement',
+        title: 'Seller Central Reimbursements report (Event Date / approval-date): signed amount-total for the filter — includes credits and Reimbursement_Reversal. Account BLENDED; see Totals.',
+        num: true,
+        defaultVisible: true,
+        cell: (r, data) => `<td class="num" title="Reimbursements are blended from Seller Central Reimbursements for the date filter — see Totals">${(data.reimbursement_blended || (data.reimbursement_meta && data.reimbursement_meta.blended)) ? `<span class="profit-ads-blended">BLENDED</span>` : profitMoney(r.reimbursement)}</td>`,
+        total: (_r, t) => `<td class="num" title="Seller Central Reimbursements net amount-total (credits + reversals) for Event/approval dates in this filter">${profitMoney(t.reimbursement)}</td>`,
+      },
+      {
         id: 'net',
         label: 'Net',
         num: true,
@@ -3351,25 +3360,62 @@
       };
     }
 
+    function mergeProfitColumnOrder(savedOrder) {
+      const known = new Set(PROFIT_DEFAULT_ORDER);
+      const order = [];
+      for (const id of savedOrder || []) {
+        if (known.has(id) && !order.includes(id)) order.push(id);
+      }
+      // Insert newly added columns at their default relative position
+      // (e.g. reimbursement before net/margin), not blindly at the end.
+      for (const id of PROFIT_DEFAULT_ORDER) {
+        if (order.includes(id)) continue;
+        const defIdx = PROFIT_DEFAULT_ORDER.indexOf(id);
+        let insertAt = order.length;
+        for (let i = defIdx - 1; i >= 0; i -= 1) {
+          const prevAt = order.indexOf(PROFIT_DEFAULT_ORDER[i]);
+          if (prevAt >= 0) {
+            insertAt = prevAt + 1;
+            break;
+          }
+        }
+        if (insertAt === order.length) {
+          for (let i = defIdx + 1; i < PROFIT_DEFAULT_ORDER.length; i += 1) {
+            const nextAt = order.indexOf(PROFIT_DEFAULT_ORDER[i]);
+            if (nextAt >= 0) {
+              insertAt = nextAt;
+              break;
+            }
+          }
+        }
+        order.splice(insertAt, 0, id);
+      }
+      const withoutSku = order.filter((id) => id !== 'sku');
+      return ['sku', ...withoutSku];
+    }
+
+    function ensureReimbursementBeforeNetMargin(order) {
+      const without = (order || []).filter((id) => id !== 'reimbursement');
+      if (!PROFIT_COLUMN_BY_ID.reimbursement) return without;
+      let insertAt = without.length;
+      const netIdx = without.indexOf('net');
+      const marginIdx = without.indexOf('margin');
+      if (netIdx >= 0) insertAt = netIdx;
+      else if (marginIdx >= 0) insertAt = marginIdx;
+      without.splice(insertAt, 0, 'reimbursement');
+      return without;
+    }
+
     function loadProfitColumnPrefs() {
       try {
         const raw = localStorage.getItem(PROFIT_COL_PREFS_KEY);
         if (!raw) return defaultProfitColumnPrefs();
         const parsed = JSON.parse(raw);
         const base = defaultProfitColumnPrefs();
-        const known = new Set(PROFIT_DEFAULT_ORDER);
-        const order = [];
-        for (const id of parsed.order || []) {
-          if (known.has(id) && !order.includes(id)) order.push(id);
-        }
-        for (const id of PROFIT_DEFAULT_ORDER) {
-          if (!order.includes(id)) order.push(id);
-        }
-        // SKU always first
-        const withoutSku = order.filter((id) => id !== 'sku');
+        const order = ensureReimbursementBeforeNetMargin(mergeProfitColumnOrder(parsed.order));
         const visible = { ...base.visible, ...(parsed.visible || {}) };
         visible.sku = true;
-        return { order: ['sku', ...withoutSku], visible };
+        return { order, visible };
       } catch {
         return defaultProfitColumnPrefs();
       }
@@ -3651,6 +3697,7 @@
             kpiCard('Amz fees', `$${(t.amazon_fees || 0).toLocaleString()}`),
             kpiCard('Storage', `$${(t.storage_fee || 0).toLocaleString()}`),
             kpiCard('Removal', `$${(t.removal_fee || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}`),
+            kpiCard('Reimbursement', `$${(t.reimbursement || 0).toLocaleString(undefined, {maximumFractionDigits: 2})}`),
             kpiCard('Ad spend', `$${(t.ad_cost || 0).toLocaleString()}`),
             kpiCard('COGS + Inbound', `$${(t.cogs_total || 0).toLocaleString()}`),
             kpiCard('Net profit', `$${(t.net || 0).toLocaleString()}`),

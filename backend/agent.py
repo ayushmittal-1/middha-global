@@ -879,15 +879,18 @@ async def compute_profitability_data(
         get_aged_surcharge_charges_cache,
         get_placement_fee_cache,
         get_removal_fees_cache,
+        get_reimbursements_cache,
         get_storage_cache,
         put_aged_inventory_cache,
         put_aged_surcharge_charges_cache,
         put_placement_fee_cache,
         put_removal_fees_cache,
+        put_reimbursements_cache,
         merge_storage_cache,
     )
     from amazon_sp import (
         calendar_months_in_window,
+        fetch_reimbursements_for_window,
         fetch_removal_fees_per_sku,
         fetch_storage_fees_for_months,
         is_per_asin_by_month_storage_cache,
@@ -1108,6 +1111,17 @@ async def compute_profitability_data(
         "access_denied": False,
         "blended": True,
         "months": removal_months,
+    }
+
+    reimbursement_trusted = False
+    reimbursement_blended = True
+    reimbursement_report_total = 0.0
+    reimbursement_months = calendar_months_in_window(start_dt, end_dt, mp_tz)
+    reimbursement_meta: dict = {
+        "source": None,
+        "access_denied": False,
+        "blended": True,
+        "months": reimbursement_months,
     }
 
     ad_window = {
@@ -1625,6 +1639,55 @@ async def compute_profitability_data(
             removal_report_total = 0.0
             removal_meta["source"] = "unavailable"
 
+    async def _load_reimbursements():
+        # FBA Reimbursements report (GET_FBA_REIMBURSEMENTS_DATA), approval-date
+        # window. Always BLENDED account income on Totals — rows stay $0.
+        # Month-wise report create/reuse, then clipped to exact [start, end).
+        nonlocal reimbursement_trusted, reimbursement_report_total
+        try:
+            reimb_cache = await get_reimbursements_cache(
+                charges_start_iso, charges_end_iso, max_age_hours=24,
+            )
+            if reimb_cache and not reimb_cache.get("access_denied"):
+                reimbursement_report_total = round(
+                    float(reimb_cache.get("report_total") or 0), 2,
+                )
+                reimbursement_meta["source"] = "charges_cache"
+                reimbursement_trusted = True
+            else:
+                async with _REPORT_SEM:
+                    reimb_raw = await fetch_reimbursements_for_window(
+                        start_dt, end_dt, time_zone=mp_tz,
+                    )
+                per_sku = (reimb_raw or {}).get("per_sku") or {}
+                reimbursement_report_total = round(
+                    float((reimb_raw or {}).get("report_total") or 0), 2,
+                )
+                await put_reimbursements_cache(
+                    per_sku,
+                    charges_start_iso,
+                    charges_end_iso,
+                    report_total=reimbursement_report_total,
+                )
+                reimbursement_meta["source"] = "charges_report"
+                reimbursement_trusted = True
+            reimbursement_meta["report_total"] = reimbursement_report_total
+            reimbursement_meta["blended"] = True
+        except Exception as e:
+            warnings.append(_sp_report_warning("FBA Reimbursements", e))
+            if _is_sp_access_denied(e):
+                reimbursement_meta["access_denied"] = True
+                await put_reimbursements_cache(
+                    {},
+                    charges_start_iso,
+                    charges_end_iso,
+                    report_total=0.0,
+                    access_denied=True,
+                )
+            reimbursement_trusted = False
+            reimbursement_report_total = 0.0
+            reimbursement_meta["source"] = "unavailable"
+
     async def _load_product_fees_and_batch():
         # Fast path: Aurora products.fees (Mongo). Live Fees API only for
         # SKUs missing fees or whose sale price drifted from listing price —
@@ -1695,9 +1758,10 @@ async def compute_profitability_data(
         "returns": _fire_bg(_load_returns()),
         "placement": _fire_bg(_load_placement()),
         "product fees": _fire_bg(_load_product_fees_and_batch()),
-        # Storage report creates are slow, but leaving them on the soft
-        # deadline left Storage at $0 on first paint for every account.
+        # Storage / reimbursements report creates are slow; soft 5s left them
+        # at $0 on first paint even when Seller Central had rows.
         "storage": storage_task,
+        "reimbursements": _fire_bg(_load_reimbursements()),
     }
     soft_tasks: dict[str, asyncio.Task] = {
         "aged inventory": _fire_bg(_load_aged()),
@@ -1706,7 +1770,7 @@ async def compute_profitability_data(
     }
     # Two-tier wait:
     # 1) Soft reports (aged / removal / ads) get ~5s — keep running in bg.
-    # 2) Critical fee sources (finances / placement / storage / returns /
+    # 2) Critical fee sources (finances / placement / storage / reimbursements /
     #    product fees) await longer so first paint is usable.
     soft_deadline_s = 5.0
     critical_deadline_s = 55.0
@@ -1739,8 +1803,8 @@ async def compute_profitability_data(
             time_zone=mp_tz,
         )
     )
-    # Storage is NEVER BLENDED (only placement / ads / removal are).
-    # Primary: Monthly Storage Fees report → per-ASIN → split to sold SKUs.
+    # Storage is NEVER BLENDED (only placement / ads / removal / reimbursements
+    # are). Primary: Monthly Storage Fees report → per-ASIN → split to sold SKUs.
     # Fallback when report has no rows for the filter months: Finances
     # FBAStorageFee attributed by SellerSKU (and unattributed residual on
     # Totals). Same dollars as Payments → Transactions, per-SKU when Amazon
@@ -1973,6 +2037,8 @@ async def compute_profitability_data(
         # Removal / Disposal: always BLENDED from Removal Order Detail.
         # Per-SKU rows stay $0; Totals carries the request-date report sum.
         removal_fee = 0.0
+        # Reimbursements: always BLENDED account income; rows stay $0.
+        reimbursement = 0.0
 
         # COGS components (only when uploaded)
         cogs_row = cogs_map.get(sku)
@@ -1987,7 +2053,7 @@ async def compute_profitability_data(
         net = round(
             revenue - amazon_fees - storage - product_cost - inbound - ad_cost
             - return_processing_fee - low_inventory_fee - inbound_placement_fee
-            - aged_inventory_fee - removal_fee,
+            - aged_inventory_fee - removal_fee + reimbursement,
             2,
         )
         margin = round((net / revenue * 100), 1) if revenue > 0 else 0.0
@@ -2014,6 +2080,7 @@ async def compute_profitability_data(
             "inbound_placement_fee": inbound_placement_fee,
             "aged_inventory_fee": aged_inventory_fee,
             "removal_fee": removal_fee,
+            "reimbursement": reimbursement,
             "net": net,
             "margin": margin,
             "cogs_uploaded": cogs_row is not None,
@@ -2036,6 +2103,7 @@ async def compute_profitability_data(
         totals["inbound_placement_fee"] += inbound_placement_fee
         totals["aged_inventory_fee"] += aged_inventory_fee
         totals["removal_fee"] += removal_fee
+        totals["reimbursement"] += reimbursement
         totals["net"] += net
 
     # Blended placement: rows carry $0 / BLENDED; apply the Amazon placement
@@ -2087,6 +2155,15 @@ async def compute_profitability_data(
         removal_unallocated = fee_r
         removal_blended = True
 
+    # Reimbursements: BLENDED account income from FBA Reimbursements report
+    # (approval-date window). Credit increases net once on Totals.
+    if reimbursement_trusted:
+        credit = round(float(reimbursement_report_total or 0), 2)
+        totals["reimbursement"] = credit
+        if credit:
+            totals["net"] += credit
+        reimbursement_blended = True
+
     rev = totals["revenue"]
     totals_out = {k: round(v, 2) for k, v in totals.items()}
     totals_out["units"] = int(totals["units"])
@@ -2098,6 +2175,10 @@ async def compute_profitability_data(
     totals_out["removal_report_total"] = round(float(removal_report_total or 0), 2)
     totals_out["removal_unallocated"] = removal_unallocated
     totals_out["removal_blended"] = bool(removal_blended)
+    totals_out["reimbursement_report_total"] = round(
+        float(reimbursement_report_total or 0), 2,
+    )
+    totals_out["reimbursement_blended"] = bool(reimbursement_blended)
 
     caveats = [
         f"Date range uses marketplace timezone ({mp_tz}) — same day boundaries as Aurora Orders.",
@@ -2157,6 +2238,9 @@ async def compute_profitability_data(
         "removal-fee by request-date (Event Date) for Return + Disposal. "
         f"Months in filter: {', '.join(removal_months) or 'none'}. "
         "Never uses Finances ServiceFee spread.",
+        "Reimbursements use GET_FBA_REIMBURSEMENTS_DATA (Seller Central "
+        "Reimbursements report): BLENDED account income of amount-total by "
+        f"approval-date. Months in filter: {', '.join(reimbursement_months) or 'none'}.",
         "Return processing and low-inventory fees come from the Finances API "
         "(45-day lookback before the window start) — recent orders may not have "
         "them yet.",
@@ -2196,6 +2280,22 @@ async def compute_profitability_data(
         caveats.append(
             "Removal: Removal Order Detail unavailable for this window — "
             "showing $0 (retry; Finances spread is disabled so totals stay accurate)."
+        )
+    if reimbursement_trusted:
+        caveats.append(
+            f"Reimbursements are BLENDED for this window: "
+            f"${reimbursement_report_total:,.2f} (FBA Reimbursements approval-date "
+            f"total for {', '.join(reimbursement_months) or 'the filter'}). "
+            "SKU rows show BLENDED; see Totals / Reimbursement."
+        )
+    elif reimbursement_meta.get("access_denied"):
+        caveats.append(
+            "Reimbursements: FBA Reimbursements report is blocked (403) — showing $0."
+        )
+    elif reimbursement_meta.get("source") == "unavailable":
+        caveats.append(
+            "Reimbursements: FBA Reimbursements report unavailable for this window — "
+            "showing $0 (retry once Amazon finishes processing)."
         )
     if not storage_by_asin_month and not storage_from_finances:
         caveats.append("Storage fees: report unavailable for this window; values are 0.")
@@ -2278,6 +2378,8 @@ async def compute_profitability_data(
         "placement_blended": placement_blended,
         "removal_blended": bool(removal_blended),
         "removal_meta": removal_meta,
+        "reimbursement_blended": bool(reimbursement_blended),
+        "reimbursement_meta": reimbursement_meta,
         "caveats": caveats,
         "warnings": warnings,
     }
