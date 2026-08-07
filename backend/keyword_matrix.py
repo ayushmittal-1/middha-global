@@ -56,11 +56,12 @@ from keywords import fetch_amazon_keywords
 # dashboard's polling UX; nothing here needs to survive a restart.
 _JOBS: dict[str, dict[str, Any]] = {}
 
-SOURCES = ("amazon_asin", "meta", "amazon_searchbar")
+SOURCES = ("amazon_asin", "meta", "amazon_searchbar", "google")
 _SOURCE_LABELS = {
     "amazon_asin": "Amazon (ASIN)",
     "meta": "Meta",
     "amazon_searchbar": "Amazon Searchbar",
+    "google": "Google",
 }
 STEPS = ("sourcing", "brand_analytics", "cpc", "scoring", "done")
 
@@ -119,18 +120,20 @@ async def _run_job(job_id: str) -> None:
         job["step"] = "sourcing"
         job["titles"] = await _fetch_titles_for_asins(job["asins"])
 
-        # Fan out the three sourcing paths concurrently — none of them share
+        # Fan out the sourcing paths concurrently — none of them share
         # state and each hits a different API.
-        asin_res, meta_res, sb_res = await asyncio.gather(
+        asin_res, meta_res, sb_res, google_res = await asyncio.gather(
             _source_amazon_asin(job["asins"]),
             _source_meta(list(job["titles"].values())),
             _source_amazon_searchbar(list(job["titles"].values())),
+            _source_google_autocomplete(list(job["titles"].values())),
             return_exceptions=True,
         )
         for name, res in (
             ("amazon_asin", asin_res),
             ("meta", meta_res),
             ("amazon_searchbar", sb_res),
+            ("google", google_res),
         ):
             if isinstance(res, Exception):
                 job["sources"][name]["notes"].append(f"error: {res}")
@@ -414,6 +417,40 @@ async def _source_amazon_searchbar(titles: list[str]) -> dict:
                     keywords.append(norm)
         if not found_any:
             notes.append(f"no autocomplete for '{title[:40]}...'")
+    return {"keywords": keywords, "notes": notes}
+
+
+async def _source_google_autocomplete(titles: list[str]) -> dict:
+    """Google Search autocomplete — buyer-intent queries for each title.
+
+    Same seed-fanout strategy as `_source_amazon_searchbar`: multiple seeds
+    per title so head terms that live at the tail of a marketing-style title
+    still make it in. Google returns real typed user queries, which score
+    fairly against the Brand Analytics data — unlike Meta's ad interests,
+    which are broad audience categories that rarely appear in BA.
+    """
+    from google_autocomplete import fetch_google_suggestions
+
+    seen: set[str] = set()
+    keywords: list[str] = []
+    notes: list[str] = []
+    for title in titles:
+        if not title:
+            notes.append("empty title — skipped Google autocomplete for one ASIN")
+            continue
+        found_any = False
+        for seed in _seed_candidates(title):
+            results = await fetch_google_suggestions(seed)
+            if not results:
+                continue
+            found_any = True
+            for kw in results:
+                norm = kw.strip().lower()
+                if norm and norm not in seen:
+                    seen.add(norm)
+                    keywords.append(norm)
+        if not found_any:
+            notes.append(f"no Google suggestions for '{title[:40]}...'")
     return {"keywords": keywords, "notes": notes}
 
 

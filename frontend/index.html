@@ -4026,7 +4026,7 @@
 
     function renderKwSourceStrip(sources) {
       if (!sources) return;
-      const order = ['amazon_asin', 'meta', 'amazon_searchbar'];
+      const order = ['amazon_asin', 'meta', 'amazon_searchbar', 'google'];
       const html = order.map(key => {
         const s = sources[key];
         if (!s) return '';
