@@ -1427,6 +1427,66 @@ async def get_keyword_matrix(job_id: str, user: dict = Depends(protect)):
     return job
 
 
+# ── Listing Optimizer ─────────────────────────────────────────────────────
+
+class ListingAnalyzeRequest(BaseModel):
+    asin: str
+    title: str = ""
+    bullets: list[str] = []
+    description: str = ""
+    backend_keywords: str = ""
+    brand: str | None = None
+    category: str | None = None
+    focus_keywords: list[str] | None = None
+    marketplace: str = "US"
+
+
+@app.get("/listings/prefill/{asin}")
+async def listings_prefill(asin: str, user: dict = Depends(protect)):
+    """Pre-populate whatever we already know about an ASIN from Aurora's
+    `products` collection — title, brand, category, and the primary image.
+    Bullets / description / backend keywords aren't stored anywhere so they
+    stay empty; the seller pastes those into the form."""
+    from database import _db, _user_oid
+    doc = await _db().products.find_one(
+        {"sellerId": _user_oid(), "asin": asin.strip().upper()},
+        {"_id": 0, "title": 1, "brand": 1, "category": 1, "images": 1,
+         "sku": 1, "asin": 1},
+    )
+    if not doc:
+        return {"asin": asin, "found": False}
+    return {
+        "asin": doc.get("asin") or asin,
+        "found": True,
+        "sku": doc.get("sku"),
+        "title": doc.get("title") or "",
+        "brand": doc.get("brand") or "",
+        "category": doc.get("category") or "",
+        "primary_image": doc.get("images"),
+    }
+
+
+@app.post("/listings/analyze")
+async def listings_analyze(
+    body: ListingAnalyzeRequest, user: dict = Depends(protect),
+):
+    """Score + AI-rewrite a listing against Amazon's 2026 style guidelines.
+    Returns deterministic scorecard + LLM rewrites side-by-side."""
+    from listings_optimizer import analyze_listing
+    result = await analyze_listing(
+        asin=body.asin,
+        title=body.title,
+        bullets=body.bullets,
+        description=body.description,
+        backend_keywords=body.backend_keywords,
+        brand=body.brand,
+        category=body.category,
+        focus_keywords=body.focus_keywords,
+        marketplace=body.marketplace,
+    )
+    return result
+
+
 # Serve frontend static files
 frontend_dir = Path(__file__).parent.parent / "frontend"
 app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")

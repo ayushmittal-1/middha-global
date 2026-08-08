@@ -1621,6 +1621,104 @@
       color: #f8fafc;
     }
 
+    /* ── Listing Optimizer view ─────────────────────────── */
+    #listings-view {
+      display: none;
+      flex-direction: column;
+      flex: 1;
+      overflow-y: auto;
+      background: #fafafa;
+    }
+    #listings-view.visible { display: flex; }
+    #lo-toolbar {
+      display: flex; align-items: center; gap: 10px;
+      padding: 16px 20px; border-bottom: 1px solid #e5e5e5;
+      background: #fff; flex-wrap: wrap;
+    }
+    #lo-toolbar h2 { margin: 0; font-size: 18px; color: #1a1a2e; }
+    #lo-toolbar input[type=text] {
+      padding: 6px 10px; font-size: 13px;
+      border: 1px solid #d0d0d0; border-radius: 4px;
+      background: #fff; color: #1a1a2e;
+    }
+    #lo-asin { width: 160px; }
+    #lo-analyze-btn {
+      padding: 6px 14px; font-size: 13px;
+      background: #4a6cf7; color: #fff; border: none;
+      border-radius: 4px; cursor: pointer;
+    }
+    #lo-analyze-btn:hover { background: #3a5bd6; }
+    #lo-analyze-btn:disabled { background: #a0a8bd; cursor: not-allowed; }
+    #lo-status { font-size: 12px; color: #666; }
+    #lo-body { padding: 16px 20px; display: grid;
+      grid-template-columns: 1fr 1fr; gap: 20px; }
+    @media (max-width: 1100px) { #lo-body { grid-template-columns: 1fr; } }
+    .lo-panel {
+      background: #fff; border: 1px solid #e5e5e5;
+      border-radius: 6px; padding: 14px;
+    }
+    .lo-panel h3 {
+      margin: 0 0 10px 0; font-size: 14px; color: #1a1a2e;
+      border-bottom: 1px solid #eee; padding-bottom: 6px;
+    }
+    .lo-field { margin-bottom: 12px; }
+    .lo-field label {
+      display: block; font-size: 11px; color: #6b7280;
+      margin-bottom: 4px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .lo-field input[type=text], .lo-field textarea {
+      width: 100%; padding: 8px 10px; font-size: 13px;
+      border: 1px solid #d0d0d0; border-radius: 4px;
+      background: #fff; color: #1a1a2e; font-family: inherit;
+      box-sizing: border-box;
+    }
+    .lo-field textarea { min-height: 60px; resize: vertical; }
+    .lo-field .lo-hint { font-size: 11px; color: #9ca3af; margin-top: 2px; }
+    .lo-score-card {
+      border: 1px solid #e5e7eb; border-radius: 6px;
+      padding: 10px 12px; margin-bottom: 10px; background: #f9fafb;
+    }
+    .lo-score-head {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 6px;
+    }
+    .lo-score-name { font-weight: 600; font-size: 13px; color: #1a1a2e; }
+    .lo-score-badge {
+      font-size: 11px; font-weight: 700; padding: 2px 8px;
+      border-radius: 10px;
+    }
+    .lo-score-badge.good { background: #d1fae5; color: #047857; }
+    .lo-score-badge.mid  { background: #fef3c7; color: #92400e; }
+    .lo-score-badge.bad  { background: #fee2e2; color: #b91c1c; }
+    .lo-issue { font-size: 12px; color: #b91c1c; margin: 2px 0; }
+    .lo-pass  { font-size: 12px; color: #047857; margin: 2px 0; }
+    .lo-issue::before { content: "✗ "; }
+    .lo-pass::before  { content: "✓ "; }
+    .lo-rewrite {
+      background: #eff6ff; border: 1px solid #93c5fd;
+      border-radius: 6px; padding: 10px 12px; margin-bottom: 10px;
+    }
+    .lo-rewrite .lo-rewrite-title {
+      font-weight: 600; font-size: 12px; color: #1e40af;
+      margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.03em;
+    }
+    .lo-rewrite pre {
+      white-space: pre-wrap; word-break: break-word;
+      font-family: inherit; font-size: 13px; color: #1a1a2e;
+      margin: 0; line-height: 1.4;
+    }
+    .lo-checklist { list-style: none; padding: 0; margin: 0; }
+    .lo-checklist li {
+      font-size: 12px; color: #4b5563; padding: 4px 0;
+      display: flex; gap: 8px; align-items: flex-start;
+    }
+    .lo-checklist input[type=checkbox] { margin-top: 2px; }
+    #lo-total-score {
+      font-size: 18px; font-weight: 700; color: #1a1a2e;
+      margin-bottom: 12px;
+    }
+
     /* ── Keyword Matrix view ────────────────────────────── */
     #keywords-view {
       display: none;
@@ -1788,6 +1886,7 @@
       <button class="tab-btn" data-tab="profit">Profitability</button>
       <button class="tab-btn" data-tab="cogs">COGS</button>
       <button class="tab-btn" data-tab="keywords">Keywords</button>
+      <button class="tab-btn" data-tab="listings">Listings</button>
     </nav>
 
     <div id="chat-container">
@@ -2049,6 +2148,63 @@
       </div>
       <div id="cogs-empty" style="display:none; padding:20px; color:#888;">
         No COGS rows yet. Add one above or upload a CSV from the sidebar.
+      </div>
+    </div>
+
+    <div id="listings-view">
+      <div id="lo-toolbar">
+        <h2>Listing Optimizer</h2>
+        <input id="lo-asin" type="text" placeholder="ASIN — e.g. B0ABC12345">
+        <button id="lo-prefill-btn" style="padding:6px 12px;font-size:13px;background:#e5e7eb;border:none;border-radius:4px;cursor:pointer;">Pre-fill from DB</button>
+        <button id="lo-analyze-btn">Analyze &amp; rewrite</button>
+        <span id="lo-status"></span>
+      </div>
+      <div id="lo-body">
+        <div class="lo-panel">
+          <h3>Current listing</h3>
+          <div class="lo-field">
+            <label>Title</label>
+            <input id="lo-in-title" type="text" placeholder="Brand + Product Type + key attributes — under 200 chars">
+          </div>
+          <div class="lo-field">
+            <label>Brand</label>
+            <input id="lo-in-brand" type="text" placeholder="e.g. Acme">
+          </div>
+          <div class="lo-field">
+            <label>Category</label>
+            <input id="lo-in-category" type="text" placeholder="e.g. Home & Kitchen">
+          </div>
+          <div class="lo-field">
+            <label>Bullet points (one per line, up to 5)</label>
+            <textarea id="lo-in-bullets" rows="6" placeholder="FEATURE → BENEFIT → USE CASE, one bullet per line"></textarea>
+          </div>
+          <div class="lo-field">
+            <label>Product description</label>
+            <textarea id="lo-in-description" rows="5" placeholder="Overview, benefits, materials, usage, care. No URLs / no promo language."></textarea>
+          </div>
+          <div class="lo-field">
+            <label>Backend search terms</label>
+            <textarea id="lo-in-keywords" rows="2" placeholder="Space-separated, under 250 bytes, no duplicates, no commas"></textarea>
+            <div class="lo-hint">Backend search terms are Amazon's hidden keyword field (under 250 UTF-8 bytes).</div>
+          </div>
+          <div class="lo-field">
+            <label>Focus keywords (optional, comma-separated)</label>
+            <input id="lo-in-focus" type="text" placeholder="Keywords the rewrite should weave in — e.g. yoga mat, non slip, thick">
+          </div>
+          <div class="lo-field">
+            <label>Marketplace</label>
+            <select id="lo-in-market" style="padding:6px 10px;font-size:13px;border:1px solid #d0d0d0;border-radius:4px;">
+              <option value="US" selected>US (200-char title limit)</option>
+              <option value="IN">IN (75-char title limit, 2026 rule)</option>
+            </select>
+          </div>
+        </div>
+        <div class="lo-panel">
+          <h3>Analysis</h3>
+          <div id="lo-results" style="color:#6b7280;font-size:13px;">
+            Enter an ASIN + paste the current listing content, then click <b>Analyze &amp; rewrite</b>.
+          </div>
+        </div>
       </div>
     </div>
 
@@ -2650,6 +2806,7 @@
     let cogsLoaded = false;
 
     const keywordsViewEl = document.getElementById('keywords-view');
+    const listingsViewEl = document.getElementById('listings-view');
     const kwAsinsEl = document.getElementById('kw-asins');
     const kwCampaignEl = document.getElementById('kw-campaign');
     const kwAdgroupEl = document.getElementById('kw-adgroup');
@@ -2672,6 +2829,7 @@
       const isProfit = tab === 'profit';
       const isCogs = tab === 'cogs';
       const isKeywords = tab === 'keywords';
+      const isListings = tab === 'listings';
       chatContainerEl.style.display = isChat ? 'flex' : 'none';
       inputAreaEl.style.display = isChat ? 'flex' : 'none';
       restockViewEl.classList.toggle('visible', isRestock);
@@ -2680,6 +2838,7 @@
       profitViewEl.classList.toggle('visible', isProfit);
       cogsViewEl.classList.toggle('visible', isCogs);
       keywordsViewEl.classList.toggle('visible', isKeywords);
+      listingsViewEl.classList.toggle('visible', isListings);
       if (isRestock && !restockLoaded) {
         loadRestock();
         loadForecastSettings();
@@ -2705,6 +2864,161 @@
     document.querySelectorAll('.tab-btn').forEach(b => {
       b.addEventListener('click', () => setActiveTab(b.dataset.tab));
     });
+
+    // ── Listing Optimizer ───────────────────────────────
+    (function initListingOptimizer() {
+      const $ = (id) => document.getElementById(id);
+      const asin = $('lo-asin');
+      const inTitle = $('lo-in-title'), inBrand = $('lo-in-brand');
+      const inCategory = $('lo-in-category');
+      const inBullets = $('lo-in-bullets'), inDesc = $('lo-in-description');
+      const inKeywords = $('lo-in-keywords'), inFocus = $('lo-in-focus');
+      const inMarket = $('lo-in-market');
+      const statusEl = $('lo-status');
+      const resultsEl = $('lo-results');
+      const analyzeBtn = $('lo-analyze-btn');
+      const prefillBtn = $('lo-prefill-btn');
+
+      function setStatus(txt, isError) {
+        statusEl.textContent = txt || '';
+        statusEl.style.color = isError ? '#b91c1c' : '#666';
+      }
+
+      prefillBtn.addEventListener('click', async () => {
+        const a = (asin.value || '').trim().toUpperCase();
+        if (!a) { setStatus('Enter an ASIN first', true); return; }
+        setStatus('Loading from DB…');
+        try {
+          const r = await fetch(`/listings/prefill/${encodeURIComponent(a)}`,
+            { headers: authHeaders() });
+          const data = await r.json();
+          if (!data.found) {
+            setStatus(`No DB record for ${a} — fill fields manually`, true);
+            return;
+          }
+          if (data.title && !inTitle.value) inTitle.value = data.title;
+          if (data.brand && !inBrand.value) inBrand.value = data.brand;
+          if (data.category && !inCategory.value) inCategory.value = data.category;
+          setStatus(`Loaded title/brand/category for ${a}. Paste bullets, description & backend keywords.`);
+        } catch (e) {
+          setStatus(`Pre-fill failed: ${e}`, true);
+        }
+      });
+
+      analyzeBtn.addEventListener('click', async () => {
+        const a = (asin.value || '').trim().toUpperCase();
+        if (!a) { setStatus('Enter an ASIN', true); return; }
+        analyzeBtn.disabled = true;
+        setStatus('Analyzing… (usually 5-15s)');
+        resultsEl.innerHTML = '<div style="color:#6b7280;font-size:13px;">Running scorecard + AI rewrite…</div>';
+        const bullets = (inBullets.value || '').split('\n')
+          .map(s => s.trim()).filter(Boolean);
+        const focus = (inFocus.value || '').split(',')
+          .map(s => s.trim()).filter(Boolean);
+        try {
+          const r = await fetch('/listings/analyze', {
+            method: 'POST',
+            headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              asin: a,
+              title: inTitle.value || '',
+              bullets,
+              description: inDesc.value || '',
+              backend_keywords: inKeywords.value || '',
+              brand: inBrand.value || null,
+              category: inCategory.value || null,
+              focus_keywords: focus.length ? focus : null,
+              marketplace: inMarket.value || 'US',
+            }),
+          });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const data = await r.json();
+          renderResults(data);
+          setStatus(`Analyzed — total score ${data.total_score}/${data.max_score}`);
+        } catch (e) {
+          resultsEl.innerHTML = `<div style="color:#b91c1c;font-size:13px;">Analysis failed: ${escapeHtml(String(e))}</div>`;
+          setStatus('Analysis failed', true);
+        } finally {
+          analyzeBtn.disabled = false;
+        }
+      });
+
+      function badgeClass(score, max) {
+        const pct = max ? score / max : 0;
+        if (pct >= 0.8) return 'good';
+        if (pct >= 0.5) return 'mid';
+        return 'bad';
+      }
+
+      function renderScoreCard(name, s) {
+        const cls = badgeClass(s.score, s.max_score);
+        const issues = (s.issues || []).map(i => `<div class="lo-issue">${escapeHtml(i)}</div>`).join('');
+        const passed = (s.passed || []).map(p => `<div class="lo-pass">${escapeHtml(p)}</div>`).join('');
+        return `
+          <div class="lo-score-card">
+            <div class="lo-score-head">
+              <span class="lo-score-name">${escapeHtml(name)}</span>
+              <span class="lo-score-badge ${cls}">${s.score}/${s.max_score}</span>
+            </div>
+            ${issues}${passed}
+          </div>`;
+      }
+
+      function renderRewrite(label, value) {
+        if (value == null || value === '') return '';
+        const displayValue = Array.isArray(value)
+          ? value.map((v, i) => `${i + 1}. ${v}`).join('\n')
+          : String(value);
+        return `
+          <div class="lo-rewrite">
+            <div class="lo-rewrite-title">Suggested ${label}</div>
+            <pre>${escapeHtml(displayValue)}</pre>
+          </div>`;
+      }
+
+      function renderResults(data) {
+        const sc = data.scorecard || {};
+        const rw = data.rewrites || {};
+        const checklist = (data.images_checklist || []).map(item => `
+          <li>
+            <input type="checkbox">
+            <span>${escapeHtml(item)}</span>
+          </li>`).join('');
+        const rewriteError = rw.error
+          ? `<div style="color:#b91c1c;font-size:12px;margin-bottom:10px;">
+              AI rewrite unavailable: ${escapeHtml(rw.error)}
+             </div>`
+          : '';
+        const rewriteNotes = rw.notes
+          ? `<div style="font-size:12px;color:#6b7280;margin-bottom:10px;font-style:italic;">
+              ${escapeHtml(rw.notes)}
+             </div>`
+          : '';
+        resultsEl.innerHTML = `
+          <div id="lo-total-score">
+            Compliance score:
+            <span class="lo-score-badge ${badgeClass(data.total_score, data.max_score)}">${data.total_score}/${data.max_score}</span>
+          </div>
+          <h3 style="margin:16px 0 8px;font-size:13px;color:#1a1a2e;">Guideline scorecard</h3>
+          ${renderScoreCard('Title', sc.title || {})}
+          ${renderScoreCard('Bullet points', sc.bullets || {})}
+          ${renderScoreCard('Description', sc.description || {})}
+          ${renderScoreCard('Backend keywords', sc.backend_keywords || {})}
+
+          <h3 style="margin:16px 0 8px;font-size:13px;color:#1a1a2e;">AI rewrites</h3>
+          ${rewriteError}
+          ${rewriteNotes}
+          ${renderRewrite('title', rw.title)}
+          ${renderRewrite('bullets', rw.bullets)}
+          ${renderRewrite('description', rw.description)}
+          ${renderRewrite('backend keywords', rw.backend_keywords)}
+
+          <h3 style="margin:16px 0 8px;font-size:13px;color:#1a1a2e;">Images checklist (self-verify)</h3>
+          <ul class="lo-checklist">${checklist}</ul>
+        `;
+      }
+    })();
+
 
     function urgencyClass(daysOfCover) {
       if (daysOfCover === null || daysOfCover === undefined) return 'urgency-grey';
