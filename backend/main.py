@@ -1493,6 +1493,26 @@ async def listings_prefill(asin: str, user: dict = Depends(protect)):
         img = doc.get("images")
         if img is not None and not isinstance(img, str):
             img = str(img) if not isinstance(img, (dict, list)) else None
+        bullets = doc.get("bullets") or []
+        description = doc.get("description") or ""
+        content_source = "aurora"
+        # If Aurora didn't have bullets/description (SP-API doesn't
+        # reliably return them for most listings), fall back to scraping
+        # the PDP. Silently no-ops on cloud IPs when SCRAPER_API_KEY
+        # isn't set — Amazon blocks datacenter IPs immediately.
+        if not bullets and not description:
+            try:
+                from pdp_scraper import scrape_pdp_for_asin
+                scraped = await scrape_pdp_for_asin(doc.get("asin") or asin)
+                if scraped:
+                    bullets = scraped.get("bullets") or []
+                    description = scraped.get("description") or ""
+                    content_source = f"scrape:{scraped.get('source', 'live')}"
+            except Exception as e:
+                import logging
+                logging.getLogger("main").warning(
+                    "pdp scrape failed for %s: %s", asin, e,
+                )
         return {
             "asin": doc.get("asin") or asin,
             "found": True,
@@ -1501,10 +1521,11 @@ async def listings_prefill(asin: str, user: dict = Depends(protect)):
             "brand": doc.get("brand") or "",
             "category": doc.get("category") or "",
             "primary_image": img,
-            "bullets": doc.get("bullets") or [],
-            "description": doc.get("description") or "",
+            "bullets": bullets,
+            "description": description,
             "backend_keywords": doc.get("searchTerms") or "",
             "item_type_keyword": doc.get("itemTypeKeyword") or "",
+            "content_source": content_source,
         }
     except Exception as e:
         return {"asin": asin, "found": False, "error": f"prefill failed: {e}"}
