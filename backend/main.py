@@ -1468,17 +1468,21 @@ async def listings_config():
 @app.get("/listings/prefill/{asin}")
 async def listings_prefill(asin: str, user: dict = Depends(protect)):
     """Pre-populate whatever we already know about an ASIN from Aurora's
-    `products` collection — title, brand, category, and the primary image.
-    Bullets / description / backend keywords aren't stored anywhere so they
-    stay empty; the seller pastes those into the form. Wrapped in a
-    catch-all so a DB error surfaces as JSON, not an HTML 500 that crashes
-    the FE's response.json() parse."""
+    `products` collection — title/brand/category/image plus (after the
+    Aurora Listings-attributes PR merged) bullets/description/searchTerms.
+    Wrapped in a catch-all so a DB error surfaces as JSON, not an HTML
+    500 that crashes the FE's response.json() parse."""
     try:
         from database import _db, _user_oid
         doc = await _db().products.find_one(
             {"sellerId": _user_oid(), "asin": asin.strip().upper()},
             {"_id": 0, "title": 1, "brand": 1, "category": 1, "images": 1,
-             "sku": 1, "asin": 1},
+             "sku": 1, "asin": 1,
+             # New fields Aurora writes once the Listings-attribute
+             # extraction has run (POST /api/products/sync). Empty on
+             # products that haven't been re-synced since that PR.
+             "bullets": 1, "description": 1, "searchTerms": 1,
+             "itemTypeKeyword": 1},
         )
         if not doc:
             return {"asin": asin, "found": False}
@@ -1497,6 +1501,10 @@ async def listings_prefill(asin: str, user: dict = Depends(protect)):
             "brand": doc.get("brand") or "",
             "category": doc.get("category") or "",
             "primary_image": img,
+            "bullets": doc.get("bullets") or [],
+            "description": doc.get("description") or "",
+            "backend_keywords": doc.get("searchTerms") or "",
+            "item_type_keyword": doc.get("itemTypeKeyword") or "",
         }
     except Exception as e:
         return {"asin": asin, "found": False, "error": f"prefill failed: {e}"}

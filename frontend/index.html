@@ -3130,18 +3130,21 @@
       }
 
       // Row click → open optimizer for that ASIN.
-      function openInOptimizer(row) {
+      async function openInOptimizer(row) {
         showOptimizer();
         asin.value = row.asin || '';
         inTitle.value = row.title || '';
         inBrand.value = row.brand || '';
         inCategory.value = row.category || '';
-        // Reset editable-but-not-in-DB fields.
         inBullets.value = '';
         inDesc.value = '';
         inKeywords.value = '';
-        resultsEl.innerHTML = `<div style="color:#6b7280;font-size:13px;">Paste bullets / description / backend keywords for <b>${escapeHtml(row.asin || '')}</b>, then click <b>Analyze &amp; rewrite</b>. Title-only analyze is also useful if you just want a quick check.</div>`;
-        setStatus('');
+        resultsEl.innerHTML = `<div style="color:#6b7280;font-size:13px;">Loading full listing content for <b>${escapeHtml(row.asin || '')}</b>…</div>`;
+        setStatus('Loading listing content…');
+        // Auto-fire prefill so bullets/description/backend_keywords
+        // populate too (Aurora writes these once the Listings-attribute
+        // sync change ships). Silently no-ops on older un-resynced ASINs.
+        await runPrefill(row.asin);
       }
 
       // Expose so setActiveTab can trigger the initial load.
@@ -3163,8 +3166,8 @@
       });
       refreshBtn.addEventListener('click', () => loadListingsList());
 
-      prefillBtn.addEventListener('click', async () => {
-        const a = (asin.value || '').trim().toUpperCase();
+      async function runPrefill(asinInput) {
+        const a = (asinInput || asin.value || '').trim().toUpperCase();
         if (!a) { setStatus('Enter an ASIN first', true); return; }
         setStatus('Loading from DB…');
         try {
@@ -3174,16 +3177,31 @@
           if (!data.found) {
             const suffix = data.error ? ` (${data.error})` : '';
             setStatus(`No DB record for ${a}${suffix} — fill fields manually`, true);
+            resultsEl.innerHTML = `<div style="color:#6b7280;font-size:13px;">Paste bullets / description / backend keywords for <b>${escapeHtml(a)}</b> and click <b>Analyze &amp; rewrite</b>.</div>`;
             return;
           }
           if (data.title && !inTitle.value) inTitle.value = data.title;
           if (data.brand && !inBrand.value) inBrand.value = data.brand;
           if (data.category && !inCategory.value) inCategory.value = data.category;
-          setStatus(`Loaded title/brand/category for ${a}. Paste bullets, description & backend keywords.`);
+          // New fields — only overwrite when non-empty so we don't wipe
+          // the user's edits. bullets is an array; join with newlines
+          // to match the textarea format.
+          if (Array.isArray(data.bullets) && data.bullets.length && !inBullets.value) {
+            inBullets.value = data.bullets.join('\n');
+          }
+          if (data.description && !inDesc.value) inDesc.value = data.description;
+          if (data.backend_keywords && !inKeywords.value) inKeywords.value = data.backend_keywords;
+          const gotContent = data.bullets?.length || data.description || data.backend_keywords;
+          const contentMsg = gotContent
+            ? 'Full listing loaded from Aurora.'
+            : 'Only title/brand loaded — bullets/description not synced yet. Paste them manually or re-run product sync.';
+          setStatus(`${a}: ${contentMsg}`);
+          resultsEl.innerHTML = `<div style="color:#6b7280;font-size:13px;">Ready. Click <b>Analyze &amp; rewrite</b> to score against Amazon's guidelines and get AI-suggested rewrites.</div>`;
         } catch (e) {
           setStatus(`Pre-fill failed: ${e.message || e}`, true);
         }
-      });
+      }
+      prefillBtn.addEventListener('click', () => runPrefill());
 
       analyzeBtn.addEventListener('click', async () => {
         const a = (asin.value || '').trim().toUpperCase();
