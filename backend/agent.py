@@ -817,6 +817,52 @@ def _aggregate_sku_from_sp_api(
     return sku_data, orders_count
 
 
+def _lookup_returns_for_sku(
+    returns_by_sku: dict[str, dict],
+    sku: str,
+) -> dict | None:
+    """Exact then case-insensitive SKU match (no ASIN fallback)."""
+    ret = returns_by_sku.get(sku)
+    if ret or not sku:
+        return ret
+    sku_l = sku.lower()
+    return next(
+        (v for k, v in returns_by_sku.items() if str(k).lower() == sku_l),
+        None,
+    )
+
+
+def _apply_returns_to_sku_data(
+    sku_data: dict[str, dict],
+    returns_by_sku: dict[str, dict],
+) -> None:
+    """Net units/revenue/line fees by returned quantity (in-place).
+
+    Units become ordered − returned. Revenue and Aurora order-line
+    referral/FBA totals scale by kept/ordered so Referral, FBA, Fuel,
+    COGS, and per-unit allocations all follow remaining quantity.
+    """
+    if not returns_by_sku or not sku_data:
+        return
+    for sku, d in sku_data.items():
+        ordered = int(d.get("units") or 0)
+        if ordered <= 0:
+            continue
+        ret = _lookup_returns_for_sku(returns_by_sku, sku)
+        returned = int((ret or {}).get("returned_units") or 0)
+        if returned <= 0:
+            continue
+        returned = min(returned, ordered)
+        kept = ordered - returned
+        ratio = kept / ordered
+        d["units"] = kept
+        d["revenue"] = float(d.get("revenue") or 0.0) * ratio
+        if "referral_total" in d:
+            d["referral_total"] = float(d.get("referral_total") or 0.0) * ratio
+        if "fba_total" in d:
+            d["fba_total"] = float(d.get("fba_total") or 0.0) * ratio
+
+
 # Storage report generation on Amazon's side runs 30-240s for months not
 # yet published. Kick it off in the background, dedupe rapid callers on the
 # same (user, months) key, and let the caller decide whether to wait. Keep
@@ -867,6 +913,9 @@ async def compute_profitability_data(
     otherwise spread uniformly across units sold. Returns / low-inv /
     inbound-placement come from Finances / Aurora events; aged-inv and
     removal / disposal come from their Seller Central charge reports.
+    Units, revenue, Referral, FBA, Fuel, and COGS are net of returned/
+    refunded units for orders purchased in the window; Return Proc still
+    charges 20% of referral on those returned units.
 
     Window is defined by `start`/`end` (YYYY-MM-DD strings or datetimes)
     when either is provided; falls back to `days_back` for legacy callers
@@ -1819,6 +1868,11 @@ async def compute_profitability_data(
     elif float(storage_report_total or 0) > 0:
         storage_meta["source"] = "storage_report"
         storage_meta["window_total"] = round(float(storage_report_total), 2)
+
+    # Net out returned/refunded units before fee × units math and storage /
+    # ad allocation. Return Proc still uses full returned_units below.
+    _apply_returns_to_sku_data(sku_data, returns_by_sku)
+
     # Units sold per ASIN — used to split that ASIN's report fee across SKUs.
     storage_units_by_asin: dict[str, float] = defaultdict(float)
     for _sku, _d in sku_data.items():
@@ -1976,14 +2030,7 @@ async def compute_profitability_data(
         # `refunded_referral`). Must match by exact seller SKU only — many
         # replenishment / amazon.gr SKUs share one ASIN, and falling back by
         # ASIN incorrectly charged Return Proc on never-returned SKUs.
-        ret = returns_by_sku.get(sku)
-        if not ret and sku:
-            # Case-insensitive SKU match only (no ASIN fallback).
-            sku_l = sku.lower()
-            ret = next(
-                (v for k, v in returns_by_sku.items() if str(k).lower() == sku_l),
-                None,
-            )
+        ret = _lookup_returns_for_sku(returns_by_sku, sku)
         refunded_referral = float((ret or {}).get("refunded_referral") or 0.0)
         returned_units = int((ret or {}).get("returned_units") or 0)
         return_processing_fee = round(0.20 * refunded_referral, 2)
@@ -2183,7 +2230,8 @@ async def compute_profitability_data(
     caveats = [
         f"Date range uses marketplace timezone ({mp_tz}) — same day boundaries as Aurora Orders.",
         "Units and revenue exclude Canceled, Cancelled, and Unfulfillable orders "
-        "(same rules as the Aurora dashboard).",
+        "(same rules as the Aurora dashboard), and subtract returned/refunded "
+        "units so Referral, FBA, Fuel, and COGS use remaining quantity only.",
     ]
     if placement_blended:
         src = placement_meta.get("source")
