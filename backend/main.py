@@ -1441,29 +1441,97 @@ class ListingAnalyzeRequest(BaseModel):
     marketplace: str = "US"
 
 
+class ListingScoresRequest(BaseModel):
+    asins: list[str]
+
+
+def _listing_analysis_cache():
+    """One doc per (userId, asin) — persisted score from the last analyze
+    run so the products list can render a real number instead of a dash."""
+    from database import _db
+    return _db().listingAnalysisCache
+
+
+@app.get("/listings/config")
+async def listings_config():
+    """Tell the frontend where Aurora's products endpoint lives so it can
+    fetch the list directly instead of us proxying it. Derived from
+    AURORA_API_URL (already used by campaigns.py) by stripping the /ads
+    suffix — one env var to configure, works in dev and prod."""
+    aurora_api = os.getenv(
+        "AURORA_API_URL", "https://aurorabackend-is4p.onrender.com/api/ads",
+    ).rstrip("/")
+    api_base = aurora_api.rsplit("/", 1)[0] if "/" in aurora_api else aurora_api
+    return {"aurora_products_url": f"{api_base}/products"}
+
+
 @app.get("/listings/prefill/{asin}")
 async def listings_prefill(asin: str, user: dict = Depends(protect)):
     """Pre-populate whatever we already know about an ASIN from Aurora's
     `products` collection — title, brand, category, and the primary image.
     Bullets / description / backend keywords aren't stored anywhere so they
-    stay empty; the seller pastes those into the form."""
-    from database import _db, _user_oid
-    doc = await _db().products.find_one(
-        {"sellerId": _user_oid(), "asin": asin.strip().upper()},
-        {"_id": 0, "title": 1, "brand": 1, "category": 1, "images": 1,
-         "sku": 1, "asin": 1},
-    )
-    if not doc:
-        return {"asin": asin, "found": False}
-    return {
-        "asin": doc.get("asin") or asin,
-        "found": True,
-        "sku": doc.get("sku"),
-        "title": doc.get("title") or "",
-        "brand": doc.get("brand") or "",
-        "category": doc.get("category") or "",
-        "primary_image": doc.get("images"),
-    }
+    stay empty; the seller pastes those into the form. Wrapped in a
+    catch-all so a DB error surfaces as JSON, not an HTML 500 that crashes
+    the FE's response.json() parse."""
+    try:
+        from database import _db, _user_oid
+        doc = await _db().products.find_one(
+            {"sellerId": _user_oid(), "asin": asin.strip().upper()},
+            {"_id": 0, "title": 1, "brand": 1, "category": 1, "images": 1,
+             "sku": 1, "asin": 1},
+        )
+        if not doc:
+            return {"asin": asin, "found": False}
+        # `images` in Aurora sometimes holds an ObjectId reference (not a
+        # URL string) — coerce to str so FastAPI's jsonable_encoder doesn't
+        # blow up with "ObjectId is not iterable". If it's a dict/list, we
+        # skip it since we don't render nested image structures yet.
+        img = doc.get("images")
+        if img is not None and not isinstance(img, str):
+            img = str(img) if not isinstance(img, (dict, list)) else None
+        return {
+            "asin": doc.get("asin") or asin,
+            "found": True,
+            "sku": doc.get("sku"),
+            "title": doc.get("title") or "",
+            "brand": doc.get("brand") or "",
+            "category": doc.get("category") or "",
+            "primary_image": img,
+        }
+    except Exception as e:
+        return {"asin": asin, "found": False, "error": f"prefill failed: {e}"}
+
+
+@app.post("/listings/scores")
+async def listings_scores(
+    body: ListingScoresRequest, user: dict = Depends(protect),
+):
+    """Given a list of ASINs, return the cached compliance score for each.
+    Missing ASINs (never analyzed) are omitted — the FE renders them as
+    a dash. One Mongo roundtrip via $in regardless of page size. The
+    products list itself lives in Aurora's Node.js /api/products — this
+    endpoint only owns the score data (Middha-specific)."""
+    try:
+        from database import _user_oid
+        asins = [a.strip().upper() for a in (body.asins or []) if a and a.strip()]
+        if not asins:
+            return {"scores": {}}
+        cursor = _listing_analysis_cache().find(
+            {"userId": _user_oid(), "asin": {"$in": asins}},
+            {"_id": 0, "asin": 1, "total_score": 1, "max_score": 1,
+             "updated_at": 1},
+        )
+        out: dict[str, dict] = {}
+        async for c in cursor:
+            out[c["asin"]] = {
+                "total_score": c.get("total_score"),
+                "max_score": c.get("max_score"),
+                "last_analyzed": c.get("updated_at").isoformat()
+                    if hasattr(c.get("updated_at"), "isoformat") else None,
+            }
+        return {"scores": out}
+    except Exception as e:
+        return {"scores": {}, "error": f"scores query failed: {e}"}
 
 
 @app.post("/listings/analyze")
@@ -1471,19 +1539,45 @@ async def listings_analyze(
     body: ListingAnalyzeRequest, user: dict = Depends(protect),
 ):
     """Score + AI-rewrite a listing against Amazon's 2026 style guidelines.
-    Returns deterministic scorecard + LLM rewrites side-by-side."""
+    Returns deterministic scorecard + LLM rewrites side-by-side. Persists
+    the total score to listingAnalysisCache so the products list can show
+    a real number next time."""
     from listings_optimizer import analyze_listing
-    result = await analyze_listing(
-        asin=body.asin,
-        title=body.title,
-        bullets=body.bullets,
-        description=body.description,
-        backend_keywords=body.backend_keywords,
-        brand=body.brand,
-        category=body.category,
-        focus_keywords=body.focus_keywords,
-        marketplace=body.marketplace,
-    )
+    try:
+        result = await analyze_listing(
+            asin=body.asin,
+            title=body.title,
+            bullets=body.bullets,
+            description=body.description,
+            backend_keywords=body.backend_keywords,
+            brand=body.brand,
+            category=body.category,
+            focus_keywords=body.focus_keywords,
+            marketplace=body.marketplace,
+        )
+    except Exception as e:
+        return {"error": f"analyze failed: {e}"}
+
+    # Persist the compliance score for this ASIN so the products list can
+    # render a real number instead of a dash. Best-effort — a cache-write
+    # failure shouldn't take down the whole analyze response.
+    try:
+        from database import _user_oid
+        await _listing_analysis_cache().update_one(
+            {"userId": _user_oid(), "asin": body.asin.strip().upper()},
+            {"$set": {
+                "userId": _user_oid(),
+                "asin": body.asin.strip().upper(),
+                "total_score": result.get("total_score"),
+                "max_score": result.get("max_score"),
+                "updated_at": datetime.now(timezone.utc),
+                "marketplace": body.marketplace,
+            }},
+            upsert=True,
+        )
+    except Exception as e:
+        result["_cache_warning"] = f"failed to persist score: {e}"
+
     return result
 
 

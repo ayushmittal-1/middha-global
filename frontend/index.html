@@ -1642,6 +1642,29 @@
       background: #fff; color: #1a1a2e;
     }
     #lo-asin { width: 160px; }
+    #lo-search { min-width: 260px; flex: 1; max-width: 500px; }
+    #lo-list-table tbody tr { cursor: pointer; transition: background 0.1s; }
+    #lo-list-table tbody tr:hover { background: #eff6ff; }
+    #lo-list-table tbody td {
+      padding: 10px 12px; font-size: 13px; color: #1a1a2e;
+      border-bottom: 1px solid #f3f4f6;
+    }
+    .lo-list-title { font-weight: 500; }
+    .lo-list-brand { color: #6b7280; font-size: 12px; }
+    #lo-pagination button {
+      padding: 4px 10px; font-size: 12px; background: #e5e7eb;
+      border: none; border-radius: 4px; cursor: pointer;
+      margin: 0 2px;
+    }
+    #lo-pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .lo-score-cell {
+      display: inline-block; padding: 3px 8px; border-radius: 10px;
+      font-weight: 600; font-size: 12px;
+    }
+    .lo-score-cell.good { background: #d1fae5; color: #047857; }
+    .lo-score-cell.mid  { background: #fef3c7; color: #92400e; }
+    .lo-score-cell.bad  { background: #fee2e2; color: #b91c1c; }
+    .lo-score-cell.none { background: #f3f4f6; color: #9ca3af; }
     #lo-analyze-btn {
       padding: 6px 14px; font-size: 13px;
       background: #4a6cf7; color: #fff; border: none;
@@ -2152,7 +2175,37 @@
     </div>
 
     <div id="listings-view">
+      <!-- List view: paginated products with compliance scores -->
+      <div id="lo-list-panel">
+        <div id="lo-toolbar">
+          <h2>Listings</h2>
+          <input id="lo-search" type="text" placeholder="Search title / ASIN / SKU">
+          <button id="lo-refresh-btn" style="padding:6px 12px;font-size:13px;background:#e5e7eb;border:none;border-radius:4px;cursor:pointer;">Refresh</button>
+          <span id="lo-list-status" style="font-size:12px;color:#666;"></span>
+        </div>
+        <div style="padding:16px 20px;">
+          <table id="lo-list-table" style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e5e5;border-radius:6px;overflow:hidden;">
+            <thead>
+              <tr style="background:#f9fafb;border-bottom:1px solid #e5e5e5;">
+                <th style="padding:10px 12px;text-align:left;font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:0.03em;">Title</th>
+                <th style="padding:10px 12px;text-align:left;font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:0.03em;width:130px;">ASIN</th>
+                <th style="padding:10px 12px;text-align:left;font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:0.03em;width:140px;">Brand</th>
+                <th style="padding:10px 12px;text-align:right;font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:0.03em;width:100px;">Score</th>
+                <th style="padding:10px 12px;text-align:left;font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:0.03em;width:140px;">Last analyzed</th>
+              </tr>
+            </thead>
+            <tbody id="lo-list-tbody">
+              <tr><td colspan="5" style="padding:20px;text-align:center;color:#9ca3af;font-size:13px;">Loading…</td></tr>
+            </tbody>
+          </table>
+          <div id="lo-pagination" style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;font-size:12px;color:#6b7280;"></div>
+        </div>
+      </div>
+
+      <!-- Optimizer view: existing form, shown when a row is clicked -->
+      <div id="lo-optimizer-panel" style="display:none;">
       <div id="lo-toolbar">
+        <button id="lo-back-btn" style="padding:6px 10px;font-size:13px;background:#e5e7eb;border:none;border-radius:4px;cursor:pointer;">← Back to listings</button>
         <h2>Listing Optimizer</h2>
         <input id="lo-asin" type="text" placeholder="ASIN — e.g. B0ABC12345">
         <button id="lo-prefill-btn" style="padding:6px 12px;font-size:13px;background:#e5e7eb;border:none;border-radius:4px;cursor:pointer;">Pre-fill from DB</button>
@@ -2206,6 +2259,7 @@
           </div>
         </div>
       </div>
+      </div><!-- /lo-optimizer-panel -->
     </div>
 
     <div id="keywords-view">
@@ -2839,6 +2893,9 @@
       cogsViewEl.classList.toggle('visible', isCogs);
       keywordsViewEl.classList.toggle('visible', isKeywords);
       listingsViewEl.classList.toggle('visible', isListings);
+      if (isListings && typeof window.__loadListingsIfNeeded === 'function') {
+        window.__loadListingsIfNeeded();
+      }
       if (isRestock && !restockLoaded) {
         loadRestock();
         loadForecastSettings();
@@ -2866,6 +2923,27 @@
     });
 
     // ── Listing Optimizer ───────────────────────────────
+    let loListLoaded = false;
+    let loCurrentPage = 1;
+    let loSearchTerm = '';
+
+    async function loSafeJsonFetch(url, opts) {
+      // Defensive fetch — a proxy 500 (HTML "Internal Server Error") should
+      // surface as a clean error, not crash the whole flow with a
+      // "Unexpected token 'I'" JSON parse.
+      const r = await fetch(url, opts);
+      const ct = r.headers.get('content-type') || '';
+      const text = await r.text();
+      if (!ct.includes('application/json')) {
+        throw new Error(`HTTP ${r.status}: server returned non-JSON — ${text.slice(0, 120)}`);
+      }
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        throw new Error(`HTTP ${r.status}: invalid JSON — ${text.slice(0, 120)}`);
+      }
+    }
+
     (function initListingOptimizer() {
       const $ = (id) => document.getElementById(id);
       const asin = $('lo-asin');
@@ -2878,22 +2956,224 @@
       const resultsEl = $('lo-results');
       const analyzeBtn = $('lo-analyze-btn');
       const prefillBtn = $('lo-prefill-btn');
+      const backBtn = $('lo-back-btn');
+      const listPanel = $('lo-list-panel');
+      const optimizerPanel = $('lo-optimizer-panel');
+      const searchEl = $('lo-search');
+      const refreshBtn = $('lo-refresh-btn');
+      const listStatus = $('lo-list-status');
+      const listTbody = $('lo-list-tbody');
+      const pagerEl = $('lo-pagination');
 
       function setStatus(txt, isError) {
         statusEl.textContent = txt || '';
         statusEl.style.color = isError ? '#b91c1c' : '#666';
       }
 
+      // ── View switching ─────────────────────────────
+      function showList() {
+        listPanel.style.display = '';
+        optimizerPanel.style.display = 'none';
+        setStatus('');
+      }
+      function showOptimizer() {
+        listPanel.style.display = 'none';
+        optimizerPanel.style.display = '';
+      }
+      backBtn.addEventListener('click', () => {
+        showList();
+        // Refresh list — the row we just analyzed now has a real score.
+        loadListingsList();
+      });
+
+      // ── List loading + rendering ───────────────────
+      function scoreClass(score, max) {
+        if (score == null || !max) return 'none';
+        const pct = score / max;
+        if (pct >= 0.8) return 'good';
+        if (pct >= 0.5) return 'mid';
+        return 'bad';
+      }
+      function fmtLastAnalyzed(iso) {
+        if (!iso) return '<span style="color:#9ca3af;">Never</span>';
+        try {
+          const d = new Date(iso);
+          const now = new Date();
+          const days = Math.floor((now - d) / (1000 * 60 * 60 * 24));
+          if (days === 0) return 'Today';
+          if (days === 1) return 'Yesterday';
+          if (days < 30) return `${days}d ago`;
+          return d.toLocaleDateString();
+        } catch { return iso; }
+      }
+      // Aurora products URL — resolved lazily from Middha's /listings/config
+      // so we don't hardcode it in the FE. Same JWT works on both backends
+      // because they share JWT_SECRET.
+      let auroraProductsUrl = null;
+      async function resolveAuroraUrl() {
+        if (auroraProductsUrl) return auroraProductsUrl;
+        try {
+          const c = await loSafeJsonFetch('/listings/config',
+            { headers: authHeaders() });
+          auroraProductsUrl = c.aurora_products_url;
+        } catch (e) {
+          console.warn('config fetch failed', e);
+        }
+        return auroraProductsUrl;
+      }
+
+      async function loadListingsList() {
+        listStatus.textContent = 'Loading…';
+        listTbody.innerHTML = '<tr><td colspan="5" style="padding:20px;text-align:center;color:#9ca3af;font-size:13px;">Loading…</td></tr>';
+        try {
+          const auroraUrl = await resolveAuroraUrl();
+          if (!auroraUrl) throw new Error('Aurora products URL not configured');
+          const qs = new URLSearchParams({
+            page: String(loCurrentPage),
+            limit: '25',
+            sortBy: 'lastUpdatedTime',
+            sortOrder: 'desc',
+            listing: 'listed',
+          });
+          if (loSearchTerm) qs.set('search', loSearchTerm);
+          // Same JWT as Middha — auth.py note: both backends share JWT_SECRET.
+          const auroraResp = await fetch(`${auroraUrl}?${qs}`,
+            { headers: authHeaders() });
+          if (!auroraResp.ok) {
+            throw new Error(`Aurora products: HTTP ${auroraResp.status}`);
+          }
+          const aurora = await auroraResp.json();
+          // Aurora response shape: {success, count, pagination:{page,limit,total,pages}, data:[...]}
+          const items = (aurora.data || []).map(p => ({
+            asin: (p.asin || '').trim(),
+            sku: p.sku || p.sellerSku || '',
+            title: p.title || '',
+            brand: p.brand || '',
+            category: p.category || '',
+          }));
+          const pagination = aurora.pagination || {};
+
+          if (!items.length) {
+            listStatus.textContent = '';
+            listTbody.innerHTML = `<tr><td colspan="5" style="padding:20px;text-align:center;color:#9ca3af;font-size:13px;">No products match.</td></tr>`;
+            pagerEl.innerHTML = '';
+            return;
+          }
+
+          // Fetch cached scores from Middha for just the ASINs on this
+          // page. One roundtrip, joined client-side.
+          const asinsOnPage = items.map(it => it.asin).filter(Boolean);
+          let scoresMap = {};
+          try {
+            const scoresResp = await loSafeJsonFetch('/listings/scores', {
+              method: 'POST',
+              headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+              body: JSON.stringify({ asins: asinsOnPage }),
+            });
+            scoresMap = scoresResp.scores || {};
+          } catch (e) {
+            // Score column just shows dashes — not a fatal error.
+            console.warn('scores fetch failed', e);
+          }
+          items.forEach(it => {
+            const s = scoresMap[it.asin] || {};
+            it.total_score = s.total_score;
+            it.max_score = s.max_score;
+            it.last_analyzed = s.last_analyzed;
+          });
+
+          listTbody.innerHTML = items.map(it => {
+            const scoreStr = (it.total_score != null && it.max_score)
+              ? `<span class="lo-score-cell ${scoreClass(it.total_score, it.max_score)}">${it.total_score}/${it.max_score}</span>`
+              : `<span class="lo-score-cell none">—</span>`;
+            const title = it.title || '<span style="color:#9ca3af;">(no title)</span>';
+            return `
+              <tr data-asin="${escapeHtml(it.asin || '')}"
+                  data-title="${escapeHtml(it.title || '')}"
+                  data-brand="${escapeHtml(it.brand || '')}"
+                  data-category="${escapeHtml(it.category || '')}">
+                <td><div class="lo-list-title">${escapeHtml(title.length > 80 ? title.slice(0, 80) + '…' : title)}</div><div class="lo-list-brand">${escapeHtml(it.sku || '')}</div></td>
+                <td><code style="font-size:12px;">${escapeHtml(it.asin || '—')}</code></td>
+                <td>${escapeHtml(it.brand || '—')}</td>
+                <td style="text-align:right;">${scoreStr}</td>
+                <td>${fmtLastAnalyzed(it.last_analyzed)}</td>
+              </tr>`;
+          }).join('');
+          listTbody.querySelectorAll('tr').forEach(tr => {
+            tr.addEventListener('click', () => openInOptimizer({
+              asin: tr.dataset.asin,
+              title: tr.dataset.title,
+              brand: tr.dataset.brand,
+              category: tr.dataset.category,
+            }));
+          });
+          const totalPages = pagination.pages || 1;
+          const total = pagination.total || items.length;
+          const page = pagination.page || loCurrentPage;
+          listStatus.textContent = `${total} products`;
+          pagerEl.innerHTML = `
+            <span>Page ${page} of ${totalPages} · ${total} total</span>
+            <span>
+              <button ${page <= 1 ? 'disabled' : ''} data-page="${page - 1}">‹ Prev</button>
+              <button ${page >= totalPages ? 'disabled' : ''} data-page="${page + 1}">Next ›</button>
+            </span>`;
+          pagerEl.querySelectorAll('button[data-page]').forEach(b => {
+            b.addEventListener('click', () => {
+              loCurrentPage = parseInt(b.dataset.page, 10);
+              loadListingsList();
+            });
+          });
+        } catch (e) {
+          listStatus.textContent = '';
+          listTbody.innerHTML = `<tr><td colspan="5" style="padding:20px;text-align:center;color:#b91c1c;font-size:13px;">Failed to load: ${escapeHtml(String(e))}</td></tr>`;
+        }
+      }
+
+      // Row click → open optimizer for that ASIN.
+      function openInOptimizer(row) {
+        showOptimizer();
+        asin.value = row.asin || '';
+        inTitle.value = row.title || '';
+        inBrand.value = row.brand || '';
+        inCategory.value = row.category || '';
+        // Reset editable-but-not-in-DB fields.
+        inBullets.value = '';
+        inDesc.value = '';
+        inKeywords.value = '';
+        resultsEl.innerHTML = `<div style="color:#6b7280;font-size:13px;">Paste bullets / description / backend keywords for <b>${escapeHtml(row.asin || '')}</b>, then click <b>Analyze &amp; rewrite</b>. Title-only analyze is also useful if you just want a quick check.</div>`;
+        setStatus('');
+      }
+
+      // Expose so setActiveTab can trigger the initial load.
+      window.__loadListingsIfNeeded = function () {
+        if (loListLoaded) return;
+        loListLoaded = true;
+        loadListingsList();
+      };
+
+      // Search input — debounced.
+      let searchDebounce;
+      searchEl.addEventListener('input', () => {
+        clearTimeout(searchDebounce);
+        searchDebounce = setTimeout(() => {
+          loSearchTerm = searchEl.value.trim();
+          loCurrentPage = 1;
+          loadListingsList();
+        }, 300);
+      });
+      refreshBtn.addEventListener('click', () => loadListingsList());
+
       prefillBtn.addEventListener('click', async () => {
         const a = (asin.value || '').trim().toUpperCase();
         if (!a) { setStatus('Enter an ASIN first', true); return; }
         setStatus('Loading from DB…');
         try {
-          const r = await fetch(`/listings/prefill/${encodeURIComponent(a)}`,
+          const data = await loSafeJsonFetch(
+            `/listings/prefill/${encodeURIComponent(a)}`,
             { headers: authHeaders() });
-          const data = await r.json();
           if (!data.found) {
-            setStatus(`No DB record for ${a} — fill fields manually`, true);
+            const suffix = data.error ? ` (${data.error})` : '';
+            setStatus(`No DB record for ${a}${suffix} — fill fields manually`, true);
             return;
           }
           if (data.title && !inTitle.value) inTitle.value = data.title;
@@ -2901,7 +3181,7 @@
           if (data.category && !inCategory.value) inCategory.value = data.category;
           setStatus(`Loaded title/brand/category for ${a}. Paste bullets, description & backend keywords.`);
         } catch (e) {
-          setStatus(`Pre-fill failed: ${e}`, true);
+          setStatus(`Pre-fill failed: ${e.message || e}`, true);
         }
       });
 
@@ -2916,7 +3196,7 @@
         const focus = (inFocus.value || '').split(',')
           .map(s => s.trim()).filter(Boolean);
         try {
-          const r = await fetch('/listings/analyze', {
+          const data = await loSafeJsonFetch('/listings/analyze', {
             method: 'POST',
             headers: { ...authHeaders(), 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2931,12 +3211,13 @@
               marketplace: inMarket.value || 'US',
             }),
           });
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          const data = await r.json();
+          if (data.error) throw new Error(data.error);
           renderResults(data);
           setStatus(`Analyzed — total score ${data.total_score}/${data.max_score}`);
+          // Mark the list as stale so returning shows the new score.
+          loListLoaded = false;
         } catch (e) {
-          resultsEl.innerHTML = `<div style="color:#b91c1c;font-size:13px;">Analysis failed: ${escapeHtml(String(e))}</div>`;
+          resultsEl.innerHTML = `<div style="color:#b91c1c;font-size:13px;">Analysis failed: ${escapeHtml(e.message || String(e))}</div>`;
           setStatus('Analysis failed', true);
         } finally {
           analyzeBtn.disabled = false;
