@@ -31,6 +31,12 @@ from agent import client  # Reuse the existing Groq client instance.
 # chat path's model config changes.
 MODEL = "llama-3.3-70b-versatile"
 
+# Vision model for image compliance checks. Llama-4 Scout on Groq
+# accepts image URLs via OpenAI-style content parts. Keep this separate
+# from the text MODEL so a Groq deprecation on one side doesn't break
+# the other.
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
 log = logging.getLogger("listings_optimizer")
 
 # ── Amazon 2026 style-guide constants ──────────────────────────────────────
@@ -244,18 +250,99 @@ def score_backend_keywords(keywords: str) -> FieldScore:
     return fs
 
 
-# The 7-item image checklist from the guidelines doc. All entries are
-# rendered as manual-verify checkboxes in the UI — we can't actually
-# inspect the images (no vision model wired), so this is a self-check.
-IMAGES_CHECKLIST = [
+# Amazon image guideline targets (2026).
+IMAGE_MIN_LONG_EDGE = 1000       # min longest edge for zoom eligibility
+IMAGE_RECOMMENDED_EDGE = 1600    # recommended for full zoom quality
+IMAGE_TARGET_COUNT_MIN = 7       # 7–9 images is the recommended range
+IMAGE_TARGET_COUNT_MAX = 9
+
+# Manual-verify items we can't inspect without a vision model. Rendered
+# as a separate self-check checklist under the auto-scored bits.
+IMAGES_MANUAL_CHECKLIST = [
     "Main image on pure white background (RGB 255,255,255)",
     "Product occupies at least 85% of the frame",
-    "All images at least 1000×1000 px (1600+ recommended for zoom)",
-    "7–9 total images uploaded (main + variants + lifestyle + size chart)",
     "Includes a lifestyle / in-use shot",
     "Includes an infographic with dimensions or key features",
     "No text/watermarks/logos overlaid on the main image",
 ]
+
+
+def _image_long_edge(img: dict) -> int:
+    """Best-effort longest-edge px for an image dict.
+
+    Aurora stores images as {url, height, width}. When dims are missing
+    we try to parse the Amazon CDN size hint from the URL — filenames
+    like `_SL1500_.jpg` or `_SX679_SY522_.jpg` encode the rendered size.
+    Returns 0 when we can't determine dims — treated as unknown, not zero.
+    """
+    if not isinstance(img, dict):
+        return 0
+    h = int(img.get("height") or 0)
+    w = int(img.get("width") or 0)
+    if h or w:
+        return max(h, w)
+    url = str(img.get("url") or "")
+    # _SL1500_, _SX679_, _SY522_, _AC_SL1500_, etc. — the digits are px.
+    m = re.findall(r"_S[LXY](\d{2,5})_", url)
+    if m:
+        return max(int(x) for x in m)
+    return 0
+
+
+def score_images(images: list[dict] | None) -> FieldScore:
+    """Auto-score whatever we can from the image list — count + dims.
+
+    Colour/composition checks stay in the manual checklist; we can't
+    inspect pixels here without a vision model. Missing dims are treated
+    as unknown (soft warning), not a hard fail — Aurora doesn't populate
+    dims for every image and we don't want to punish that.
+    """
+    fs = FieldScore()
+    imgs = [i for i in (images or []) if isinstance(i, dict) and i.get("url")]
+    n = len(imgs)
+    if n == 0:
+        fs.fail("No product images uploaded", penalty=10)
+        return fs
+
+    if n < IMAGE_TARGET_COUNT_MIN:
+        fs.fail(
+            f"Only {n} image(s) — Amazon recommends "
+            f"{IMAGE_TARGET_COUNT_MIN}–{IMAGE_TARGET_COUNT_MAX} "
+            "(main + variants + lifestyle + infographic + size chart)",
+            penalty=3,
+        )
+    elif n > IMAGE_TARGET_COUNT_MAX:
+        # Not a hard fail — extras don't render but don't hurt either.
+        fs.pass_(f"{n} images (Amazon renders the first {IMAGE_TARGET_COUNT_MAX})")
+    else:
+        fs.pass_(f"{n} images in the recommended {IMAGE_TARGET_COUNT_MIN}–{IMAGE_TARGET_COUNT_MAX} range")
+
+    dims = [_image_long_edge(i) for i in imgs]
+    known = [d for d in dims if d > 0]
+    if known:
+        too_small = [d for d in known if d < IMAGE_MIN_LONG_EDGE]
+        if too_small:
+            fs.fail(
+                f"{len(too_small)}/{len(known)} image(s) below {IMAGE_MIN_LONG_EDGE}px "
+                "on the long edge — zoom won't activate",
+                penalty=3,
+            )
+        else:
+            below_recommended = [d for d in known if d < IMAGE_RECOMMENDED_EDGE]
+            if below_recommended:
+                fs.fail(
+                    f"{len(below_recommended)}/{len(known)} image(s) below "
+                    f"{IMAGE_RECOMMENDED_EDGE}px — zoom works but quality is limited",
+                    penalty=1,
+                )
+            else:
+                fs.pass_(f"All measured images ≥{IMAGE_RECOMMENDED_EDGE}px on the long edge")
+    if len(known) < n:
+        # Not a scoring hit — just surface it so the seller knows why.
+        fs.passed.append(
+            f"{n - len(known)} image(s) missing dimensions — can't verify zoom eligibility"
+        )
+    return fs
 
 
 def score_listing(
@@ -264,6 +351,7 @@ def score_listing(
     description: str,
     backend_keywords: str,
     brand: str | None = None,
+    images: list[dict] | None = None,
     max_title_chars: int = TITLE_MAX_CHARS_DEFAULT,
 ) -> dict:
     """Run all deterministic checks. LLM-free. Returns a unified scorecard
@@ -273,6 +361,7 @@ def score_listing(
         "bullets": score_bullets(bullets).to_dict(),
         "description": score_description(description).to_dict(),
         "backend_keywords": score_backend_keywords(backend_keywords).to_dict(),
+        "images": score_images(images).to_dict(),
     }
     total = sum(s["score"] for s in scorecard.values())
     max_total = sum(s["max_score"] for s in scorecard.values())
@@ -280,7 +369,7 @@ def score_listing(
         "scorecard": scorecard,
         "total_score": total,
         "max_score": max_total,
-        "images_checklist": IMAGES_CHECKLIST,
+        "images_manual_checklist": IMAGES_MANUAL_CHECKLIST,
     }
 
 
@@ -367,6 +456,130 @@ async def rewrite_listing(
         return {"error": str(e)}
 
 
+# ── Vision analysis for the image checklist ───────────────────────────────
+
+
+_VISION_ITEMS = [
+    # (id, question). Each becomes one JSON key in the model response.
+    ("white_background", "Is the MAIN image (first one) on a pure white background (RGB 255,255,255, no shadows, gradients, or colored floor)?"),
+    ("product_frame", "Does the product in the MAIN image occupy at least 85% of the frame?"),
+    ("lifestyle_shot", "Does the image set include at least one lifestyle / in-use / in-context shot showing the product being used?"),
+    ("infographic", "Does the image set include at least one infographic-style image (dimensions callouts, feature labels, comparison chart, or similar)?"),
+    ("no_watermarks", "Is the MAIN image free of text, watermarks, logos, or promotional badges overlaid on the product?"),
+]
+
+_VISION_SYSTEM_PROMPT = (
+    "You are an Amazon listing compliance reviewer. You will look at a "
+    "seller's product images and grade them against Amazon's 2026 image "
+    "guidelines. Be strict but fair — 'pass' means the image clearly meets "
+    "the rule, 'fail' means it clearly violates it, 'unsure' when the "
+    "image is too small/low-res to judge. The FIRST image is always the "
+    "listing's main image; the rest are gallery/variants. Return VALID "
+    "JSON only, no prose."
+)
+
+
+def _build_vision_user_prompt() -> str:
+    lines = ["For each of the following checks, respond with pass / fail / unsure and one short reason."]
+    for i, (key, question) in enumerate(_VISION_ITEMS, 1):
+        lines.append(f"{i}. {key}: {question}")
+    lines.append("")
+    lines.append("Return JSON of the exact shape:")
+    schema = {k: {"verdict": "pass|fail|unsure", "reason": "one short sentence"} for k, _ in _VISION_ITEMS}
+    lines.append(json.dumps(schema, indent=2))
+    return "\n".join(lines)
+
+
+async def analyze_images_vision(images: list[dict] | None) -> dict:
+    """Send image URLs to Groq's vision model and grade against the manual
+    checklist. Best-effort — returns {} silently when there are no images
+    or the model errors; the FE falls back to the human checklist in
+    either case."""
+    urls = [
+        str(i.get("url"))
+        for i in (images or [])
+        if isinstance(i, dict) and i.get("url")
+    ]
+    # Cap at 6 images to keep the request small and the latency bounded.
+    # Amazon shows main + up to 8 gallery — 6 is enough to judge the set.
+    urls = urls[:6]
+    if not urls:
+        return {}
+
+    content: list[dict] = [
+        {"type": "text", "text": _build_vision_user_prompt()},
+    ]
+    for u in urls:
+        content.append({"type": "image_url", "image_url": {"url": u}})
+
+    try:
+        resp = await client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=[
+                {"role": "system", "content": _VISION_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=800,
+        )
+        raw = resp.choices[0].message.content or "{}"
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        log.warning("analyze_images_vision: bad JSON: %s", e)
+        return {"error": "Vision model returned malformed JSON"}
+    except Exception as e:
+        log.exception("analyze_images_vision failed")
+        return {"error": str(e)}
+
+    # Normalise: only keep the known keys, coerce verdict to lowercase.
+    out: dict = {}
+    for key, question in _VISION_ITEMS:
+        row = parsed.get(key) if isinstance(parsed, dict) else None
+        if not isinstance(row, dict):
+            continue
+        verdict = str(row.get("verdict") or "").lower().strip()
+        if verdict not in ("pass", "fail", "unsure"):
+            verdict = "unsure"
+        out[key] = {
+            "question": question,
+            "verdict": verdict,
+            "reason": str(row.get("reason") or "").strip(),
+        }
+    return {"items": out, "images_reviewed": urls}
+
+
+def _apply_vision_verdicts_to_score(image_score: dict, vision: dict) -> None:
+    """Fold vision verdicts back into the image scorecard in place. Each
+    `fail` verdict deducts 1 pt from images (min 0) so a listing that
+    aces count+dims but flunks white-background/watermarks doesn't get
+    a fake 10/10."""
+    items = (vision or {}).get("items") or {}
+    if not items:
+        return
+    fails = [k for k, v in items.items() if v.get("verdict") == "fail"]
+    if not fails:
+        image_score.setdefault("passed", []).append(
+            "Vision review: no issues found on white-background, lifestyle, infographic, watermarks."
+        )
+        return
+    label = {
+        "white_background": "Main image background isn't pure white",
+        "product_frame": "Product fills less than 85% of the main image",
+        "lifestyle_shot": "No lifestyle / in-use shot detected",
+        "infographic": "No infographic image detected",
+        "no_watermarks": "Text/watermark/logo detected on the main image",
+    }
+    penalty = min(len(fails), image_score.get("score", 0))
+    image_score["score"] = max(0, image_score.get("score", 0) - penalty)
+    for k in fails:
+        reason = items[k].get("reason", "")
+        msg = label.get(k, k)
+        image_score.setdefault("issues", []).append(
+            f"AI vision: {msg}{f' — {reason}' if reason else ''}"
+        )
+
+
 # ── Unified entrypoint ────────────────────────────────────────────────────
 
 
@@ -380,16 +593,18 @@ async def analyze_listing(
     category: str | None = None,
     focus_keywords: list[str] | None = None,
     marketplace: str = "US",
+    images: list[dict] | None = None,
 ) -> dict:
-    """Run scorecard + AI rewrite in one call. Returns the shape the FE
-    expects — deterministic checks and LLM rewrites side by side."""
+    """Run scorecard + AI rewrite + vision review in one call. Returns
+    the shape the FE expects — deterministic checks, LLM rewrites, and
+    vision verdicts side by side."""
     max_title = (
         TITLE_MAX_CHARS_INDIA if marketplace.upper() == "IN"
         else TITLE_MAX_CHARS_DEFAULT
     )
     scored = score_listing(
         title=title, bullets=bullets, description=description,
-        backend_keywords=backend_keywords, brand=brand,
+        backend_keywords=backend_keywords, brand=brand, images=images,
         max_title_chars=max_title,
     )
     rewrites = await rewrite_listing(
@@ -397,6 +612,13 @@ async def analyze_listing(
         backend_keywords=backend_keywords, brand=brand, category=category,
         focus_keywords=focus_keywords,
     )
+    vision = await analyze_images_vision(images)
+    if vision and not vision.get("error"):
+        _apply_vision_verdicts_to_score(scored["scorecard"]["images"], vision)
+        # Re-sum totals since we may have deducted from the images row.
+        scored["total_score"] = sum(
+            s["score"] for s in scored["scorecard"].values()
+        )
     return {
         "asin": asin,
         "brand": brand,
@@ -404,4 +626,6 @@ async def analyze_listing(
         "marketplace": marketplace,
         **scored,
         "rewrites": rewrites,
+        "images_vision": vision,
+        "images": images or [],
     }

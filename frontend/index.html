@@ -3166,6 +3166,11 @@
       });
       refreshBtn.addEventListener('click', () => loadListingsList());
 
+      // Cache the image list Aurora returns during prefill so analyze can
+      // score it. Not exposed as a form field — sellers upload images
+      // through Amazon, not here.
+      let loLastImages = [];
+
       async function runPrefill(asinInput) {
         const a = (asinInput || asin.value || '').trim().toUpperCase();
         if (!a) { setStatus('Enter an ASIN first', true); return; }
@@ -3178,6 +3183,7 @@
             const suffix = data.error ? ` (${data.error})` : '';
             setStatus(`No DB record for ${a}${suffix} — fill fields manually`, true);
             resultsEl.innerHTML = `<div style="color:#6b7280;font-size:13px;">Paste bullets / description / backend keywords for <b>${escapeHtml(a)}</b> and click <b>Analyze &amp; rewrite</b>.</div>`;
+            loLastImages = [];
             return;
           }
           if (data.title && !inTitle.value) inTitle.value = data.title;
@@ -3191,12 +3197,25 @@
           }
           if (data.description && !inDesc.value) inDesc.value = data.description;
           if (data.backend_keywords && !inKeywords.value) inKeywords.value = data.backend_keywords;
+          loLastImages = Array.isArray(data.images) ? data.images : [];
           const gotContent = data.bullets?.length || data.description || data.backend_keywords;
           const contentMsg = gotContent
             ? 'Full listing loaded from Aurora.'
             : 'Only title/brand loaded — bullets/description not synced yet. Paste them manually or re-run product sync.';
-          setStatus(`${a}: ${contentMsg}`);
-          resultsEl.innerHTML = `<div style="color:#6b7280;font-size:13px;">Ready. Click <b>Analyze &amp; rewrite</b> to score against Amazon's guidelines and get AI-suggested rewrites.</div>`;
+          const imgMsg = loLastImages.length
+            ? ` ${loLastImages.length} image(s) will be auto-scored.`
+            : '';
+          setStatus(`${a}: ${contentMsg}${imgMsg}`);
+          // Render thumbnails right away so the seller can eyeball the
+          // listing before triggering the (slower) Analyze pass.
+          const thumbs = renderImageThumbs(loLastImages);
+          resultsEl.innerHTML = `
+            <div style="color:#6b7280;font-size:13px;margin-bottom:10px;">
+              Ready. Click <b>Analyze &amp; rewrite</b> to score against Amazon's guidelines and get AI-suggested rewrites.
+            </div>
+            <h3 style="margin:12px 0 6px;font-size:13px;color:#1a1a2e;">Current images (${loLastImages.length})</h3>
+            ${thumbs}
+          `;
         } catch (e) {
           setStatus(`Pre-fill failed: ${e.message || e}`, true);
         }
@@ -3227,6 +3246,7 @@
               category: inCategory.value || null,
               focus_keywords: focus.length ? focus : null,
               marketplace: inMarket.value || 'US',
+              images: loLastImages.length ? loLastImages : null,
             }),
           });
           if (data.error) throw new Error(data.error);
@@ -3275,14 +3295,77 @@
           </div>`;
       }
 
+      function renderImageThumbs(images) {
+        if (!Array.isArray(images) || images.length === 0) {
+          return '<div style="font-size:12px;color:#6b7280;">No images to preview.</div>';
+        }
+        const tiles = images.map((im, idx) => {
+          const url = im && im.url;
+          if (!url) return '';
+          const dims = (im.height && im.width) ? `${im.width}×${im.height}` : '';
+          const label = idx === 0 ? 'MAIN' : `#${idx + 1}`;
+          return `
+            <a href="${escapeHtml(url)}" target="_blank" rel="noopener"
+               style="display:flex;flex-direction:column;align-items:center;gap:4px;
+                      padding:6px;border:1px solid #e5e7eb;border-radius:6px;
+                      background:#fff;text-decoration:none;color:#111827;">
+              <img src="${escapeHtml(url)}" alt="Image ${idx + 1}"
+                   style="width:88px;height:88px;object-fit:contain;background:#f9fafb;border-radius:4px;"
+                   loading="lazy">
+              <span style="font-size:10px;color:#6b7280;">${label}${dims ? ' • ' + dims : ''}</span>
+            </a>`;
+        }).join('');
+        return `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;">${tiles}</div>`;
+      }
+
+      function renderVisionVerdicts(vision, manualItems) {
+        // If vision failed or wasn't run, fall back to the manual-checklist
+        // checkboxes so the section is never empty.
+        if (!vision || vision.error || !vision.items) {
+          const errNote = vision && vision.error
+            ? `<div style="font-size:11px;color:#b91c1c;margin-bottom:6px;">
+                AI vision unavailable: ${escapeHtml(vision.error)} — self-verify below.
+               </div>`
+            : '';
+          const checklist = (manualItems || []).map(item => `
+            <li>
+              <input type="checkbox">
+              <span>${escapeHtml(item)}</span>
+            </li>`).join('');
+          return `${errNote}<ul class="lo-checklist">${checklist}</ul>`;
+        }
+        const badge = (v) => {
+          const color = v === 'pass' ? '#059669' : v === 'fail' ? '#dc2626' : '#6b7280';
+          const bg = v === 'pass' ? '#d1fae5' : v === 'fail' ? '#fee2e2' : '#f3f4f6';
+          return `<span style="display:inline-block;padding:1px 6px;border-radius:10px;
+                                font-size:10px;font-weight:600;color:${color};background:${bg};
+                                text-transform:uppercase;">${v}</span>`;
+        };
+        const rows = Object.entries(vision.items).map(([key, row]) => `
+          <div style="display:flex;align-items:flex-start;gap:8px;padding:6px 0;
+                      border-bottom:1px solid #f3f4f6;">
+            <div style="flex-shrink:0;width:52px;">${badge(row.verdict)}</div>
+            <div style="flex:1;font-size:12px;">
+              <div style="color:#1a1a2e;">${escapeHtml(row.question)}</div>
+              ${row.reason ? `<div style="color:#6b7280;font-size:11px;margin-top:2px;">${escapeHtml(row.reason)}</div>` : ''}
+            </div>
+          </div>`).join('');
+        return `
+          <div style="font-size:11px;color:#6b7280;margin-bottom:4px;">
+            Auto-reviewed by Llama-4 Scout vision on ${vision.images_reviewed?.length || 0} image(s).
+          </div>
+          <div style="border:1px solid #e5e7eb;border-radius:6px;padding:0 10px;background:#fafafa;">
+            ${rows}
+          </div>`;
+      }
+
       function renderResults(data) {
         const sc = data.scorecard || {};
         const rw = data.rewrites || {};
-        const checklist = (data.images_checklist || []).map(item => `
-          <li>
-            <input type="checkbox">
-            <span>${escapeHtml(item)}</span>
-          </li>`).join('');
+        // `images_manual_checklist` is the new key (auto-scored bits moved
+        // into sc.images); `images_checklist` is the pre-scoring name kept
+        // so an older backend behind a stale FE doesn't render nothing.
+        const manualItems = data.images_manual_checklist || data.images_checklist || [];
         const rewriteError = rw.error
           ? `<div style="color:#b91c1c;font-size:12px;margin-bottom:10px;">
               AI rewrite unavailable: ${escapeHtml(rw.error)}
@@ -3293,6 +3376,8 @@
               ${escapeHtml(rw.notes)}
              </div>`
           : '';
+        const thumbs = renderImageThumbs(data.images || []);
+        const vision = renderVisionVerdicts(data.images_vision, manualItems);
         resultsEl.innerHTML = `
           <div id="lo-total-score">
             Compliance score:
@@ -3303,6 +3388,13 @@
           ${renderScoreCard('Bullet points', sc.bullets || {})}
           ${renderScoreCard('Description', sc.description || {})}
           ${renderScoreCard('Backend keywords', sc.backend_keywords || {})}
+          ${sc.images ? renderScoreCard('Images', sc.images) : ''}
+
+          <h3 style="margin:16px 0 8px;font-size:13px;color:#1a1a2e;">Current images</h3>
+          ${thumbs}
+
+          <h3 style="margin:16px 0 8px;font-size:13px;color:#1a1a2e;">AI vision review</h3>
+          ${vision}
 
           <h3 style="margin:16px 0 8px;font-size:13px;color:#1a1a2e;">AI rewrites</h3>
           ${rewriteError}
@@ -3311,9 +3403,6 @@
           ${renderRewrite('bullets', rw.bullets)}
           ${renderRewrite('description', rw.description)}
           ${renderRewrite('backend keywords', rw.backend_keywords)}
-
-          <h3 style="margin:16px 0 8px;font-size:13px;color:#1a1a2e;">Images checklist (self-verify)</h3>
-          <ul class="lo-checklist">${checklist}</ul>
         `;
       }
     })();
@@ -5156,15 +5245,35 @@
               </div>`;
           })()}
           ${(() => {
-            // Dev-only 3-way model comparison — Prophet vs LightGBM vs
-            // Naive on the same holdout. Only rendered when the backend
-            // has LGBM_BENCHMARK=1 set (otherwise `compare` is null).
+            // Dev-only multi-model comparison. Iterates over compare.models
+            // (a {name: result} dict from the backend) so adding more models
+            // in routes.py is a pure backend change — no FE update needed.
             if (!compare) return '';
-            const rows = [
-              { key: 'prophet',  label: 'Prophet',  color: '#f59e0b', data: compare.prophet },
-              { key: 'lgbm',     label: 'LightGBM', color: '#10b981', data: compare.lgbm },
-              { key: 'naive',    label: 'Naive',    color: '#8b5cf6', data: compare.naive },
-            ];
+            // MODEL_META maps the backend key → display label + chart color.
+            // If a new model shows up in compare.models that isn't listed
+            // here, it's rendered with default label + grey.
+            const MODEL_META = {
+              naive:    { label: 'Naive',    color: '#8b5cf6' },
+              prophet:  { label: 'Prophet',  color: '#f59e0b' },
+              lgbm:     { label: 'LightGBM', color: '#10b981' },
+              xgb:      { label: 'XGBoost',  color: '#3b82f6' },
+              catboost: { label: 'CatBoost', color: '#ec4899' },
+              chronos:  { label: 'Chronos',  color: '#0ea5e9' },
+            };
+            const modelsObj = compare.models || {
+              // Back-compat with old backends that only return the flat keys.
+              naive: compare.naive, prophet: compare.prophet,
+              lgbm: compare.lgbm, xgb: compare.xgb,
+              catboost: compare.catboost, chronos: compare.chronos,
+            };
+            const rows = Object.entries(modelsObj)
+              .filter(([, data]) => data)
+              .map(([key, data]) => ({
+                key,
+                label: (MODEL_META[key] || {}).label || key,
+                color: (MODEL_META[key] || {}).color || '#9ca3af',
+                data,
+              }));
             const bestAcc = Math.max(...rows
               .map(r => (r.data && r.data.metrics && r.data.metrics.accuracy_pct) || -1));
             const cell = (v, unit = '') => v == null ? '—' : `${v}${unit}`;
@@ -5269,11 +5378,30 @@
             .map(lbl => { const d = byDate.get(lbl); return d ? d.p50 : null; })
             .concat(new Array(fcLabels.length).fill(null));
         };
-        const compareOverlays = compare ? [
-          { label: 'Prophet backtest',  color: '#f59e0b', days: (compare.prophet || {}).days },
-          { label: 'LightGBM backtest', color: '#10b981', days: (compare.lgbm || {}).days },
-          { label: 'Naive backtest',    color: '#8b5cf6', days: (compare.naive || {}).days },
-        ] : [];
+        // Dynamic per-model chart overlays. Same MODEL_META palette as the
+        // comparison card above, so table color and chart line color match.
+        const CHART_MODEL_META = {
+          naive:    { label: 'Naive',    color: '#8b5cf6' },
+          prophet:  { label: 'Prophet',  color: '#f59e0b' },
+          lgbm:     { label: 'LightGBM', color: '#10b981' },
+          xgb:      { label: 'XGBoost',  color: '#3b82f6' },
+          catboost: { label: 'CatBoost', color: '#ec4899' },
+          chronos:  { label: 'Chronos',  color: '#0ea5e9' },
+        };
+        const chartModelsObj = compare && (compare.models || {
+          naive: compare.naive, prophet: compare.prophet,
+          lgbm: compare.lgbm, xgb: compare.xgb,
+          catboost: compare.catboost, chronos: compare.chronos,
+        });
+        const compareOverlays = chartModelsObj
+          ? Object.entries(chartModelsObj)
+              .filter(([, r]) => r && r.days && r.days.length)
+              .map(([key, r]) => ({
+                label: `${(CHART_MODEL_META[key] || {}).label || key} backtest`,
+                color: (CHART_MODEL_META[key] || {}).color || '#9ca3af',
+                days: r.days,
+              }))
+          : [];
         const compareDatasets = compareOverlays.map(o => ({
           label: o.label,
           data: alignBtDays(o.days),

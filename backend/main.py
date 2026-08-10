@@ -1439,6 +1439,10 @@ class ListingAnalyzeRequest(BaseModel):
     category: str | None = None
     focus_keywords: list[str] | None = None
     marketplace: str = "US"
+    # Optional — [{"url": "...", "height": N, "width": N}]. When provided,
+    # the scorecard adds automated image checks (count + dims) and the
+    # Groq vision pass grades white-background / lifestyle / watermarks.
+    images: list[dict] | None = None
 
 
 class ListingScoresRequest(BaseModel):
@@ -1486,13 +1490,27 @@ async def listings_prefill(asin: str, user: dict = Depends(protect)):
         )
         if not doc:
             return {"asin": asin, "found": False}
-        # `images` in Aurora sometimes holds an ObjectId reference (not a
-        # URL string) — coerce to str so FastAPI's jsonable_encoder doesn't
-        # blow up with "ObjectId is not iterable". If it's a dict/list, we
-        # skip it since we don't render nested image structures yet.
-        img = doc.get("images")
-        if img is not None and not isinstance(img, str):
-            img = str(img) if not isinstance(img, (dict, list)) else None
+        # Aurora stores images as [{url, height, width}] (Mongoose
+        # subdocuments — auroraBackend/src/models/Product.js:87).
+        # Normalise into plain dicts (drop _id keys), keep the URL/dims
+        # the Listing Optimizer's image scoring + vision pass use.
+        raw_imgs = doc.get("images")
+        images: list[dict] = []
+        primary_image: str | None = None
+        if isinstance(raw_imgs, list):
+            for it in raw_imgs:
+                if isinstance(it, dict) and it.get("url"):
+                    images.append({
+                        "url": str(it.get("url")),
+                        "height": it.get("height"),
+                        "width": it.get("width"),
+                    })
+                elif isinstance(it, str):
+                    images.append({"url": it, "height": None, "width": None})
+        elif isinstance(raw_imgs, str):
+            images.append({"url": raw_imgs, "height": None, "width": None})
+        if images:
+            primary_image = images[0]["url"]
         bullets = doc.get("bullets") or []
         description = doc.get("description") or ""
         content_source = "aurora"
@@ -1520,7 +1538,8 @@ async def listings_prefill(asin: str, user: dict = Depends(protect)):
             "title": doc.get("title") or "",
             "brand": doc.get("brand") or "",
             "category": doc.get("category") or "",
-            "primary_image": img,
+            "primary_image": primary_image,
+            "images": images,
             "bullets": bullets,
             "description": description,
             "backend_keywords": doc.get("searchTerms") or "",
@@ -1583,6 +1602,7 @@ async def listings_analyze(
             category=body.category,
             focus_keywords=body.focus_keywords,
             marketplace=body.marketplace,
+            images=body.images,
         )
     except Exception as e:
         return {"error": f"analyze failed: {e}"}
