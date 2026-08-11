@@ -1314,16 +1314,24 @@ async def compute_profitability_data(
     finances_task = _fire_bg(_load_finances())
 
     async def _load_placement():
-        # Prefer Aurora's fbainboundplacementfees dated events filtered by the
-        # profitability window (Transaction/Posted date from API sync).
-        # Only blend from stored events when they MATCH the filter. If older
-        # events exist but none match, fall back to live Finances PostedDate-
-        # window blended total — never lock $0 just because unrelated months
-        # are stored. Rate × units only when neither has data.
+        # Prefer Aurora's fbainboundplacementfees dated charges filtered by the
+        # profitability window (Transaction/Posted date — andexports July path).
+        # If none match, use live Finances PostedDate-window total. If that is
+        # also $0, lock Totals at $0. Never invent fee_rate × units sold from
+        # other months.
         nonlocal placement_charges_by_sku, placement_charges_by_asin
         nonlocal placement_blended, placement_window_total
         nonlocal placement_avg_per_unit, placement_avg_per_asin
-        placement_from_aurora: dict | None = None
+
+        def _lock_zero_placement(source: str) -> None:
+            nonlocal placement_blended, placement_window_total
+            placement_blended = True
+            placement_window_total = 0.0
+            placement_meta["source"] = source
+            placement_meta["blended"] = True
+            placement_meta["window_total"] = 0.0
+            placement_meta["sku_count"] = 0
+
         if use_db:
             try:
                 (
@@ -1393,10 +1401,9 @@ async def compute_profitability_data(
                         placement_meta["blended"] = True
                         placement_meta["window_total"] = placement_window_total
                         placement_meta["sku_count"] = 0
-                    else:
-                        placement_from_aurora = await aurora_data.fba_inbound_placement_by_sku(
-                            require_user(),
-                        )
+                        return
+                    _lock_zero_placement("zero_no_window_charges")
+                    return
             except Exception as e:
                 warnings.append(_sp_report_warning("Inbound placement (Aurora)", e))
                 try:
@@ -1410,6 +1417,9 @@ async def compute_profitability_data(
                     placement_meta["blended"] = True
                     placement_meta["window_total"] = placement_window_total
                     placement_meta["sku_count"] = 0
+                    return
+                _lock_zero_placement("zero_no_window_charges")
+                return
         else:
             try:
                 await finances_task
@@ -1422,113 +1432,13 @@ async def compute_profitability_data(
                 placement_meta["blended"] = True
                 placement_meta["window_total"] = placement_window_total
                 placement_meta["sku_count"] = 0
-
-        placement_cache_meta = await get_placement_fee_cache(max_age_hours=24)
-        try:
-            placement_per_sku: dict = {}
-            need_placement_fetch = False
-            if placement_blended:
-                pass  # account-level report total only — no per-SKU rates
-            elif placement_from_aurora:
-                placement_per_sku = placement_from_aurora
-                placement_meta["source"] = "aurora_db"
-                placement_meta["sku_count"] = len(placement_per_sku)
-                placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
-                    placement_per_sku
-                )
-                placement_meta["resolved_skus"] = len(placement_avg_per_unit)
-            elif placement_cache_meta and placement_cache_meta.get("access_denied"):
-                placement_meta["access_denied"] = True
-                placement_per_sku = placement_cache_meta.get("per_sku") or {}
-                if not placement_per_sku and use_db:
-                    placement_per_sku = await _placement_rates_from_finances_join(use_db)
-                if placement_per_sku:
-                    placement_meta["source"] = "finances_shipment_join"
-                    placement_meta["sku_count"] = len(placement_per_sku)
-                    placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
-                        placement_per_sku
-                    )
-                    placement_meta["resolved_skus"] = len(placement_avg_per_unit)
-                else:
-                    placement_meta["source"] = "finances_fallback"
-                    warnings.append(
-                        "Inbound placement report unavailable — Amazon denied access "
-                        "(403) and no placement fee events were found in Finances. "
-                        "Placement fees may show as 0."
-                    )
-            elif placement_cache_meta:
-                placement_per_sku = placement_cache_meta.get("per_sku") or {}
-                if placement_per_sku and not any(
-                    isinstance(b, dict) and "fee_bearing_units" in b
-                    for b in placement_per_sku.values()
-                ):
-                    need_placement_fetch = True
-                elif placement_per_sku:
-                    placement_meta["source"] = "report_cache"
-                    placement_meta["sku_count"] = len(placement_per_sku)
-                    placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
-                        placement_per_sku
-                    )
-                    placement_meta["resolved_skus"] = len(placement_avg_per_unit)
-                else:
-                    need_placement_fetch = True
             else:
-                need_placement_fetch = True
+                _lock_zero_placement("zero_no_window_charges")
+                return
 
-            if need_placement_fetch:
-                async with _REPORT_SEM:
-                    placement_per_sku, months, events = (
-                        await amazon_sp.fetch_inbound_placement_fees_per_sku(months_back=3)
-                    )
-                if use_db and placement_per_sku:
-                    placement_per_sku = await aurora_data.resolve_placement_report_to_skus(
-                        require_user(), placement_per_sku,
-                    )
-                if use_db and events:
-                    events = await aurora_data.resolve_placement_events_to_skus(
-                        require_user(), events,
-                    )
-                await put_placement_fee_cache(placement_per_sku, months)
-                placement_meta["source"] = "report_live"
-                placement_meta["sku_count"] = len(placement_per_sku)
-                if placement_per_sku:
-                    placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
-                        placement_per_sku
-                    )
-                    placement_meta["resolved_skus"] = len(placement_avg_per_unit)
-                else:
-                    placement_avg_per_unit = None
-        except Exception as e:
-            warnings.append(_sp_report_warning("Inbound placement", e))
-            if _is_sp_access_denied(e):
-                placement_meta["access_denied"] = True
-                placement_per_sku = {}
-                if use_db:
-                    try:
-                        placement_per_sku = await _placement_rates_from_finances_join(use_db)
-                    except Exception as join_err:
-                        warnings.append(
-                            f"Inbound placement Finances join failed ({join_err}); "
-                            "placement fees may show as 0."
-                        )
-                        await put_placement_fee_cache({}, [], access_denied=True)
-                else:
-                    await put_placement_fee_cache({}, [], access_denied=True)
-                if placement_per_sku:
-                    placement_meta["source"] = "finances_shipment_join"
-                    placement_meta["sku_count"] = len(placement_per_sku)
-                    placement_avg_per_unit, placement_avg_per_asin = _build_placement_rates(
-                        placement_per_sku
-                    )
-                    placement_meta["resolved_skus"] = len(placement_avg_per_unit)
-                else:
-                    placement_avg_per_unit = None
-                    placement_avg_per_asin = {}
-                    placement_meta["source"] = "finances_fallback"
-            else:
-                placement_avg_per_unit = None
-                placement_avg_per_asin = {}
-                placement_meta["source"] = "finances_fallback"
+        if placement_blended:
+            return
+        _lock_zero_placement("zero_no_window_charges")
 
     async def _load_aged():
         # Prefer Aurora's fbaagedinventoryfees snapshot (populated by
@@ -2038,23 +1948,9 @@ async def compute_profitability_data(
             (fin_sku.get("low_inventory", 0.0)
              + unattr_per_unit["low_inventory"] * units), 2)
 
-        # Inbound placement: when dated Seller Central events exist, do NOT
-        # allocate by SKU/ASIN — rows show BLENDED and the Totals row carries
-        # the report window sum (same Transaction date filter as the Amazon
-        # placement fee report / CSV). Otherwise
-        # fall back to fee_rate × units sold / Finances SKU attribution.
-        if placement_blended:
-            inbound_placement_fee = 0.0
-        else:
-            report_rate = _lookup_rate(
-                placement_avg_per_unit, placement_avg_per_asin, sku, asin,
-            )
-            if report_rate:
-                inbound_placement_fee = round(float(report_rate) * units, 2)
-            else:
-                inbound_placement_fee = round(
-                    float(fin_sku.get("inbound_placement", 0.0) or 0), 2,
-                )
+        # Inbound placement: dated window charges (or Finances window total)
+        # go on Totals as BLENDED. Rows stay $0. Never fee_rate × units sold.
+        inbound_placement_fee = 0.0
 
         # Aged inventory: actual amount-charged from Seller Central's Aged
         # Inventory Surcharge report (GET_FBA_FULFILLMENT_LONGTERM_STORAGE_
@@ -2241,13 +2137,24 @@ async def compute_profitability_data(
                 "filter — Totals match the placement-fee report Transaction date "
                 "(UTC calendar day of each charge). SKU rows show BLENDED."
             )
+        elif src == "zero_no_window_charges":
+            ws = placement_meta.get("window_start")
+            we = placement_meta.get("window_end")
+            caveats.append(
+                "Inbound placement Totals is $0 — no Amazon placement charges "
+                f"were posted in {ws or display_start} → {we or display_end}. "
+                "Other months' rates are not applied."
+            )
         else:
             caveats.append(
                 "Inbound placement is BLENDED to match Amazon (placement-fee report "
                 "Total charge sum for the Transaction date filter). SKU rows show "
                 "BLENDED; see Totals / Inbound Placement."
             )
-        if float(placement_window_total or 0) <= 0 and src != "finances_posted_window":
+        if (
+            float(placement_window_total or 0) <= 0
+            and src not in ("finances_posted_window", "zero_no_window_charges")
+        ):
             ws = placement_meta.get("window_start")
             we = placement_meta.get("window_end")
             n_ev = placement_meta.get("event_count") or 0
@@ -2259,9 +2166,8 @@ async def compute_profitability_data(
             )
     else:
         caveats.append(
-            "Inbound placement uses fee_rate × units sold when dated API charge "
-            "events are not available yet for this account (inventory sync pulls "
-            "them from Finances or the SP-API placement report)."
+            "Inbound placement Totals is $0 because no dated Amazon placement "
+            "charges were found for this filter."
         )
     caveats.extend([
         (
