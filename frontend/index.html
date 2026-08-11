@@ -3350,9 +3350,14 @@
               ${row.reason ? `<div style="color:#6b7280;font-size:11px;margin-top:2px;">${escapeHtml(row.reason)}</div>` : ''}
             </div>
           </div>`).join('');
+        const providerLabel = vision.provider === 'gemini'
+          ? 'Gemini Flash vision'
+          : vision.provider === 'groq'
+            ? 'Llama-4 Scout vision'
+            : 'AI vision';
         return `
           <div style="font-size:11px;color:#6b7280;margin-bottom:4px;">
-            Auto-reviewed by Llama-4 Scout vision on ${vision.images_reviewed?.length || 0} image(s).
+            Auto-reviewed by ${providerLabel} on ${vision.images_reviewed?.length || 0} image(s).
           </div>
           <div style="border:1px solid #e5e7eb;border-radius:6px;padding:0 10px;background:#fafafa;">
             ${rows}

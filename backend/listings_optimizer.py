@@ -17,10 +17,15 @@ comparison view.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
+
+import httpx
 
 from agent import client  # Reuse the existing Groq client instance.
 
@@ -31,11 +36,18 @@ from agent import client  # Reuse the existing Groq client instance.
 # chat path's model config changes.
 MODEL = "llama-3.3-70b-versatile"
 
-# Vision model for image compliance checks. Llama-4 Scout on Groq
-# accepts image URLs via OpenAI-style content parts. Keep this separate
-# from the text MODEL so a Groq deprecation on one side doesn't break
-# the other.
-VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+# Vision model for image compliance checks. Groq's llama-4-scout is
+# vision-capable but locked behind their Dev tier — free-tier accounts
+# 404. We try Gemini first (see GEMINI_VISION_MODEL) when GEMINI_API_KEY
+# is set; only fall back to Groq for accounts that have paid access.
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+# Google Gemini vision model — free tier gives 15 req/min, 1500/day.
+# `gemini-flash-latest` is an alias that always points to the current
+# stable Flash release, so we don't have to bump this every time Google
+# deprecates a version (2.0-flash and 2.5-flash both got retired for
+# new users mid-2026).
+GEMINI_VISION_MODEL = "gemini-flash-latest"
 
 log = logging.getLogger("listings_optimizer")
 
@@ -490,49 +502,10 @@ def _build_vision_user_prompt() -> str:
     return "\n".join(lines)
 
 
-async def analyze_images_vision(images: list[dict] | None) -> dict:
-    """Send image URLs to Groq's vision model and grade against the manual
-    checklist. Best-effort — returns {} silently when there are no images
-    or the model errors; the FE falls back to the human checklist in
-    either case."""
-    urls = [
-        str(i.get("url"))
-        for i in (images or [])
-        if isinstance(i, dict) and i.get("url")
-    ]
-    # Cap at 6 images to keep the request small and the latency bounded.
-    # Amazon shows main + up to 8 gallery — 6 is enough to judge the set.
-    urls = urls[:6]
-    if not urls:
-        return {}
-
-    content: list[dict] = [
-        {"type": "text", "text": _build_vision_user_prompt()},
-    ]
-    for u in urls:
-        content.append({"type": "image_url", "image_url": {"url": u}})
-
-    try:
-        resp = await client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {"role": "system", "content": _VISION_SYSTEM_PROMPT},
-                {"role": "user", "content": content},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2,
-            max_tokens=800,
-        )
-        raw = resp.choices[0].message.content or "{}"
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        log.warning("analyze_images_vision: bad JSON: %s", e)
-        return {"error": "Vision model returned malformed JSON"}
-    except Exception as e:
-        log.exception("analyze_images_vision failed")
-        return {"error": str(e)}
-
-    # Normalise: only keep the known keys, coerce verdict to lowercase.
+def _normalise_vision_response(parsed: dict, urls: list[str], provider: str) -> dict:
+    """Filter a model's raw JSON down to the known checklist keys +
+    coerce verdicts. Shared by both provider paths so the FE sees the
+    same shape regardless of who scored the images."""
     out: dict = {}
     for key, question in _VISION_ITEMS:
         row = parsed.get(key) if isinstance(parsed, dict) else None
@@ -546,7 +519,145 @@ async def analyze_images_vision(images: list[dict] | None) -> dict:
             "verdict": verdict,
             "reason": str(row.get("reason") or "").strip(),
         }
-    return {"items": out, "images_reviewed": urls}
+    return {"items": out, "images_reviewed": urls, "provider": provider}
+
+
+async def _fetch_image_bytes(url: str, timeout: float = 15.0) -> tuple[bytes, str] | None:
+    """Download an image and return (bytes, mime_type). Gemini needs
+    inline_data (base64) since it doesn't fetch arbitrary URLs like
+    OpenAI-compatible vision endpoints do."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            log.warning("vision: image fetch HTTP %s for %s", r.status_code, url)
+            return None
+        mime = r.headers.get("content-type", "").split(";")[0].strip() or "image/jpeg"
+        return r.content, mime
+    except Exception as e:
+        log.warning("vision: image fetch failed for %s: %s", url, e)
+        return None
+
+
+async def _analyze_images_gemini(urls: list[str], api_key: str) -> dict:
+    """Grade `urls` via Gemini Flash. Fetches each image (Gemini's
+    generateContent takes inline base64, not URLs) and asks it to
+    return a JSON object matching the _VISION_ITEMS schema."""
+    fetched = await asyncio.gather(*[_fetch_image_bytes(u) for u in urls])
+    parts: list[dict] = [{"text": _build_vision_user_prompt()}]
+    successful_urls: list[str] = []
+    for url, res in zip(urls, fetched):
+        if not res:
+            continue
+        blob, mime = res
+        parts.append({
+            "inline_data": {
+                "mime_type": mime,
+                "data": base64.b64encode(blob).decode("ascii"),
+            },
+        })
+        successful_urls.append(url)
+
+    if not successful_urls:
+        return {"error": "Could not fetch any image for vision analysis"}
+
+    payload = {
+        "system_instruction": {"parts": [{"text": _VISION_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 800,
+            "responseMimeType": "application/json",
+        },
+    }
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_VISION_MODEL}:generateContent?key={api_key}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as c:
+            r = await c.post(endpoint, json=payload)
+    except Exception as e:
+        log.exception("gemini vision request failed")
+        return {"error": f"Gemini transport error: {e}"}
+    if r.status_code != 200:
+        # Gemini surfaces model / auth errors as {"error": {"message": ...}}.
+        err = "unknown"
+        try:
+            err = (r.json().get("error") or {}).get("message") or r.text[:200]
+        except Exception:
+            err = r.text[:200]
+        return {"error": f"Gemini HTTP {r.status_code}: {err}"}
+    try:
+        body = r.json()
+        raw = (
+            (body.get("candidates") or [{}])[0]
+            .get("content", {}).get("parts", [{}])[0]
+            .get("text", "{}")
+        )
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        log.warning("gemini vision: bad response shape: %s", e)
+        return {"error": "Gemini returned malformed JSON"}
+    return _normalise_vision_response(parsed, successful_urls, provider="gemini")
+
+
+async def _analyze_images_groq(urls: list[str]) -> dict:
+    """Grade `urls` via Groq's vision model. Uses OpenAI-compatible
+    image_url content parts — no image fetch needed. 404s on free-tier
+    Groq accounts (the vision Llama-4 models are Dev-tier only)."""
+    content: list[dict] = [{"type": "text", "text": _build_vision_user_prompt()}]
+    for u in urls:
+        content.append({"type": "image_url", "image_url": {"url": u}})
+    try:
+        resp = await client.chat.completions.create(
+            model=GROQ_VISION_MODEL,
+            messages=[
+                {"role": "system", "content": _VISION_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=800,
+        )
+        raw = resp.choices[0].message.content or "{}"
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        log.warning("groq vision: bad JSON: %s", e)
+        return {"error": "Groq vision returned malformed JSON"}
+    except Exception as e:
+        log.exception("groq vision failed")
+        return {"error": str(e)}
+    return _normalise_vision_response(parsed, urls, provider="groq")
+
+
+async def analyze_images_vision(images: list[dict] | None) -> dict:
+    """Grade the manual-checklist items (white background, lifestyle,
+    watermarks, etc.) against real image content.
+
+    Provider order:
+      1. Gemini (when GEMINI_API_KEY is set) — free tier works.
+      2. Groq llama-4-scout — requires Groq Dev tier; 404s on free.
+
+    Both providers return the same {items, images_reviewed, provider}
+    shape. Errors bubble up as {"error": "..."} so the FE can show a
+    fallback checklist instead of failing silently.
+    """
+    urls = [
+        str(i.get("url"))
+        for i in (images or [])
+        if isinstance(i, dict) and i.get("url")
+    ]
+    # Cap at 6 images — main + first 5 gallery is enough to judge the
+    # set, keeps request payload small, avoids Gemini's per-request cap.
+    urls = urls[:6]
+    if not urls:
+        return {}
+
+    gemini_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if gemini_key:
+        return await _analyze_images_gemini(urls, gemini_key)
+    return await _analyze_images_groq(urls)
 
 
 def _apply_vision_verdicts_to_score(image_score: dict, vision: dict) -> None:
