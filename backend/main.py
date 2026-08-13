@@ -716,12 +716,13 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
     ]
 
     # ── Backtest / holdout validation ────────────────────────────────────
-    # Train on days [-60, -31], predict days [-30, -1], compare against
-    # actual. Gives the seller a concrete accuracy read on the model
-    # they're seeing — not a black-box "trust me" number.
+    # Train on days [-120, -31], predict days [-30, -1], compare against
+    # actual. 90-day training window matches the live refresh (model.py
+    # `since = 90 days`) so the backtest measures the SAME model users see
+    # — Prophet on SKUs with enough history, naive on the rest.
     backtest: dict | None = None
     try:
-        bt_since = now_utc - _td(days=60)
+        bt_since = now_utc - _td(days=120)
         bt_rows = await get_sales_daily(sku=sku, since=bt_since)
         cutoff = (now_utc - _td(days=30)).replace(
             hour=0, minute=0, second=0, microsecond=0,
@@ -1001,6 +1002,7 @@ async def profitability(
     start: str | None = None,
     end: str | None = None,
     timeZone: str | None = None,
+    marketplaceId: str | None = None,
     user: dict = Depends(protect),
 ):
     """Per-SKU profitability for the requested window. Walks SP-API
@@ -1010,10 +1012,14 @@ async def profitability(
     the FE date pickers) or `?days_back=N` (legacy, still used by the LLM
     tool). If both are given, start/end wins.
 
+    `marketplaceId` (optional) scopes the response to a single marketplace
+    so multi-marketplace sellers get single-currency totals instead of a
+    silently-blended figure (review issue #1).
+
     Day boundaries use the seller's marketplace timezone (same as Aurora Orders)."""
     return await compute_profitability_data(
         days_back=days_back, start=start, end=end, paginate=True,
-        time_zone=timeZone,
+        time_zone=timeZone, marketplace_id=marketplaceId,
     )
 
 
@@ -1417,6 +1423,55 @@ async def start_keyword_matrix(
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/keyword-matrix/meta-interests")
+async def meta_interests(q: str, limit: int = 25, user: dict = Depends(protect)):
+    """Debug/preview endpoint: run an arbitrary string through Meta's
+    ad-interest search and return the raw list. Same call the keyword-matrix
+    pipeline makes internally in `_source_meta` — useful for tuning queries.
+
+    Declared BEFORE `/keyword-matrix/{job_id}` on purpose — FastAPI matches
+    routes in declaration order, so a literal path here would otherwise be
+    swallowed as a job id.
+    """
+    import httpx as _httpx
+
+    token = (os.getenv("META_ACCESS_TOKEN") or "").strip()
+    if not token:
+        raise HTTPException(status_code=503, detail="META_ACCESS_TOKEN not set")
+    query = (q or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="q required")
+    limit = max(1, min(int(limit), 100))
+    async with _httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            "https://graph.facebook.com/v19.0/search",
+            params={
+                "type": "adinterest",
+                "q": query[:100],
+                "limit": limit,
+                "access_token": token,
+            },
+        )
+    if resp.is_error:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
+    items = (resp.json() or {}).get("data", []) or []
+    return {
+        "query": query,
+        "count": len(items),
+        "interests": [
+            {
+                "name": it.get("name"),
+                "id": it.get("id"),
+                "topic": it.get("topic"),
+                "audience_size_lower_bound": it.get("audience_size_lower_bound")
+                    or it.get("audience_size"),
+                "path": it.get("path"),
+            }
+            for it in items
+        ],
+    }
 
 
 @app.get("/keyword-matrix/{job_id}")

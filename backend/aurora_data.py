@@ -50,6 +50,107 @@ def _money_amount(block: Optional[dict]) -> float:
         return 0.0
 
 
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Iterable
+
+_PENNY = Decimal("0.01")
+
+
+# Row keys whose account-level total is a naive per-SKU sum (no blending
+# with account-level report totals or unallocated residuals). Kept here so
+# both the reconciliation stage and its unit tests reference the same list.
+ROW_SUM_MONEY_KEYS = (
+    "revenue", "referral_fee", "fba_fee", "fuel_surcharge",
+    "amazon_fees", "ad_cost", "product_cost", "inbound_shipping",
+    "cogs_total", "return_processing_fee", "low_inventory_fee",
+)
+
+
+def reconcile_row_derived_totals(rows: list[dict]) -> dict[str, float]:
+    """Extracted stage of compute_profitability_data (review issue #8, #7).
+
+    Returns Decimal-accurate totals for the money keys that are pure
+    per-SKU sums. Blended/overwritten totals (placement, storage w/
+    unallocated, aged w/ unallocated, removal, reimbursement) are the
+    caller's responsibility — they aren't row sums."""
+    return {
+        key: sum_money(row.get(key, 0) for row in (rows or []))
+        for key in ROW_SUM_MONEY_KEYS
+    }
+
+
+def sum_money(values: Iterable) -> float:
+    """Penny-accurate sum of money values (review issue #7).
+
+    Each addend is converted via `Decimal(str(v))` and quantized to 2dp
+    with ROUND_HALF_UP before accumulation, so binary-float drift can't
+    build up over thousands of rows and produce a total that's off by a
+    cent from Seller Central's own figure. Returns float for JSON
+    compatibility. Ignores None and non-numeric values."""
+    total = Decimal("0")
+    for v in values:
+        if v is None:
+            continue
+        try:
+            d = v if isinstance(v, Decimal) else Decimal(str(v))
+        except Exception:
+            continue
+        total += d.quantize(_PENNY, rounding=ROUND_HALF_UP)
+    return float(total.quantize(_PENNY, rounding=ROUND_HALF_UP))
+
+
+_MONEY_FIELDS = ("itemSubtotal", "itemPrice", "promotionDiscount")
+
+
+def filter_orders_by_marketplace(
+    order_docs: list[dict], marketplace_id: Optional[str],
+) -> list[dict]:
+    """Keep only orders belonging to the given marketplace.
+
+    When marketplace_id is None or empty, the list is returned unchanged.
+    Handles both Aurora-DB shape (`marketplaceId`, lower-camel) and SP-API
+    shape (`MarketplaceId`, PascalCase) so the same helper works on both
+    profitability code paths. This is the fix for review issue #1 —
+    scoping a profitability request to a single marketplace guarantees a
+    single-currency response instead of a silently-mixed blended total."""
+    if not marketplace_id:
+        return list(order_docs or [])
+    target = str(marketplace_id).strip()
+    if not target:
+        return list(order_docs or [])
+    kept: list[dict] = []
+    for doc in order_docs or []:
+        mid = doc.get("marketplaceId") or doc.get("MarketplaceId") or ""
+        if isinstance(mid, str) and mid.strip() == target:
+            kept.append(doc)
+    return kept
+
+
+def detect_order_currencies(order_docs: list[dict]) -> set[str]:
+    """Return the distinct non-empty currency codes present across order-line
+    money fields. Used by the profitability path to detect when a request
+    would silently mix multiple currencies into one total (review issue #1).
+
+    Cancelled/unfulfillable orders are excluded to match the revenue path.
+    Only 3-letter ISO-like codes are considered; blank/None values are ignored
+    so a partial fixture doesn't produce a false-positive '' currency."""
+    codes: set[str] = set()
+    for doc in order_docs or []:
+        if is_excluded_order_status(doc.get("orderStatus")):
+            continue
+        # Some Aurora order docs carry a top-level orderTotal.currencyCode.
+        top = (doc.get("orderTotal") or {}).get("currencyCode")
+        if isinstance(top, str) and top.strip():
+            codes.add(top.strip().upper())
+        for it in doc.get("orderItems") or []:
+            for field in _MONEY_FIELDS:
+                block = it.get(field) or {}
+                code = block.get("currencyCode")
+                if isinstance(code, str) and code.strip():
+                    codes.add(code.strip().upper())
+    return codes
+
+
 def is_excluded_order_status(status: Optional[str]) -> bool:
     """True for Canceled / Cancelled / Unfulfillable / Pending — anything
     that isn't a confirmed, revenue-recognisable sale."""

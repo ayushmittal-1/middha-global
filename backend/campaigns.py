@@ -352,9 +352,16 @@ async def analyze_performance_data(full: bool = False) -> dict:
 
         acos_val = None
         roi_val = 0.0
+        # roas_val = sales / spend * 100 — standard ROAS %. Distinct from the
+        # legacy `roi_pct` field (= roas_pct - 100), which is kept for
+        # backward compatibility with the existing frontend but is
+        # revenue-based and does NOT net out COGS or Amazon fees, so it
+        # doesn't mean profit ROI in the finance sense.
+        roas_val = 0.0
         if spend_amt > 0:
             acos_val = (spend_amt / sales_amt * 100) if sales_amt > 0 else None
             roi_val = ((sales_amt - spend_amt) / spend_amt * 100)
+            roas_val = (sales_amt / spend_amt * 100)
 
         entry = {
             "name": name,
@@ -366,6 +373,7 @@ async def analyze_performance_data(full: bool = False) -> dict:
             "budget": round(budget_amt, 2),
             "acos": round(acos_val, 1) if acos_val is not None else ("N/A (no sales)" if spend_amt > 0 else None),
             "roi_pct": round(roi_val, 1),
+            "roas_pct": round(roas_val, 1),
         }
         all_rows.append(entry)
 
