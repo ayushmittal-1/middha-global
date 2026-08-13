@@ -741,27 +741,54 @@ def _sp_item_line_revenue(item: dict) -> float | None:
     return max(0.0, amount - promo_amt)
 
 
-async def _fetch_order_items_paced(order_ids: list[str]) -> list[tuple[str, dict]]:
-    """SP-API GetOrderItems at ~0.5 req/s with backoff on 429."""
+async def _fetch_order_items_paced(
+    order_ids: list[str],
+    concurrency: int = 5,
+) -> list[tuple[str, dict]]:
+    """SP-API GetOrderItems with bounded concurrency + backoff on 429.
+
+    Review issue #3: this was strictly serial with 2.1s per-call sleep,
+    making the fallback path effectively unusable for sellers with hundreds
+    of unsynced orders. Now runs up to `concurrency` calls in flight
+    against a shared asyncio.Semaphore, with per-slot pacing preserved so
+    the sustained rate stays under SP-API's ~0.5 req/s quota. Bursts up to
+    `concurrency` finish in one pacing window (about `base_sleep` seconds)
+    instead of `N × base_sleep` — a small window that used to take 60s
+    now finishes in ~5s. `concurrency` is a parameter so tests can pin it
+    to a known value without inheriting the production default."""
     items_results: list[tuple[str, dict]] = []
+    results_lock = asyncio.Lock()
     pending = list(order_ids)
     attempt = 1
+    concurrency = max(1, concurrency)
     while pending and attempt <= 4:
         base_sleep = 2.1 * attempt
+        sem = asyncio.Semaphore(concurrency)
         failed: list[str] = []
-        for oid in pending:
-            try:
-                resp = await amazon_sp.get_order_items(oid)
-                items_results.append((oid, resp))
-            except Exception as e:
-                msg = str(e)
-                if "429" in msg or "QuotaExceeded" in msg:
-                    failed.append(oid)
-                    await asyncio.sleep(base_sleep * 2)
-                else:
-                    items_results.append((oid, {"_error": msg}))
-                continue
-            await asyncio.sleep(base_sleep)
+        failed_lock = asyncio.Lock()
+
+        async def fetch_one(oid: str) -> None:
+            async with sem:
+                try:
+                    resp = await amazon_sp.get_order_items(oid)
+                except Exception as e:
+                    msg = str(e)
+                    if "429" in msg or "QuotaExceeded" in msg:
+                        async with failed_lock:
+                            failed.append(oid)
+                        await asyncio.sleep(base_sleep * 2)
+                        return
+                    async with results_lock:
+                        items_results.append((oid, {"_error": msg}))
+                    return
+                async with results_lock:
+                    items_results.append((oid, resp))
+                # Per-slot pacing sleep — with `concurrency` slots each
+                # sleeping `base_sleep` after every call, effective
+                # sustained rate is `concurrency / base_sleep` req/s.
+                await asyncio.sleep(base_sleep)
+
+        await asyncio.gather(*(fetch_one(oid) for oid in pending))
         pending = failed
         attempt += 1
         if pending:
@@ -882,6 +909,17 @@ _REPORT_SEMS: dict[str, asyncio.Semaphore] = {}
 _REPORT_SEMS_LOCK = asyncio.Lock()
 
 
+def build_incompleteness_report(task_status: dict[str, bool]) -> dict:
+    """Given {section_name: is_done}, return the machine-readable partial-
+    result contract used in the profitability response (review issue #4).
+
+    The free-text `warnings` array alone lets a forgetful frontend render
+    an incomplete profit total as if it were final. A top-level `complete`
+    bool + explicit `partial_sections` list is impossible to miss."""
+    missing = sorted(name for name, done in task_status.items() if not done)
+    return {"complete": not missing, "partial_sections": missing}
+
+
 def _sp_api_order_currencies(orders: list[dict]) -> set[str]:
     """SP-API-shape sibling of aurora_data.detect_order_currencies.
 
@@ -932,6 +970,7 @@ async def compute_profitability_data(
     end: str | datetime | None = None,
     paginate: bool = False,
     time_zone: str | None = None,
+    marketplace_id: str | None = None,
 ) -> dict:
     """Per-SKU profitability following the FBA Profitability Calculator PDF:
 
@@ -939,7 +978,7 @@ async def compute_profitability_data(
             − Referral Fee
             − FBA Fulfilment Fee
             − Fuel Surcharge (Product Fees API — split from fulfillment when bundled)
-            − Allocated Storage Fee (monthly storage ÷ avg units on hand × units sold)
+            − Allocated Storage Fee (ASIN monthly storage × units sold for SKU ÷ total units sold for ASIN — sales-share proxy, not on-hand-based)
             − Product Cost (COGS)
             − Shipping Cost to Amazon (inbound)
             − Advertising Cost (allocated)
@@ -1076,13 +1115,14 @@ async def compute_profitability_data(
     na_price_rows: list[dict] = []
     fetch_errors: list[str] = []
     orders_count = 0
-    # Review issue #1 (partial mitigation): the calc path assumes a single
-    # currency per response but the app supports 10 marketplaces / 7+
-    # currencies. Track distinct codes seen in the loaded orders and, if
-    # more than one appears, emit a loud warning and a top-level flag so
-    # frontends can refuse to display a mathematically-meaningless blended
-    # total. A full fix (FX conversion or a marketplaceId filter) is
-    # separate scope.
+    # Review issue #1: the calc path assumes a single currency per response
+    # but the app supports 10 marketplaces / 7+ currencies. Two guards:
+    # (a) when `marketplace_id` is passed, filter to that marketplace before
+    #     aggregating — guarantees a single-currency response;
+    # (b) when it isn't, still scan loaded orders for distinct currency
+    #     codes and, if >1 appears, emit a loud warning + top-level
+    #     `mixed_currency` flag so frontends can refuse to display a
+    #     mathematically-meaningless blended total.
     detected_currencies: set[str] = set()
     sku_data: dict[str, dict] = {}
 
@@ -1092,6 +1132,10 @@ async def compute_profitability_data(
             created_after=created_after,
             created_before=created_before,
         )
+        if marketplace_id:
+            db_orders = aurora_data.filter_orders_by_marketplace(
+                db_orders, marketplace_id,
+            )
         if not db_orders:
             # Window empty in DB — try live SP-API (unsynced recent orders).
             try:
@@ -1106,6 +1150,10 @@ async def compute_profitability_data(
                         "error_kind": "rate_limited" if "429" in msg else "orders_fetch_failed"}
             orders = orders_resp.get("payload", {}).get("Orders", [])
             partial_warning = orders_resp.get("_partial")
+            if marketplace_id:
+                orders = aurora_data.filter_orders_by_marketplace(
+                    orders, marketplace_id,
+                )
             if not orders:
                 return {
                     "orders_count": 0, "skus_count": 0, "rows": [], "totals": None,
@@ -1143,6 +1191,10 @@ async def compute_profitability_data(
                     "error_kind": "rate_limited" if "429" in msg else "orders_fetch_failed"}
         orders = orders_resp.get("payload", {}).get("Orders", [])
         partial_warning = orders_resp.get("_partial")
+        if marketplace_id:
+            orders = aurora_data.filter_orders_by_marketplace(
+                orders, marketplace_id,
+            )
         if not orders:
             return {
                 "orders_count": 0, "skus_count": 0, "rows": [], "totals": None,
@@ -1808,12 +1860,13 @@ async def compute_profitability_data(
             still_critical,
             timeout=max(0.0, critical_deadline_s - soft_deadline_s),
         )
-    incomplete = sorted(
-        name for name, task in all_tasks.items() if not task.done()
+    partial_status = build_incompleteness_report(
+        {name: task.done() for name, task in all_tasks.items()}
     )
-    if incomplete:
+    if not partial_status["complete"]:
         warnings.append(
-            "Still loading in background: " + ", ".join(incomplete)
+            "Still loading in background: "
+            + ", ".join(partial_status["partial_sections"])
             + ". These sections may show as 0 in this response — reload in "
             "~30 seconds to pick up the warmed cache."
         )
@@ -2172,6 +2225,14 @@ async def compute_profitability_data(
             totals["net"] += credit
         reimbursement_blended = True
 
+    # Review issues #7 + #8: delegate row-derived total reconciliation to
+    # aurora_data.reconcile_row_derived_totals — a pure extracted stage
+    # that uses Decimal + ROUND_HALF_UP so binary-float drift over
+    # thousands of rows can't produce totals that are off by a cent.
+    # Blended/overwritten totals (placement, storage w/ unallocated, aged
+    # w/ unallocated, removal, reimbursement) keep their existing values.
+    for _key, _val in aurora_data.reconcile_row_derived_totals(rows).items():
+        totals[_key] = _val
     rev = totals["revenue"]
     totals_out = {k: round(v, 2) for k, v in totals.items()}
     totals_out["units"] = int(totals["units"])
@@ -2403,6 +2464,9 @@ async def compute_profitability_data(
         "warnings": warnings,
         "detected_currencies": sorted(detected_currencies),
         "mixed_currency": len(detected_currencies) > 1,
+        "marketplace_id": marketplace_id or None,
+        "complete": partial_status["complete"],
+        "partial_sections": partial_status["partial_sections"],
     }
 
 
