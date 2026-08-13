@@ -388,24 +388,108 @@ def score_listing(
 # ── LLM-driven rewrite ────────────────────────────────────────────────────
 
 
-_REWRITE_SYSTEM_PROMPT = """You are an Amazon listing optimization expert following Amazon's 2026 US style guidelines.
+_REWRITE_SYSTEM_PROMPT = """You are a senior Amazon listing optimization specialist. Your rewrites must match or exceed the depth and keyword coverage of top-tier tools (Helium 10, Jungle Scout, Seller Assistant) — not the minimum-viable output of a generic template.
 
-Guidelines you MUST follow when rewriting:
-- Title: include Brand + Product Type + 2-3 key attributes (size/color/quantity/material). Under 200 chars. No ALL CAPS. No promotional terms (free shipping, best seller, guarantee, sale, discount, etc.). No emojis. Use primary keywords naturally, never stuff.
-- Bullets: exactly 5 bullets. Each under 500 chars. Structure: FEATURE → BENEFIT → USE CASE. Scannable — lead with a 2-4 word capitalized hook, then a colon, then the sentence. No promotional language.
-- Description: 200-2000 chars. Include overview, benefits, materials/ingredients, usage, care. NO URLs, emails, phone numbers, or promotional/pricing claims. NO unsupported medical/health claims.
-- Backend search terms: single space-separated string, under 250 UTF-8 bytes. Include synonyms, alternate spellings, common misspellings. No duplicates. No commas. No competitor brand names. Do not repeat words already in the title.
+The seller is paying for a rich, conversion-optimized rewrite. Thin, one-line-per-bullet output is a failure — expand every field to the top of what Amazon allows, keeping full compliance.
 
-Return VALID JSON with exactly this shape:
+# Length + richness targets (aim for the TOP of each range — under-length is a failure)
+- Title: 150-200 characters. Pack in brand, product type, material, key spec/pack size, primary use case, and 1-2 differentiators. Front-load the most-searched terms.
+- Bullets: EXACTLY 5 bullets. Each bullet 250-500 characters (aim ~350). Format:
+    ALL CAPS HEADER (5-8 words, hyphen-separated is fine) - detailed body sentence(s) covering the feature, concrete specs (dimensions/materials/quantity), the buyer benefit, and the use case or context. 2-4 sentences of body per bullet.
+    Example bullet:
+      COMPLETE 20-PIECE SET WITH HARDWARE - Includes 20 round ceramic knobs (1.6" diameter x 2" length) plus matching screws, nuts, and washers for easy installation. Universal fit works with standard cabinet and drawer holes. Excess screw length can be trimmed to fit your specific furniture thickness.
+- Description: 1200-1900 characters. Structure it as an opening hook (1-2 sentences), then 3-5 short section headers (each on its own line, followed by 2-4 sentences of body). Cover: what it is, what's included / key specs, use cases, quality / material, care, and a closing brand promise. Do NOT use HTML tags — Amazon strips them. Use blank lines between sections.
+- Backend search terms: single space-separated string, 200-249 UTF-8 bytes (fill the budget). Include 30-50 focused tokens covering: synonyms, alternate spellings, common misspellings, material variants, use-case terms, related-product terms buyers might type. NO commas, NO duplicates, NO competitor brand names, and do NOT repeat words already in the title (that wastes indexing budget).
+
+# Compliance rules (MUST follow — Amazon rejects listings that violate these)
+- No promotional terms anywhere: no "free shipping", "best seller", "money back", "guarantee", "sale", "discount", "#1", "top rated", "Amazon's Choice", "limited time", "cheapest", "hot", "new arrival".
+- No emojis, no URLs, no email addresses, no phone numbers.
+- No unsupported medical or health claims ("cures", "treats", "FDA approved" without proof, "clinically proven" without a citation).
+- Title: not fully ALL CAPS (bullet headers are fine — those are prefixes, not full-caps bullets).
+- If the seller provided a brand, the brand name MUST appear in the title.
+
+# Return format
+Return VALID JSON only — no prose outside the object — with EXACTLY this shape:
 {
-  "title": "rewritten title string",
-  "bullets": ["bullet 1", "bullet 2", "bullet 3", "bullet 4", "bullet 5"],
-  "description": "rewritten description string",
-  "backend_keywords": "space separated keyword string",
-  "notes": "2-3 sentence summary of the biggest improvements you made"
-}
+  "title": "150-200 char rewritten title",
+  "bullets": ["bullet 1 (250-500 chars, ALL CAPS HEADER - body)", "bullet 2", "bullet 3", "bullet 4", "bullet 5"],
+  "description": "1200-1900 char rewritten description with section headers on their own lines",
+  "backend_keywords": "space separated keyword string, 200-249 UTF-8 bytes, 30-50 tokens",
+  "notes": "2-3 sentence summary of the biggest improvements you made — call out specific keyword additions and structural changes."
+}"""
 
-Do not include any text outside the JSON object."""
+
+# SA-parity minimums used to decide whether a first-pass rewrite is rich
+# enough to ship or needs an expansion retry. Under these values the
+# output looks like the thin, one-line-per-bullet baseline the client
+# flagged as inferior to Seller Assistant. Above them, it matches the
+# depth of top-tier tools while staying inside Amazon's hard limits.
+RICHNESS_MIN_TITLE_CHARS = 130
+RICHNESS_MIN_BULLET_AVG_CHARS = 220
+RICHNESS_MIN_BULLET_COUNT = 5
+RICHNESS_MIN_DESCRIPTION_CHARS = 1000
+RICHNESS_MIN_BACKEND_BYTES = 180
+
+
+def check_rewrite_richness(rewrite: dict) -> dict:
+    """Measure per-field length + flag which fields fell short of the
+    SA-parity minimums. Pure function — safe to unit test directly.
+
+    Returns:
+        {
+          "title_chars": int,
+          "bullet_count": int,
+          "bullet_avg_chars": int,
+          "description_chars": int,
+          "backend_bytes": int,
+          "needs_expansion": ["title", "bullets", ...]  # names of thin fields
+        }
+    """
+    title = str(rewrite.get("title") or "")
+    bullets = [str(b) for b in (rewrite.get("bullets") or []) if str(b).strip()]
+    description = str(rewrite.get("description") or "")
+    backend = str(rewrite.get("backend_keywords") or "")
+
+    bullet_avg = (
+        sum(len(b) for b in bullets) // len(bullets) if bullets else 0
+    )
+
+    needs: list[str] = []
+    if len(title) < RICHNESS_MIN_TITLE_CHARS:
+        needs.append("title")
+    if len(bullets) < RICHNESS_MIN_BULLET_COUNT or bullet_avg < RICHNESS_MIN_BULLET_AVG_CHARS:
+        needs.append("bullets")
+    if len(description) < RICHNESS_MIN_DESCRIPTION_CHARS:
+        needs.append("description")
+    if len(backend.encode("utf-8")) < RICHNESS_MIN_BACKEND_BYTES:
+        needs.append("backend_keywords")
+
+    return {
+        "title_chars": len(title),
+        "bullet_count": len(bullets),
+        "bullet_avg_chars": bullet_avg,
+        "description_chars": len(description),
+        "backend_bytes": len(backend.encode("utf-8")),
+        "needs_expansion": needs,
+    }
+
+
+def _build_expansion_instruction(thin_fields: list[str]) -> str:
+    """Second-pass user instruction: name the fields that fell short and
+    the exact minimum each must clear. Precise beats polite here — the
+    first-pass tendency is to under-deliver on length."""
+    labels = {
+        "title": f"TITLE — expand to at least {RICHNESS_MIN_TITLE_CHARS} chars (aim 180). Add material, spec/pack size, use case, differentiators.",
+        "bullets": f"BULLETS — expand each bullet to at least {RICHNESS_MIN_BULLET_AVG_CHARS} chars on average (aim 350). Keep the ALL CAPS HEADER but add 2-4 sentences of detail per bullet: specs, dimensions, materials, buyer benefit, use case.",
+        "description": f"DESCRIPTION — expand to at least {RICHNESS_MIN_DESCRIPTION_CHARS} chars (aim 1500). Add 3-5 section headers on their own lines, each with 2-4 sentences of body.",
+        "backend_keywords": f"BACKEND KEYWORDS — expand to at least {RICHNESS_MIN_BACKEND_BYTES} UTF-8 bytes (aim 240). Add synonyms, alternate spellings, misspellings, material variants, use-case terms. Still space-separated, no commas, no duplicates.",
+    }
+    return (
+        "The previous rewrite was too thin in the following fields. "
+        "Return the same JSON shape but expand these fields to the "
+        "specified minimums (keep the other fields as-is):\n\n"
+        + "\n".join(f"- {labels[f]}" for f in thin_fields if f in labels)
+    )
 
 
 async def rewrite_listing(
@@ -417,8 +501,19 @@ async def rewrite_listing(
     category: str | None,
     focus_keywords: list[str] | None = None,
 ) -> dict:
-    """Ask Groq to rewrite each field. Returns a dict with the rewritten
-    values. Falls back to a minimal error payload if the model returns
+    """Ask Groq to rewrite each field, aiming for competitor-parity depth.
+
+    Two-pass:
+      1. First call generates a full rewrite with the SA-parity prompt.
+      2. If check_rewrite_richness flags any field as thin, a second
+         call re-runs with an explicit expansion instruction naming the
+         under-length fields. This closes the gap that showed up when
+         Aurora's output was compared side-by-side with Seller Assistant
+         and looked visibly thinner.
+
+    Returns a dict with the rewritten values plus a `richness` block so
+    the FE (or tests) can see how the output stacks up against the
+    minimums. Falls back to a minimal error payload if the model returns
     something that isn't valid JSON."""
     user_prompt_parts = []
     if brand:
@@ -442,8 +537,10 @@ async def rewrite_listing(
         f"\nCURRENT BACKEND KEYWORDS:\n{backend_keywords or '(empty)'}"
     )
     user_prompt_parts.append(
-        "\nRewrite every field to be fully compliant. If a field is empty, "
-        "create one from scratch based on the other fields and the brand/category."
+        "\nRewrite every field to be fully compliant AND to match the "
+        "length + richness targets in the system prompt. If a field is "
+        "empty, create one from scratch based on the other fields and "
+        "the brand / category."
     )
     user_prompt = "\n".join(user_prompt_parts)
 
@@ -456,16 +553,64 @@ async def rewrite_listing(
             ],
             response_format={"type": "json_object"},
             temperature=0.3,
-            max_tokens=2000,
+            # 4000 tokens: a full SA-parity rewrite (200-char title + 5 ×
+            # 350-char bullets + 1500-char description + 240-byte backend
+            # + notes) can hit ~2500-3000 tokens. Prior 2000 cap truncated
+            # the description on rich outputs.
+            max_tokens=4000,
         )
         raw = resp.choices[0].message.content or "{}"
-        return json.loads(raw)
+        rewrite = json.loads(raw)
     except json.JSONDecodeError as e:
         log.warning("rewrite_listing: LLM returned invalid JSON: %s", e)
         return {"error": "Model returned malformed JSON — try again"}
     except Exception as e:
         log.exception("rewrite_listing failed")
         return {"error": str(e)}
+
+    richness = check_rewrite_richness(rewrite)
+    if richness["needs_expansion"]:
+        try:
+            expansion = _build_expansion_instruction(richness["needs_expansion"])
+            resp2 = await client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": _REWRITE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                    {"role": "assistant", "content": json.dumps(rewrite)},
+                    {"role": "user", "content": expansion},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3,
+                max_tokens=4000,
+            )
+            expanded = json.loads(resp2.choices[0].message.content or "{}")
+            # Merge: prefer expanded fields ONLY if they're actually longer
+            # than the first pass (a bad model can return shorter content
+            # on the retry — don't regress).
+            for field_name in richness["needs_expansion"]:
+                if field_name == "bullets":
+                    old_avg = richness["bullet_avg_chars"]
+                    new_bullets = expanded.get("bullets") or []
+                    new_avg = (
+                        sum(len(str(b)) for b in new_bullets) // len(new_bullets)
+                        if new_bullets else 0
+                    )
+                    if new_avg > old_avg:
+                        rewrite["bullets"] = new_bullets
+                    continue
+                new_val = expanded.get(field_name)
+                if new_val and len(str(new_val)) > len(str(rewrite.get(field_name) or "")):
+                    rewrite[field_name] = new_val
+            richness = check_rewrite_richness(rewrite)
+            richness["retried"] = True
+        except Exception as e:
+            log.warning("rewrite_listing expansion retry failed: %s", e)
+            richness["retried"] = False
+            richness["retry_error"] = str(e)
+
+    rewrite["richness"] = richness
+    return rewrite
 
 
 # ── Vision analysis for the image checklist ───────────────────────────────
