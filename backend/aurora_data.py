@@ -50,6 +50,34 @@ def _money_amount(block: Optional[dict]) -> float:
         return 0.0
 
 
+_MONEY_FIELDS = ("itemSubtotal", "itemPrice", "promotionDiscount")
+
+
+def detect_order_currencies(order_docs: list[dict]) -> set[str]:
+    """Return the distinct non-empty currency codes present across order-line
+    money fields. Used by the profitability path to detect when a request
+    would silently mix multiple currencies into one total (review issue #1).
+
+    Cancelled/unfulfillable orders are excluded to match the revenue path.
+    Only 3-letter ISO-like codes are considered; blank/None values are ignored
+    so a partial fixture doesn't produce a false-positive '' currency."""
+    codes: set[str] = set()
+    for doc in order_docs or []:
+        if is_excluded_order_status(doc.get("orderStatus")):
+            continue
+        # Some Aurora order docs carry a top-level orderTotal.currencyCode.
+        top = (doc.get("orderTotal") or {}).get("currencyCode")
+        if isinstance(top, str) and top.strip():
+            codes.add(top.strip().upper())
+        for it in doc.get("orderItems") or []:
+            for field in _MONEY_FIELDS:
+                block = it.get(field) or {}
+                code = block.get("currencyCode")
+                if isinstance(code, str) and code.strip():
+                    codes.add(code.strip().upper())
+    return codes
+
+
 def is_excluded_order_status(status: Optional[str]) -> bool:
     """True for Canceled / Cancelled / Unfulfillable / Pending — anything
     that isn't a confirmed, revenue-recognisable sale."""

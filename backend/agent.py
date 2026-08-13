@@ -873,7 +873,45 @@ _STORAGE_BG_TASKS: dict[tuple, asyncio.Task] = {}
 # Running the storage / aged / removal / placement loaders in parallel
 # triggers 429 storms with exponential backoff up to 24s+ per call —
 # strictly worse than sequential. Serialize the report-hitting parts.
-_REPORT_SEM = asyncio.Semaphore(1)
+#
+# The quota is per-Amazon-account, so we key the semaphore by the current
+# user's ObjectId: one seller's slow report call no longer queues another
+# seller's request. Lazily populated; the outer dict-init is guarded by an
+# asyncio.Lock to avoid two coroutines racing to insert the same key.
+_REPORT_SEMS: dict[str, asyncio.Semaphore] = {}
+_REPORT_SEMS_LOCK = asyncio.Lock()
+
+
+def _sp_api_order_currencies(orders: list[dict]) -> set[str]:
+    """SP-API-shape sibling of aurora_data.detect_order_currencies.
+
+    SP-API GetOrders returns OrderTotal.CurrencyCode at the top of each
+    order — cheaper than scanning line items and consistent with what
+    Seller Central shows for that order."""
+    codes: set[str] = set()
+    for o in orders or []:
+        code = (o.get("OrderTotal") or {}).get("CurrencyCode")
+        if isinstance(code, str) and code.strip():
+            codes.add(code.strip().upper())
+    return codes
+
+
+async def _get_report_sem() -> asyncio.Semaphore:
+    """Per-account single-slot limiter for SP-API /reports calls.
+
+    Falls back to a shared '__anon__' slot if no user context is set — the
+    profitability path always has one, but the helper stays safe elsewhere."""
+    from auth import current_user
+    user = current_user.get()
+    key = str(user["_id"]) if user and user.get("_id") else "__anon__"
+    sem = _REPORT_SEMS.get(key)
+    if sem is None:
+        async with _REPORT_SEMS_LOCK:
+            sem = _REPORT_SEMS.get(key)
+            if sem is None:
+                sem = asyncio.Semaphore(1)
+                _REPORT_SEMS[key] = sem
+    return sem
 
 # Strong references so tasks that outlive the request handler (report
 # loaders that missed the soft deadline) aren't garbage-collected. The
@@ -1038,6 +1076,14 @@ async def compute_profitability_data(
     na_price_rows: list[dict] = []
     fetch_errors: list[str] = []
     orders_count = 0
+    # Review issue #1 (partial mitigation): the calc path assumes a single
+    # currency per response but the app supports 10 marketplaces / 7+
+    # currencies. Track distinct codes seen in the loaded orders and, if
+    # more than one appears, emit a loud warning and a top-level flag so
+    # frontends can refuse to display a mathematically-meaningless blended
+    # total. A full fix (FX conversion or a marketplaceId filter) is
+    # separate scope.
+    detected_currencies: set[str] = set()
     sku_data: dict[str, dict] = {}
 
     if use_db:
@@ -1074,6 +1120,7 @@ async def compute_profitability_data(
             sku_data, orders_count = _aggregate_sku_from_sp_api(
                 orders, items_results, fetch_errors, na_price_rows,
             )
+            detected_currencies = _sp_api_order_currencies(orders)
         else:
             db_orders, item_errors = await data_resolver.supplement_order_items_from_sp_api(
                 db_orders,
@@ -1082,6 +1129,7 @@ async def compute_profitability_data(
             sku_data, na_price_rows, orders_count = (
                 aurora_data.aggregate_sku_metrics_from_orders(db_orders)
             )
+            detected_currencies = aurora_data.detect_order_currencies(db_orders)
     else:
         try:
             orders_resp = await amazon_sp.get_orders(
@@ -1110,11 +1158,23 @@ async def compute_profitability_data(
         sku_data, orders_count = _aggregate_sku_from_sp_api(
             orders, items_results, fetch_errors, na_price_rows,
         )
+        detected_currencies = _sp_api_order_currencies(orders)
 
     skus = sorted(sku_data.keys())
 
     # ── Storage / finances / placement / aged — not in Aurora DB; SP-API ───
     warnings: list[str] = []
+    if len(detected_currencies) > 1:
+        # See declaration comment: the module currently sums raw floats
+        # across currencies. Surface it loudly so the FE can refuse to
+        # display the blended total.
+        warnings.append(
+            "Mixed currencies in this window: "
+            + ", ".join(sorted(detected_currencies))
+            + ". Totals below are the raw sum without FX conversion and are "
+            "not comparable. Filter by a single marketplace to get a "
+            "meaningful figure."
+        )
     if partial_warning:
         warnings.append(
             "Amazon Orders API rate-limited us mid-fetch — showing partial results. "
@@ -1214,7 +1274,8 @@ async def compute_profitability_data(
         if not missing_months:
             return
         try:
-            async with _REPORT_SEM:
+            report_sem = await _get_report_sem()
+            async with report_sem:
                 fetched, found_months = await fetch_storage_fees_for_months(
                     missing_months, mp_tz,
                 )
@@ -1481,7 +1542,8 @@ async def compute_profitability_data(
                     if aged_per_sku:
                         need_aged_fetch = False
                 if need_aged_fetch:
-                    async with _REPORT_SEM:
+                    report_sem = await _get_report_sem()
+                    async with report_sem:
                         aged_per_sku = await amazon_sp.fetch_aged_inventory_fees_per_sku()
                     await put_aged_inventory_cache(aged_per_sku)
             for psku, b in (aged_per_sku or {}).items():
@@ -1509,7 +1571,8 @@ async def compute_profitability_data(
                 aged_charges_meta["source"] = "charges_cache"
                 aged_charges_trusted = True
             else:
-                async with _REPORT_SEM:
+                report_sem = await _get_report_sem()
+                async with report_sem:
                     charges_per_sku = await amazon_sp.fetch_aged_surcharge_charges_per_sku(
                         start_dt, end_dt, time_zone=mp_tz,
                     )
@@ -1572,7 +1635,8 @@ async def compute_profitability_data(
                 removal_meta["source"] = "charges_cache"
                 removal_fees_trusted = True
             else:
-                async with _REPORT_SEM:
+                report_sem = await _get_report_sem()
+                async with report_sem:
                     removal_raw = await fetch_removal_fees_per_sku(
                         start_dt, end_dt, time_zone=mp_tz,
                     )
@@ -1614,7 +1678,8 @@ async def compute_profitability_data(
                 reimbursement_meta["source"] = "charges_cache"
                 reimbursement_trusted = True
             else:
-                async with _REPORT_SEM:
+                report_sem = await _get_report_sem()
+                async with report_sem:
                     reimb_raw = await fetch_reimbursements_for_window(
                         start_dt, end_dt, time_zone=mp_tz,
                     )
@@ -2336,6 +2401,8 @@ async def compute_profitability_data(
         "reimbursement_meta": reimbursement_meta,
         "caveats": caveats,
         "warnings": warnings,
+        "detected_currencies": sorted(detected_currencies),
+        "mixed_currency": len(detected_currencies) > 1,
     }
 
 
