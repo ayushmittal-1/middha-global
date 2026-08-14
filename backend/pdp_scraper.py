@@ -19,12 +19,31 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
 from bs4 import BeautifulSoup
 
 log = logging.getLogger("pdp_scraper")
+
+# Amazon Standard Identification Numbers are ten characters. The typical
+# modern form is `B` + nine alphanumerics; legacy book ASINs match the
+# 10-digit ISBN format. Either shape is accepted; anything else is
+# rejected before we interpolate it into a URL or a Mongo cache key
+# (audit M2).
+_ASIN_RE = re.compile(r"^(?:B[0-9A-Z]{9}|[0-9]{10})$")
+
+
+def is_valid_asin(value: object) -> bool:
+    """True when `value` is a well-formed Amazon ASIN.
+
+    Pure function so the format rules stay unit-testable without any
+    scraper machinery. Accepts either the modern `B` + 9-alnum form or
+    the legacy 10-digit ISBN form."""
+    if not isinstance(value, str):
+        return False
+    return bool(_ASIN_RE.match(value.strip().upper()))
 
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -214,7 +233,11 @@ async def scrape_pdp_for_asin(
     isn't recognised.
     """
     asin = (asin or "").strip().upper()
-    if not asin:
+    if not is_valid_asin(asin):
+        # Audit M2: reject malformed ASINs before they become part of a
+        # URL or Mongo cache key. Prevents cache pollution from typos
+        # and refuses obviously-hostile inputs at the boundary.
+        log.warning("scrape_pdp_for_asin: refusing malformed ASIN %r", asin)
         return None
     domain = _MARKETPLACE_TO_DOMAIN.get(
         marketplace_id or "ATVPDKIKX0DER", "amazon.com",

@@ -11,6 +11,7 @@ Call shutdown_browser() on server shutdown to clean up.
 
 import asyncio
 import json
+import os
 import re
 from urllib.parse import quote_plus
 
@@ -27,6 +28,29 @@ except ImportError:
 _playwright: "Playwright | None" = None
 _browser: "Browser | None" = None
 _lock = asyncio.Lock()
+
+# Audit H6 — bounded concurrency against the shared Chromium instance.
+# Each in-flight scrape opens its own BrowserContext + Page against the
+# ONE process, so an unbounded burst of requests could OOM the container
+# or race Playwright's own IPC. The default cap (5) is intentionally
+# conservative; override via META_ADS_MAX_CONCURRENCY once real load has
+# been measured.
+def _max_browser_concurrency() -> int:
+    try:
+        return max(1, int(os.getenv("META_ADS_MAX_CONCURRENCY") or 5))
+    except (TypeError, ValueError):
+        return 5
+
+
+_browser_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_browser_semaphore() -> asyncio.Semaphore:
+    """Lazy — asyncio.Semaphore must be created inside a running loop."""
+    global _browser_semaphore
+    if _browser_semaphore is None:
+        _browser_semaphore = asyncio.Semaphore(_max_browser_concurrency())
+    return _browser_semaphore
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -301,6 +325,13 @@ async def search_meta_ads(
             pass
 
     context = None
+    # Audit H6: hold a semaphore slot for the entire scrape lifetime.
+    # Each context/page pair is real Chromium resources for the whole
+    # session, so acquire/release wrap the try/except/finally without
+    # re-indenting the existing block (`async with` inside try would
+    # be equivalent but noisier for a long body).
+    sem = _get_browser_semaphore()
+    await sem.acquire()
     try:
         context = await browser.new_context(user_agent=USER_AGENT, locale="en-US")
         page = await context.new_page()
@@ -347,3 +378,4 @@ async def search_meta_ads(
                 await context.close()
             except Exception:
                 pass
+        sem.release()

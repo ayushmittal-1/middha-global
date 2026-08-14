@@ -8,10 +8,12 @@ to LWA — passing the ciphertext through unchanged is what produces the
 `invalid_grant` we saw on the profitability tab.
 
 Format: `enc:v1:{iv_hex}:{authTag_hex}:{ciphertext_hex}`
-Key priority (matches Node's `resolveEncryptionKey('token')`):
-  1. TOKEN_ENCRYPTION_KEY  (base64, 32 bytes)
-  2. SELLER_APP_ENCRYPTION_KEY  (base64, 32 bytes)
-  3. non-prod fallback: sha256("aurora-token-enc:" + JWT_SECRET)
+Key priority:
+  1. TOKEN_ENCRYPTION_KEY  (base64, 32 bytes) — REQUIRED in production
+  2. SELLER_APP_ENCRYPTION_KEY  (base64, 32 bytes) — alternative for Node parity
+  3. Local-dev only, and only when AURORA_ALLOW_DEV_TOKEN_KEY=1 is
+     explicitly set: sha256("aurora-token-enc:" + JWT_SECRET). Never
+     falls through to any hardcoded string (audit C1).
 """
 
 import base64
@@ -40,15 +42,60 @@ def _decode_configured_key(raw: Optional[str]) -> Optional[bytes]:
     return hashlib.sha256(f"aurora-env-key:{trimmed}".encode("utf-8")).digest()
 
 
+def _is_production() -> bool:
+    """Production if NODE_ENV=production. Kept as a helper so the check
+    is centralized — any hardening added later (e.g. the CORS allowlist
+    guard in main.py) reads the same flag."""
+    return os.getenv("NODE_ENV", "").strip().lower() == "production"
+
+
 def _resolve_token_key() -> Optional[bytes]:
+    """Return the AES-256 key used to decrypt Amazon refresh tokens.
+
+    Audit C1 hardened the resolution rules: no hardcoded fallback string
+    is ever returned, and the JWT_SECRET-derived key is ONLY allowed when
+    the operator has opted in explicitly (AURORA_ALLOW_DEV_TOKEN_KEY=1)
+    outside of production. Missing configuration returns None so
+    `decrypt_token` can raise a loud RuntimeError at call time, and the
+    startup check (`assert_token_key_configured`) fails fast on boot."""
     for env_name in ("TOKEN_ENCRYPTION_KEY", "SELLER_APP_ENCRYPTION_KEY"):
         k = _decode_configured_key(os.getenv(env_name))
         if k:
             return k
-    if os.getenv("NODE_ENV") != "production":
-        secret = os.getenv("JWT_SECRET") or "aurora-dev-insecure-key"
-        return hashlib.sha256(f"aurora-token-enc:{secret}".encode("utf-8")).digest()
-    return None
+    if _is_production():
+        return None
+    # Local-dev opt-in only: an operator has to acknowledge they're
+    # deriving the key from JWT_SECRET (which itself must exist and be
+    # non-empty — no hardcoded fallback string).
+    if os.getenv("AURORA_ALLOW_DEV_TOKEN_KEY", "").strip() != "1":
+        return None
+    secret = os.getenv("JWT_SECRET", "").strip()
+    if not secret:
+        return None
+    return hashlib.sha256(f"aurora-token-enc:{secret}".encode("utf-8")).digest()
+
+
+def assert_token_key_configured() -> None:
+    """Fail-fast startup check for audit C1.
+
+    Called from main.py's lifespan handler so a misconfigured deployment
+    dies at boot instead of silently running with a resolvable-from-code
+    key that anyone reading the source could reconstruct."""
+    if _resolve_token_key() is not None:
+        return
+    if _is_production():
+        raise RuntimeError(
+            "TOKEN_ENCRYPTION_KEY (or SELLER_APP_ENCRYPTION_KEY) is not "
+            "set. Amazon refresh tokens cannot be decrypted and no "
+            "insecure fallback is available in production. Set the key "
+            "and restart."
+        )
+    raise RuntimeError(
+        "No token-decryption key configured. For local dev, set "
+        "TOKEN_ENCRYPTION_KEY explicitly, or set "
+        "AURORA_ALLOW_DEV_TOKEN_KEY=1 together with a non-empty "
+        "JWT_SECRET to opt into the JWT-derived dev key (never for prod)."
+    )
 
 
 def is_encrypted(value: Optional[str]) -> bool:
