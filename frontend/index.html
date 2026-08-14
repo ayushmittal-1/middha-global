@@ -2093,7 +2093,7 @@
               <th class="num">Sales</th>
               <th class="num">Budget</th>
               <th class="num">ACOS %</th>
-              <th class="num">ROI %</th>
+              <th class="num" title="Return On Ad Spend = sales / spend × 100. Revenue-based, not profit-based (COGS/fees not netted out).">ROAS %</th>
             </tr>
           </thead>
           <tbody id="campaigns-body"></tbody>
@@ -2108,6 +2108,9 @@
       <div id="profit-toolbar">
         <h2>Profitability</h2>
         <span id="profit-stamp"></span>
+        <label>Marketplace
+          <select id="profit-marketplace" title="Scope to a single marketplace so totals are single-currency"><option value="">All (may mix currencies)</option></select>
+        </label>
         <label>From
           <input id="profit-start" type="date">
         </label>
@@ -2832,6 +2835,7 @@
       profitStartEl.value = ymdInTz(back7);
     })();
     const profitRefreshBtn = document.getElementById('profit-refresh');
+    const profitMarketplaceEl = document.getElementById('profit-marketplace');
     const profitSearchEl = document.getElementById('profit-search');
     let profitLoaded = false;
 
@@ -3691,12 +3695,28 @@
         if (!r.ok) return;
         const data = await r.json();
         const opts = ['<option value="">All</option>'];
+        // Profitability copy needs a warning-styled default so users know the
+        // "All" totals may silently mix currencies until they pick one.
+        const profitOpts = ['<option value="">All (may mix currencies)</option>'];
+        let primaryId = '';
         for (const m of data.marketplaces || []) {
           marketplaceNames[m.id] = m.name;
           const label = `${m.name}${m.is_primary ? ' (primary)' : ''}`;
-          opts.push(`<option value="${escapeHtml(m.id)}">${escapeHtml(label)}</option>`);
+          const opt = `<option value="${escapeHtml(m.id)}">${escapeHtml(label)}</option>`;
+          opts.push(opt);
+          profitOpts.push(opt);
+          if (m.is_primary) primaryId = m.id;
         }
         ordersMarketplaceEl.innerHTML = opts.join('');
+        if (profitMarketplaceEl) {
+          profitMarketplaceEl.innerHTML = profitOpts.join('');
+          // Default to the seller's primary marketplace so first paint is
+          // single-currency instead of blended-across-markets — closes
+          // review issue #1 for the common case (one seller, N markets).
+          if (primaryId && !profitMarketplaceEl.value) {
+            profitMarketplaceEl.value = primaryId;
+          }
+        }
       } catch (_) {}
     }
 
@@ -3850,7 +3870,15 @@
         }
         campaignsBodyEl.innerHTML = rows.map(c => {
           const acos = (c.acos == null) ? '—' : (typeof c.acos === 'number' ? `${c.acos}%` : escapeHtml(String(c.acos)));
-          const roi = (c.roi_pct == null) ? '—' : `${c.roi_pct}%`;
+          // Verification-review followup on issue #5: the column was
+          // labelled "ROI %" but showed (sales-spend)/spend*100 — a
+          // revenue-based ratio, not profit ROI. Prefer the properly-
+          // named `roas_pct` (= sales/spend*100). Fall back to
+          // roi_pct+100 for older backend responses.
+          const roasVal = (c.roas_pct != null)
+            ? c.roas_pct
+            : (c.roi_pct != null ? c.roi_pct + 100 : null);
+          const roas = (roasVal == null) ? '—' : `${roasVal}%`;
           return `<tr>
             <td><strong>${escapeHtml(c.name || '—')}</strong></td>
             <td>${escapeHtml(c.type || '—')}</td>
@@ -3860,7 +3888,7 @@
             <td class="num">$${(c.sales || 0).toLocaleString()}</td>
             <td class="num">$${(c.budget || 0).toLocaleString()}</td>
             <td class="num">${acos}</td>
-            <td class="num">${roi}</td>
+            <td class="num">${roas}</td>
           </tr>`;
         }).join('');
       } catch (err) {
@@ -4342,9 +4370,15 @@
 
     function scheduleProfitAutoReload(data) {
       clearProfitAutoReload();
-      const incomplete = (data.warnings || []).some(
-        (w) => /Still loading in background/i.test(String(w || '')),
-      );
+      // Verification-review followup on issue #4: prefer the structured
+      // `complete === false` contract over parsing a free-text warning
+      // string. Fall back to the string check for compatibility with
+      // any backend response that predates the contract.
+      const incomplete = data.complete === false
+        || (data.partial_sections || []).length > 0
+        || (data.warnings || []).some(
+          (w) => /Still loading in background/i.test(String(w || '')),
+        );
       if (!incomplete || profitAutoReloadCount >= PROFIT_AUTO_RELOAD_MAX) return;
       profitAutoReloadCount += 1;
       const delayMs = profitAutoReloadCount === 1 ? 8000 : 15000;
@@ -4388,7 +4422,15 @@
         return;
       }
       try {
-        const qs = new URLSearchParams({ start, end }).toString();
+        const params = new URLSearchParams({ start, end });
+        // Verification-review followup on issue #1: scope the request to
+        // a single marketplace so the response is single-currency. When
+        // "All" is chosen the backend still returns mixed_currency=true
+        // and detected_currencies=[…], which we surface as a banner below.
+        if (profitMarketplaceEl && profitMarketplaceEl.value) {
+          params.set('marketplaceId', profitMarketplaceEl.value);
+        }
+        const qs = params.toString();
         const r = await fetch(`/profitability?${qs}`, { headers: authHeaders() });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
@@ -4417,7 +4459,30 @@
 
         // Only show real warnings/errors — never methodology text.
         const caveats = [];
+        // Verification-review followup on issues #1 + #4: surface the
+        // structured backend contract loudly at the top of the caveats,
+        // not just as free-text inside warnings. Frontend was previously
+        // reading only `warnings` and ignoring `mixed_currency` /
+        // `complete` / `partial_sections`, so users saw a plausibly-
+        // precise total with no indication it was blended or incomplete.
+        if (data.mixed_currency) {
+          const codes = (data.detected_currencies || []).join(', ') || 'multiple';
+          caveats.push(
+            `<span class="profit-warning"><strong>Mixed currencies (${escapeHtml(codes)})</strong> — totals below are a raw sum without FX conversion and are not comparable. Pick a single marketplace above.</span>`
+          );
+        }
+        if (data.complete === false && (data.partial_sections || []).length) {
+          const sections = data.partial_sections.map(escapeHtml).join(', ');
+          caveats.push(
+            `<span class="profit-warning"><strong>Partial data</strong> — still loading in background: ${sections}. Numbers below may show as 0 for those sections; reload in ~30s.</span>`
+          );
+        }
         for (const w of data.warnings || []) {
+          // Skip the "still loading" free-text — it's now shown as the
+          // structured partial-data banner above (avoid duplicate row).
+          if (data.complete === false && /Still loading in background/i.test(String(w || ''))) {
+            continue;
+          }
           caveats.push(`<span class="profit-warning">${escapeHtml(w)}</span>`);
         }
         if ((data.fee_errors || []).length) {

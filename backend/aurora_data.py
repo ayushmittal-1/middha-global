@@ -79,6 +79,22 @@ def reconcile_row_derived_totals(rows: list[dict]) -> dict[str, float]:
     }
 
 
+def reconcile_net_total(rows: list[dict]) -> float:
+    """Penny-accurate `net` total (verification-review followup on issue #7).
+
+    The first pass only reconciled the row-sum COMPONENT keys with Decimal,
+    leaving `totals["net"]` on the float-accumulator path — so components
+    and net could disagree by a cent even though the row-level
+    `row["net"] = revenue - fees - ...` was rounded to 2dp. Summing
+    `row["net"]` with the same Decimal accumulator closes that gap. The
+    caller still applies blended-total adjustments to `net` after
+    reconciliation (unallocated storage/aged, blended placement, blended
+    removal, reimbursements) — those adjustments themselves land at 2dp,
+    so the Decimal-accurate base plus penny-quantized adjustments keeps
+    the whole path penny-consistent."""
+    return sum_money(row.get("net", 0) for row in (rows or []))
+
+
 def sum_money(values: Iterable) -> float:
     """Penny-accurate sum of money values (review issue #7).
 

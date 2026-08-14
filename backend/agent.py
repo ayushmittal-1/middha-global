@@ -741,28 +741,52 @@ def _sp_item_line_revenue(item: dict) -> float | None:
     return max(0.0, amount - promo_amt)
 
 
+# SP-API GetOrderItems sustained quota — Amazon's published figure. The
+# per-slot pacing sleep is derived from this so bumping `concurrency`
+# can't unintentionally push the effective sustained rate past quota.
+SP_API_ORDER_ITEMS_SUSTAINED_REQ_PER_SEC = 0.5
+
+
+def _pacing_sleep_for(concurrency: int, attempt: int) -> float:
+    """Per-slot sleep that keeps `concurrency / sleep` at the sustained
+    quota (with `attempt`-based backoff multiplier).
+
+    Verification-review followup: the first fix used a fixed 2.1s per-slot
+    sleep for every concurrency setting, which meant `concurrency=5`
+    produced ~2.4 req/s — 5× quota. The formula below guarantees the
+    effective sustained rate never exceeds
+    SP_API_ORDER_ITEMS_SUSTAINED_REQ_PER_SEC regardless of `concurrency`.
+    Attempt N applies an N× backoff, matching the original serial path."""
+    concurrency = max(1, concurrency)
+    return (concurrency / SP_API_ORDER_ITEMS_SUSTAINED_REQ_PER_SEC) * attempt
+
+
 async def _fetch_order_items_paced(
     order_ids: list[str],
     concurrency: int = 5,
 ) -> list[tuple[str, dict]]:
     """SP-API GetOrderItems with bounded concurrency + backoff on 429.
 
-    Review issue #3: this was strictly serial with 2.1s per-call sleep,
-    making the fallback path effectively unusable for sellers with hundreds
-    of unsynced orders. Now runs up to `concurrency` calls in flight
-    against a shared asyncio.Semaphore, with per-slot pacing preserved so
-    the sustained rate stays under SP-API's ~0.5 req/s quota. Bursts up to
-    `concurrency` finish in one pacing window (about `base_sleep` seconds)
-    instead of `N × base_sleep` — a small window that used to take 60s
-    now finishes in ~5s. `concurrency` is a parameter so tests can pin it
-    to a known value without inheriting the production default."""
+    Review issue #3: originally serial with 2.1s per-call sleep, which made
+    the fallback path effectively unusable for sellers with hundreds of
+    unsynced orders. Now runs up to `concurrency` calls in flight against
+    a shared asyncio.Semaphore. Per-slot pacing is computed by
+    `_pacing_sleep_for` so effective sustained rate never exceeds
+    SP-API's per-account quota (see review-verification followup — the
+    prior implementation used a fixed 2.1s sleep and ran ~5× quota).
+
+    The practical win is burst latency, not sustained throughput: a small
+    window of `<= concurrency` orders finishes in ~1 call latency instead
+    of `N × base_sleep`, while larger windows converge on the same total
+    wall-clock the original serial path took. `concurrency` is a parameter
+    so tests can pin it to a known value."""
     items_results: list[tuple[str, dict]] = []
     results_lock = asyncio.Lock()
     pending = list(order_ids)
     attempt = 1
     concurrency = max(1, concurrency)
     while pending and attempt <= 4:
-        base_sleep = 2.1 * attempt
+        per_slot_sleep = _pacing_sleep_for(concurrency, attempt)
         sem = asyncio.Semaphore(concurrency)
         failed: list[str] = []
         failed_lock = asyncio.Lock()
@@ -776,17 +800,21 @@ async def _fetch_order_items_paced(
                     if "429" in msg or "QuotaExceeded" in msg:
                         async with failed_lock:
                             failed.append(oid)
-                        await asyncio.sleep(base_sleep * 2)
+                        # 429 backoff: double the per-slot sleep for
+                        # this slot only; asyncio.Semaphore holds the
+                        # slot for that duration, throttling naturally.
+                        await asyncio.sleep(per_slot_sleep * 2)
                         return
                     async with results_lock:
                         items_results.append((oid, {"_error": msg}))
                     return
                 async with results_lock:
                     items_results.append((oid, resp))
-                # Per-slot pacing sleep — with `concurrency` slots each
-                # sleeping `base_sleep` after every call, effective
-                # sustained rate is `concurrency / base_sleep` req/s.
-                await asyncio.sleep(base_sleep)
+                # Per-slot pacing: with `concurrency` slots each sleeping
+                # `per_slot_sleep` after every call, effective sustained
+                # rate is `concurrency / per_slot_sleep` req/s, which by
+                # construction equals SP_API_ORDER_ITEMS_SUSTAINED_REQ_PER_SEC.
+                await asyncio.sleep(per_slot_sleep)
 
         await asyncio.gather(*(fetch_one(oid) for oid in pending))
         pending = failed
@@ -2233,6 +2261,24 @@ async def compute_profitability_data(
     # w/ unallocated, removal, reimbursement) keep their existing values.
     for _key, _val in aurora_data.reconcile_row_derived_totals(rows).items():
         totals[_key] = _val
+    # Verification-review followup on issue #7: also reconcile `net` from
+    # the (now Decimal-accurate) component totals, so `net` == revenue -
+    # fees ... at the penny level. The prior fix left `net` on the float-
+    # accumulator path, opening a tie-out gap between components and net.
+    totals["net"] = aurora_data.sum_money([
+        totals["revenue"],
+        -totals["amazon_fees"],
+        -totals["storage_fee"],
+        -totals["product_cost"],
+        -totals["inbound_shipping"],
+        -totals["ad_cost"],
+        -totals["return_processing_fee"],
+        -totals["low_inventory_fee"],
+        -totals["inbound_placement_fee"],
+        -totals["aged_inventory_fee"],
+        -totals["removal_fee"],
+        totals["reimbursement"],
+    ])
     rev = totals["revenue"]
     totals_out = {k: round(v, 2) for k, v in totals.items()}
     totals_out["units"] = int(totals["units"])
