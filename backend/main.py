@@ -552,6 +552,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
             "on_hand": on_hand,
             "available": available,
+            "fc_transfer": fc_transfer,
             "reserved": reserved,
             "sent_to_fba": sent_to_fba,
             "inbound_working": inbound_working,
