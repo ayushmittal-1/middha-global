@@ -263,15 +263,14 @@ async def delete_session(session_id: str):
 
 # ── COGS (Cost of Goods Sold) ─────────────────────────────────────────────
 
-async def upsert_cogs(rows: list[dict]) -> int:
-    """Insert or update COGS rows for the current user. Each row needs sku and
-    unit_cost; inbound_shipping_per_unit is optional. Returns the count actually
-    written.
-    """
-    user_id = _user_oid()
-    written = 0
-    now = datetime.now(timezone.utc)
-    for r in rows:
+def _build_cogs_bulk_ops(
+    rows: list[dict], user_id: ObjectId, now: datetime,
+) -> list[UpdateOne]:
+    """Validate + shape the incoming COGS rows into a list of UpdateOne
+    ops. Pure function so the parsing/skip rules are unit-testable
+    without any Mongo mocking (audit H3)."""
+    ops: list[UpdateOne] = []
+    for r in rows or []:
         sku = (r.get("sku") or "").strip()
         if not sku:
             continue
@@ -285,19 +284,46 @@ async def upsert_cogs(rows: list[dict]) -> int:
             shipping = float(r.get("inbound_shipping_per_unit") or 0)
         except (TypeError, ValueError):
             shipping = 0.0
-        await _cogs().update_one(
-            {"userId": user_id, "sku": sku},
-            {
-                "$set": {
-                    "unitCost": unit_cost,
-                    "inboundShippingPerUnit": shipping,
-                    "updatedAt": now,
+        ops.append(
+            UpdateOne(
+                {"userId": user_id, "sku": sku},
+                {
+                    "$set": {
+                        "unitCost": unit_cost,
+                        "inboundShippingPerUnit": shipping,
+                        "updatedAt": now,
+                    },
+                    "$setOnInsert": {"userId": user_id, "sku": sku},
                 },
-                "$setOnInsert": {"userId": user_id, "sku": sku},
-            },
-            upsert=True,
+                upsert=True,
+            ),
         )
-        written += 1
+    return ops
+
+
+async def upsert_cogs(rows: list[dict]) -> int:
+    """Bulk insert/update COGS rows for the current user (audit H3).
+
+    Previously issued one `update_one` per row, sequentially awaited —
+    an O(N) round-trip pattern that made large CSV uploads slow and
+    piled pointless load on Mongo. Now shapes every valid row into a
+    pymongo.UpdateOne and dispatches a single `bulk_write(ordered=False)`
+    per 1000-row chunk. Returns the count of rows submitted (which,
+    combined with `ordered=False`, is the count actually written unless
+    Mongo rejected a specific op)."""
+    user_id = _user_oid()
+    now = datetime.now(timezone.utc)
+    ops = _build_cogs_bulk_ops(rows, user_id, now)
+    if not ops:
+        return 0
+    coll = _cogs()
+    written = 0
+    # Chunk to bound single-command size on very large uploads.
+    CHUNK = 1000
+    for i in range(0, len(ops), CHUNK):
+        batch = ops[i:i + CHUNK]
+        await coll.bulk_write(batch, ordered=False)
+        written += len(batch)
     return written
 
 

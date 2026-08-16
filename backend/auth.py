@@ -80,17 +80,52 @@ async def protect(authorization: Optional[str] = Header(default=None)) -> dict:
 
 
 async def authenticate_ws(websocket: WebSocket) -> tuple[Optional[dict], Optional[str]]:
-    """WebSocket auth — token comes from `?token=...` query param or the
-    `Authorization: Bearer ...` header. Returns (user, error_message). On
-    success, user is set and error_message is None; on failure, user is None
-    and error_message describes which check failed."""
-    token = websocket.query_params.get("token")
+    """WebSocket auth. Token resolution order (audit H1):
+      1. `Authorization: Bearer <jwt>` header  — preferred; not logged.
+      2. `Sec-WebSocket-Protocol: bearer, <jwt>` subprotocol — preferred
+         for browsers, since the JS WebSocket API can't set arbitrary
+         headers but does support subprotocols.
+      3. `?token=<jwt>` query string — DISCOURAGED. Query strings are
+         written to server access logs, reverse-proxy logs, and browser
+         history, so a leaked log file leaks a live session token. Kept
+         for backward compatibility; emits a warning log per use so ops
+         can watch clients migrate off it.
+
+    Returns (user, error_message). On success user is set; on failure
+    it's None and error_message describes which check failed."""
+    import logging
+    _log = logging.getLogger("auth.ws")
+
+    token: Optional[str] = None
+    token_source = ""
+    auth_header = websocket.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1]
+        token_source = "header"
     if not token:
-        auth_header = websocket.headers.get("authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header.split(" ", 1)[1]
+        # Sec-WebSocket-Protocol comes in as a comma-separated list; the
+        # client sends ["bearer", <jwt>] as two protocols.
+        proto_header = websocket.headers.get("sec-websocket-protocol", "")
+        parts = [p.strip() for p in proto_header.split(",") if p.strip()]
+        if len(parts) >= 2 and parts[0].lower() == "bearer":
+            token = parts[1]
+            token_source = "subprotocol"
     if not token:
-        return None, "No token provided. Pass ?token=<jwt> in the WebSocket URL."
+        # Query-string fallback (audit H1: discouraged path).
+        token = websocket.query_params.get("token")
+        if token:
+            token_source = "query"
+            _log.warning(
+                "WebSocket auth via query-string token — this ends up in "
+                "access logs. Migrate the client to the Authorization "
+                "header or Sec-WebSocket-Protocol subprotocol."
+            )
+    if not token:
+        return None, (
+            "No token provided. Send Authorization: Bearer <jwt> or the "
+            "Sec-WebSocket-Protocol subprotocol (query-string fallback "
+            "is deprecated)."
+        )
     try:
         decoded = _verify_token(token)
     except HTTPException as e:
@@ -100,6 +135,7 @@ async def authenticate_ws(websocket: WebSocket) -> tuple[Optional[dict], Optiona
     except HTTPException as e:
         return None, f"User lookup failed: {e.detail}"
     user["_token"] = token
+    user["_token_source"] = token_source
     current_user.set(user)
     return user, None
 
@@ -130,24 +166,101 @@ def generate_token(user_id: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
+# ── Login lockout (audit M4) ─────────────────────────────────────────────
+# Progressive backoff on repeated failed logins per account. Defense-in-
+# depth on top of the IP-based rate limiter (audit C2): a rotating-IP
+# attacker still trips the per-account counter, and a legitimate user
+# fat-fingering their password five times gets a short lock, not a total
+# ban.
+
+# (failures_before_this_lock, lock_minutes) — applied in order.
+_LOGIN_LOCKOUT_TIERS = (
+    (5,  5),      # 5 failures  →  5-minute lock
+    (10, 60),     # 10 failures → 1-hour lock
+    (15, 24 * 60),  # 15 failures → 24-hour lock
+)
+
+
+def compute_login_lockout_seconds(
+    failed_count: int, now: Optional[datetime] = None,
+) -> int:
+    """Given the current failure counter, return how many seconds the
+    account should be locked out for after THIS failed attempt.
+
+    Pure function so the tiering rules are unit-testable without any
+    Mongo mocking. `failed_count` is the counter AFTER incrementing for
+    the current failure (i.e. the 5th failure passes failed_count=5)."""
+    duration_min = 0
+    for threshold, minutes in _LOGIN_LOCKOUT_TIERS:
+        if failed_count >= threshold:
+            duration_min = minutes
+    return duration_min * 60
+
+
+def _is_locked_out(user: dict, now: datetime) -> Optional[datetime]:
+    """Return the lockout expiry timestamp if the account is currently
+    locked, else None. Handles legacy user docs that lack the field."""
+    locked_until = user.get("loginLockedUntil")
+    if not isinstance(locked_until, datetime):
+        return None
+    if locked_until.tzinfo is None:
+        locked_until = locked_until.replace(tzinfo=timezone.utc)
+    return locked_until if locked_until > now else None
+
+
 async def authenticate_credentials(email: str, password: str) -> dict:
     """Verify an email+password against the shared Mongo users collection.
 
     Returns the user document (with password stripped) on success. Raises
     401 on bad credentials, matching Aurora's `login` controller behavior.
-    """
+    Additionally (audit M4): locked-out accounts return 429 with the
+    remaining lockout window instead of running bcrypt at all, and
+    failure/success both persist counter state to the user document."""
     if not email or not password:
         raise HTTPException(status_code=400, detail="Email and password are required")
     # Aurora's User schema lowercases emails on save; match that here.
-    user = await _db().users.find_one({"email": email.lower().strip()})
+    users = _db().users
+    user = await users.find_one({"email": email.lower().strip()})
     if not user or not user.get("password"):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    now = datetime.now(timezone.utc)
+    locked_until = _is_locked_out(user, now)
+    if locked_until is not None:
+        retry_after = max(1, int((locked_until - now).total_seconds()))
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Account temporarily locked due to repeated failed "
+                f"logins. Try again in {retry_after}s."
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
     try:
         ok = bcrypt.checkpw(password.encode("utf-8"), user["password"].encode("utf-8"))
     except (ValueError, TypeError):
         ok = False
     if not ok:
+        new_count = int(user.get("failedLoginCount") or 0) + 1
+        update: dict = {"failedLoginCount": new_count, "lastFailedLoginAt": now}
+        lockout_seconds = compute_login_lockout_seconds(new_count, now)
+        if lockout_seconds:
+            update["loginLockedUntil"] = now + timedelta(seconds=lockout_seconds)
+        try:
+            await users.update_one({"_id": user["_id"]}, {"$set": update})
+        except Exception:
+            # Persistence failure must not turn into a 500 on the login
+            # path — the user still gets a 401 for wrong password.
+            pass
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    # Success — reset the lockout counter atomically.
+    try:
+        await users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"failedLoginCount": 0, "loginLockedUntil": None,
+                      "lastSuccessfulLoginAt": now}},
+        )
+    except Exception:
+        pass
     user.pop("password", None)
     return hydrate_user_tokens(user)
 

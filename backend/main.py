@@ -6,15 +6,23 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlencode
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
-from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
+
+from token_encryption import assert_token_key_configured, _is_production
 
 from agent import stream_response
 from meta_ads import shutdown_browser
@@ -79,27 +87,166 @@ class LoginRequest(BaseModel):
     password: str
 
 
+# ── Production-audit hardening (C3, C4, H2, C1 startup check) ────────────
+
+
+# Aurora's own production frontends — always allowed, even when the
+# AURORA_ALLOWED_ORIGINS env is unset. These are known-safe, HTTPS-only
+# origins baked into the code so the deployed app doesn't break if the
+# env var is forgotten on a fresh box. Additional origins (staging,
+# preview environments, partner integrations) still come from the env.
+PRODUCTION_BASELINE_ORIGINS = (
+    "https://middha-global.onrender.com",
+    "https://www.auroratest.in",
+    "https://auroratest.in",
+)
+
+
+def parse_allowed_origins(env_value: Optional[str], *, production: bool) -> list[str]:
+    """Parse AURORA_ALLOWED_ORIGINS into a concrete allowlist (audit C3).
+
+    Union of PRODUCTION_BASELINE_ORIGINS (always) and the comma-separated
+    env value. Whitespace trimmed, trailing slashes stripped, duplicates
+    dropped, order preserved. Wildcards ("*") are refused so a well-
+    intentioned env value can't downgrade to the pre-audit behavior. In
+    dev (NODE_ENV != production), an unset env also adds the common
+    localhost dev-server ports."""
+    seen: set[str] = set()
+    result: list[str] = []
+
+    def _add(origin: str) -> None:
+        cleaned = origin.strip().rstrip("/")
+        if cleaned and cleaned != "*" and cleaned not in seen:
+            seen.add(cleaned)
+            result.append(cleaned)
+
+    for origin in PRODUCTION_BASELINE_ORIGINS:
+        _add(origin)
+
+    raw = (env_value or "").strip()
+    if raw:
+        for part in raw.split(","):
+            _add(part)
+    elif not production:
+        for origin in (
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://localhost:8000",
+        ):
+            _add(origin)
+
+    return result
+
+
+# Body-size cap (audit C4). Default is 50 MB per the audit-followup Q&A;
+# override via AURORA_MAX_BODY_BYTES. The check runs before route handlers
+# read the request so a hostile 10 GB body is rejected with 413 without
+# ever being buffered into memory.
+def _max_body_bytes() -> int:
+    try:
+        return max(1024, int(os.getenv("AURORA_MAX_BODY_BYTES") or 50 * 1024 * 1024))
+    except (TypeError, ValueError):
+        return 50 * 1024 * 1024
+
+
+class BodySizeLimitMiddleware(BaseHTTPMiddleware):
+    """Reject requests whose Content-Length exceeds the configured cap.
+
+    Streaming clients that omit Content-Length are enforced downstream by
+    the reverse-proxy cap (nginx `client_max_body_size` etc) — this
+    middleware is the app-layer defense-in-depth, not the only line."""
+
+    def __init__(self, app: ASGIApp, max_bytes: int):
+        super().__init__(app)
+        self._max_bytes = max_bytes
+
+    async def dispatch(self, request: Request, call_next):
+        cl = request.headers.get("content-length")
+        if cl:
+            try:
+                length = int(cl)
+            except ValueError:
+                length = 0
+            if length > self._max_bytes:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "detail": (
+                            f"Request body exceeds {self._max_bytes} bytes "
+                            f"({length} bytes sent). Split the upload or "
+                            "raise AURORA_MAX_BODY_BYTES."
+                        ),
+                    },
+                )
+        return await call_next(request)
+
+
+_PRODUCTION = _is_production()
+_ALLOWED_ORIGINS = parse_allowed_origins(
+    os.getenv("AURORA_ALLOWED_ORIGINS"), production=_PRODUCTION,
+)
+if not _ALLOWED_ORIGINS:
+    # Belt-and-braces: parse_allowed_origins always seeds
+    # PRODUCTION_BASELINE_ORIGINS, so this branch is unreachable unless
+    # someone empties that tuple. Refuse to start with a CORS wildcard.
+    raise RuntimeError(
+        "CORS origin list is empty. Refusing to start with a wildcard. "
+        "Add explicit origins to PRODUCTION_BASELINE_ORIGINS or set "
+        "AURORA_ALLOWED_ORIGINS."
+    )
+
+
+# Rate limiter (audit C2). Per-IP by default; the login endpoint gets a
+# tighter override applied via decorator. Uses slowapi's in-process
+# backend — swap to a Redis backend when moving to multi-instance.
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=[os.getenv("AURORA_DEFAULT_RATE_LIMIT", "120/minute")],
+)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: init DB. Campaigns are fetched lazily per-user on first tool call.
+    # Startup: fail-hard on the audit C1 encryption-key check before
+    # touching Mongo — a broken deployment should die at boot, not on
+    # the first token-decrypt attempt in the middle of a request.
+    assert_token_key_configured()
     await init_db()
     print("Database initialized.")
 
-    # Nightly forecasting ingest — 03:00 UTC daily. Skipped if the
-    # FORECASTING_SCHEDULER env var is set to "0" (useful in dev so the
-    # job doesn't fire while iterating on the code).
+    # Nightly forecasting ingest — 03:00 UTC daily.
+    #
+    # Audit H2: previously started on every worker process. With N
+    # workers, N schedulers would fire the job simultaneously and each
+    # instance would independently hit Amazon's report quota, doubling /
+    # tripling / N-ing the load. Now gated behind
+    # RUN_NIGHTLY_SCHEDULER=true: set on exactly ONE worker (via
+    # environment-specific docker-compose override, systemd unit, etc).
+    # FORECASTING_SCHEDULER=0 still disables it entirely in dev.
+    #
+    # Follow-up (out of scope for this PR): move to a distributed
+    # scheduler (Celery beat with leader election, or a Mongo-backed
+    # leader lease) so operators don't have to pin scheduling to a
+    # specific worker manually.
     scheduler: AsyncIOScheduler | None = None
     if os.getenv("FORECASTING_SCHEDULER", "1") != "0":
-        scheduler = AsyncIOScheduler(timezone="UTC")
-        scheduler.add_job(
-            run_nightly_ingest,
-            trigger=CronTrigger(hour=3, minute=0),
-            id="forecasting_nightly_ingest",
-            max_instances=1,
-            coalesce=True,
-        )
-        scheduler.start()
-        print("Forecasting scheduler started (nightly 03:00 UTC).")
+        if os.getenv("RUN_NIGHTLY_SCHEDULER", "").strip().lower() in ("1", "true", "yes"):
+            scheduler = AsyncIOScheduler(timezone="UTC")
+            scheduler.add_job(
+                run_nightly_ingest,
+                trigger=CronTrigger(hour=3, minute=0),
+                id="forecasting_nightly_ingest",
+                max_instances=1,
+                coalesce=True,
+            )
+            scheduler.start()
+            print("Forecasting scheduler started (nightly 03:00 UTC).")
+        else:
+            print(
+                "Forecasting scheduler NOT started on this worker "
+                "(RUN_NIGHTLY_SCHEDULER is unset). Set it on exactly "
+                "one worker so the job fires once per night."
+            )
 
     try:
         yield
@@ -112,11 +259,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Rate limiter must be attached to the app + wire the 429 handler.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Order matters: body-size cap runs BEFORE CORS so a hostile pre-flight
+# with a giant body is rejected at the entrance, not after CORS burns
+# cycles inspecting headers.
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=_max_body_bytes())
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # Dev-only LightGBM vs Prophet benchmark endpoint. No-op unless
@@ -126,7 +283,8 @@ _mount_lgbm_benchmark(app)
 
 
 @app.post("/api/auth/login")
-async def login(body: LoginRequest):
+@limiter.limit(os.getenv("AURORA_LOGIN_RATE_LIMIT", "5/minute"))
+async def login(request: Request, body: LoginRequest):
     """Local mirror of Aurora's POST /api/auth/login.
 
     Verifies the password against the shared Mongo `users` collection and
