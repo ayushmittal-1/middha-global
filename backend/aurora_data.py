@@ -513,7 +513,16 @@ async def returned_units_by_sku_daily(
 
     Uses the same LPN-based dedup as `fba_returns_by_sku` so a single
     physical unit that Amazon emitted twice (multiple disposition rows)
-    doesn't double-count."""
+    doesn't double-count.
+
+    Known caveat (verified against real Mongo during PR #42 review):
+    physical returns typically arrive 30-60 days AFTER the purchase
+    date. So for a trailing 7d or 30d window, this helper will return
+    very few or zero returns even for a seller with a materially high
+    return rate. The 90d and 180d windows show the true return signal,
+    and the Prophet forecast (trained on 180d of history) reflects the
+    adjustment fully. UI tooltip on the toggle carries the same caveat
+    so users don't misread near-zero recent-window shifts as a bug."""
     cursor = _db().orders.find(
         {
             "sellerId": user_id,

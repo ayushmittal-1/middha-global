@@ -140,6 +140,22 @@ def test_restock_toolbar_has_include_returns_toggle(frontend_html):
     assert 'id="restock-include-returns"' in frontend_html
 
 
+def test_tooltip_documents_the_return_lag_caveat(frontend_html):
+    """Live-Mongo probe (PR #42 review) confirmed physical returns lag
+    30-60d from purchase date, so trailing 7/30d shifts are small even
+    for high-return sellers. Tooltip must call this out so users don't
+    mistake the near-zero shift for a bug."""
+    assert "30" in frontend_html and "60" in frontend_html, (
+        "toggle tooltip should mention the 30-60 day return lag"
+    )
+    # A specific phrase from the tooltip — locks the wording so a
+    # generic \"tooltip\" edit that drops the caveat fails this test.
+    assert "barely shift" in frontend_html, (
+        "toggle tooltip should explain that recent-window numbers "
+        "barely shift (return-lag caveat)"
+    )
+
+
 def test_toggle_persists_to_localstorage(frontend_html):
     """Toggle state must survive reloads so users don't have to re-opt-in
     on every session."""
