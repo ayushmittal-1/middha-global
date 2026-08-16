@@ -549,7 +549,11 @@ async def forecasting_restock(user: dict = Depends(protect)):
     # demand rather than the forecast_cache's frozen number. One 90-day
     # Mongo aggregation covers every SKU — the per-window slicing happens
     # in-memory in `compute_velocity_windows`.
-    from forecasting.model import compute_velocity_windows, weighted_velocity
+    from forecasting.model import (
+        apply_returns_to_daily_rows,
+        compute_velocity_windows,
+        weighted_velocity,
+    )
     from database import DEFAULT_PRODUCT_SETTINGS
     since_180d = datetime.now(timezone.utc) - timedelta(days=180)
     sales_rows = await get_sales_daily(sku=None, since=since_180d)
@@ -558,10 +562,31 @@ async def forecasting_restock(user: dict = Depends(protect)):
         sales_by_sku.setdefault(r.get("sku") or "", []).append(r)
     now_utc = datetime.now(timezone.utc)
     default_weights = DEFAULT_PRODUCT_SETTINGS["velocity_weights"]
+
+    # Restock returns-toggle (feature ask): pull physical FBA returns over
+    # the same 180d window as velocity so the "Include returns" view uses
+    # a consistent demand definition. Failure to fetch (permission missing,
+    # collection empty for this user) is silently non-fatal — the base
+    # gross-view fields on each row are still populated.
+    returns_by_sku_daily: dict[str, dict[str, int]] = {}
+    try:
+        returns_by_sku_daily = await aurora_data.returned_units_by_sku_daily(
+            user_id, since_180d, now_utc,
+        )
+    except Exception as e:
+        print(f"[restock] returned_units_by_sku_daily failed: {e}")
+
     weighted_by_sku: dict[str, float] = {}
+    weighted_net_by_sku: dict[str, float] = {}
     orders_7d_by_sku: dict[str, int] = {}
     orders_30d_by_sku: dict[str, int] = {}
     orders_60d_by_sku: dict[str, int] = {}
+    orders_7d_net_by_sku: dict[str, int] = {}
+    orders_30d_net_by_sku: dict[str, int] = {}
+    orders_60d_net_by_sku: dict[str, int] = {}
+    returns_7d_by_sku: dict[str, int] = {}
+    returns_30d_by_sku: dict[str, int] = {}
+    returns_60d_by_sku: dict[str, int] = {}
     stockout_days_by_sku: dict[str, int] = {}
     # Mongo returns naive UTC datetimes — strip the tz on the cutoff so
     # `date >= cutoff_90d` doesn't blow up on the naive/aware mismatch.
@@ -581,6 +606,37 @@ async def forecasting_restock(user: dict = Depends(protect)):
                 orders_30d_by_sku[sku_key] = units
             elif pd_val == 60:
                 orders_60d_by_sku[sku_key] = units
+
+        # Net-of-returns pass — reuse the same window math on rows with
+        # per-day returns subtracted from units_ordered.
+        sku_returns_daily = returns_by_sku_daily.get(sku_key)
+        if sku_returns_daily:
+            net_rows = apply_returns_to_daily_rows(sku_rows, sku_returns_daily)
+            net_windows = compute_velocity_windows(
+                net_rows, now_utc, windows=(3, 7, 30, 60, 180),
+            )
+            wv_net = weighted_velocity(net_windows, default_weights)
+            weighted_net_by_sku[sku_key] = float(wv_net) if wv_net is not None else 0.0
+            gross_units_by_pd = {int(w["period_days"]): int(w["units_sold"]) for w in windows}
+            for w in net_windows:
+                pd_val = int(w.get("period_days") or 0)
+                units = int(w.get("units_sold") or 0)
+                if pd_val == 7:
+                    orders_7d_net_by_sku[sku_key] = units
+                    returns_7d_by_sku[sku_key] = max(0, gross_units_by_pd.get(7, 0) - units)
+                elif pd_val == 30:
+                    orders_30d_net_by_sku[sku_key] = units
+                    returns_30d_by_sku[sku_key] = max(0, gross_units_by_pd.get(30, 0) - units)
+                elif pd_val == 60:
+                    orders_60d_net_by_sku[sku_key] = units
+                    returns_60d_by_sku[sku_key] = max(0, gross_units_by_pd.get(60, 0) - units)
+        else:
+            # No returns for this SKU — net equals gross.
+            weighted_net_by_sku[sku_key] = weighted_by_sku[sku_key]
+            orders_7d_net_by_sku[sku_key] = orders_7d_by_sku.get(sku_key, 0)
+            orders_30d_net_by_sku[sku_key] = orders_30d_by_sku.get(sku_key, 0)
+            orders_60d_net_by_sku[sku_key] = orders_60d_by_sku.get(sku_key, 0)
+
         # Live count of stockout-corrected days in the trailing 90d —
         # get_sales_daily runs `_flag_stockout_runs` on read, so any row
         # inside the window with the flag set is a missed-sales day.
@@ -699,6 +755,51 @@ async def forecasting_restock(user: dict = Depends(protect)):
         # 500 units of an inactive listing.
         recommended_po_qty = reorder.get("recommended_po_qty", 0) if is_buyable else 0
 
+        # Returns-view overrides — computed off the same stock_forward so
+        # the toggle only changes the demand denominator, not the on-hand
+        # numerator. Forecast + ship-by dates scale by (net/gross); when
+        # net exceeds gross (rare — trailing sales < returns is a data
+        # oddity, not something to boost the forecast for) we clamp the
+        # ratio at 1.0 so the toggle can only ever LOWER demand.
+        wv_net = weighted_net_by_sku.get(sku, weighted_by_sku.get(sku, 0.0))
+        returns_view: dict = {
+            "weighted_velocity": round(wv_net, 2),
+            "orders_7d": int(orders_7d_net_by_sku.get(sku, orders_7d_by_sku.get(sku, 0))),
+            "orders_30d": int(orders_30d_net_by_sku.get(sku, orders_30d_by_sku.get(sku, 0))),
+            "orders_60d": int(orders_60d_net_by_sku.get(sku, orders_60d_by_sku.get(sku, 0))),
+            "returns_7d": int(returns_7d_by_sku.get(sku, 0)),
+            "returns_30d": int(returns_30d_by_sku.get(sku, 0)),
+            "returns_60d": int(returns_60d_by_sku.get(sku, 0)),
+        }
+        if wv > 0:
+            scale = min(1.0, wv_net / wv) if wv_net >= 0 else 0.0
+            returns_view["next_30_day_forecast"] = round(next30 * scale, 1)
+            if wv_net > 0:
+                days_of_cover_net = round(stock_forward / wv_net, 1)
+                stockout_date_net_obj = today + timedelta(days=int(stock_forward / wv_net))
+                returns_view["days_of_cover"] = days_of_cover_net
+                returns_view["stockout_date"] = stockout_date_net_obj.isoformat()
+                air_transit = int(reorder.get("air_transit_days") or 10)
+                ocean_transit = int(reorder.get("ocean_transit_days") or 45)
+                returns_view["reorder_by_date_air"] = max(
+                    today, stockout_date_net_obj - timedelta(days=air_transit),
+                ).isoformat()
+                returns_view["reorder_by_date_ocean"] = max(
+                    today, stockout_date_net_obj - timedelta(days=ocean_transit),
+                ).isoformat()
+            else:
+                # Net velocity zeroed out: no forward demand at all.
+                returns_view["days_of_cover"] = None
+                returns_view["stockout_date"] = None
+                returns_view["reorder_by_date_air"] = None
+                returns_view["reorder_by_date_ocean"] = None
+        else:
+            returns_view["next_30_day_forecast"] = round(next30, 1)
+            returns_view["days_of_cover"] = days_of_cover_val
+            returns_view["stockout_date"] = stockout_date_iso
+            returns_view["reorder_by_date_air"] = reorder_by_date_air_iso
+            returns_view["reorder_by_date_ocean"] = reorder_by_date_ocean_iso
+
         rows.append({
             "sku": sku,
             "asin": c.get("asin"),
@@ -724,6 +825,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "next_30_day_forecast": round(next30, 1),
             "days_of_cover": days_of_cover_val,
             "stockout_date": stockout_date_iso,
+            "returns_view": returns_view,
             "reorder_by_date": reorder.get("reorder_by_date"),
             "reorder_by_date_air": reorder_by_date_air_iso,
             "reorder_by_date_ocean": reorder_by_date_ocean_iso,

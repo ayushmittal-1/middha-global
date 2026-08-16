@@ -1936,6 +1936,9 @@
         <label id="restock-hide-non-buyable-label" title="Hide SKUs Amazon has flagged as not buyable (blocked / suppressed listings)">
           <input type="checkbox" id="restock-hide-non-buyable"> Hide non-buyable
         </label>
+        <label id="restock-include-returns-label" title="Subtract physical FBA customer returns from demand — orders/day, forecast, days of cover and ship-by dates all reflect net-of-returns demand." style="font-size:12px;display:inline-flex;align-items:center;gap:4px;">
+          <input type="checkbox" id="restock-include-returns"> Include returns
+        </label>
         <input type="text" id="restock-search" placeholder="Filter by SKU or ASIN" style="min-width:180px;padding:4px 8px;font-size:12px;border:1px solid #cbd5e1;border-radius:4px;">
         <label title="Trailing window for the Orders column (units sold, Aurora orders, cancelled/pending excluded)" style="font-size:12px;">
           Orders window
@@ -2764,6 +2767,35 @@
     const restockCountEl = document.getElementById('restock-count');
     const restockShowNoDemandEl = document.getElementById('restock-show-no-demand');
     const restockHideNonBuyableEl = document.getElementById('restock-hide-non-buyable');
+    // "Include returns" toggle (feature ask): when on, the restock table
+    // uses net-of-physical-returns velocity/orders/forecast/DOC/ship-by
+    // dates. Backend ships the base gross view in the row fields as
+    // usual, plus a `returns_view` block with the net overrides — the
+    // toggle just picks which set to render. Persist the choice so it
+    // survives reloads.
+    const restockIncludeReturnsEl = document.getElementById('restock-include-returns');
+    try {
+      restockIncludeReturnsEl.checked = localStorage.getItem('restock:include-returns') === '1';
+    } catch (_) {}
+    restockIncludeReturnsEl.addEventListener('change', () => {
+      try {
+        localStorage.setItem(
+          'restock:include-returns',
+          restockIncludeReturnsEl.checked ? '1' : '0',
+        );
+      } catch (_) {}
+      renderRestockRows();
+    });
+
+    function restockRowView(row) {
+      // Returns view is only surfaced when the user opts in AND the
+      // backend actually returned a returns_view block (older cached
+      // responses won't have it — fall through to the base row).
+      if (restockIncludeReturnsEl && restockIncludeReturnsEl.checked && row && row.returns_view) {
+        return {...row, ...row.returns_view};
+      }
+      return row;
+    }
     const restockSearchEl = document.getElementById('restock-search');
     const restockOrdersWindowEl = document.getElementById('restock-orders-window');
     const restockOrdersHeaderEl = document.getElementById('restock-orders-header');
@@ -3511,7 +3543,12 @@
       const tail = tailParts.length > 0 ? ` (${tailParts.join(', ')} filtered)` : '';
       restockCountEl.textContent = `${visible.length} SKU${visible.length === 1 ? '' : 's'}${tail}`;
 
-      for (const row of visible) {
+      for (const rawRow of visible) {
+        // View-swap for the "Include returns" toggle. row.* fields below
+        // resolve to either the base gross view or the returns_view
+        // overrides depending on the toggle. rawRow is preserved for
+        // fields that MUST stay gross (on_hand/inbound/PO qty).
+        const row = restockRowView(rawRow);
         const tr = document.createElement('tr');
         tr.dataset.sku = row.sku;
         // is_buyable defaults to true when the field is absent (older
