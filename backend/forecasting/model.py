@@ -45,6 +45,39 @@ DEFAULT_HORIZON = 90
 VELOCITY_WINDOWS = (3, 7, 30, 60, 180)
 
 
+def apply_returns_to_daily_rows(
+    rows: list[dict], returns_by_day: dict[str, int] | None,
+) -> list[dict]:
+    """Return a new rows list with per-day returns subtracted from
+    units_ordered (floored at 0). Pure function — safe to unit-test
+    without any Mongo mocking.
+
+    `returns_by_day` is keyed by ISO date string (YYYY-MM-DD) to match
+    aurora_data.returned_units_by_sku_daily's output. Rows whose date
+    field is not a datetime are copied through untouched. Original
+    `rows` list is not mutated (the Restock endpoint reuses it for the
+    gross-velocity pass)."""
+    if not returns_by_day:
+        return list(rows or [])
+    out: list[dict] = []
+    for r in rows or []:
+        d = r.get("date")
+        if not isinstance(d, datetime):
+            out.append(r)
+            continue
+        day_key = d.date().isoformat()
+        returned = int(returns_by_day.get(day_key) or 0)
+        if returned <= 0:
+            out.append(r)
+            continue
+        original = int(r.get("units_ordered") or 0)
+        net = max(0, original - returned)
+        new_row = dict(r)
+        new_row["units_ordered"] = net
+        out.append(new_row)
+    return out
+
+
 def compute_velocity_windows(
     rows: list[dict],
     today: datetime | None = None,
@@ -262,6 +295,11 @@ def _prophet_forecast(series: pd.DataFrame, horizon: int, today: datetime) -> di
         yearly_seasonality=True,
         daily_seasonality=False,
         holidays=PRIME_EVENTS,
+        # Default 0.05 is too conservative for this catalog — Prophet
+        # regresses to the historical mean and misses recent acceleration
+        # in demand. 0.5 lets the trend chase the last 30-60 days harder
+        # so July's uptick is actually captured.
+        changepoint_prior_scale=0.5,
     )
     model.add_country_holidays(country_name="US")
     if use_ad_regressor:
@@ -328,11 +366,12 @@ async def forecast_sku_for_user(
     """Build a forecast for a single SKU. Used by the agent tool and the
     nightly refresh job."""
     today = datetime.now(timezone.utc)
-    # Train on the trailing 30 days — SellerBoard-style. With ≤ 41 days
-    # of densified history, `_forecast_one` falls through to
-    # `_naive_forecast` (trimmed-mean × day-of-week multiplier), which is
-    # more stable than Prophet on tiny samples.
-    since = today - timedelta(days=30)
+    # Trailing 90 days — clears MIN_HISTORY_DAYS=60 so Prophet actually
+    # runs (13 weekly cycles is enough for weekly seasonality), but short
+    # enough that old sluggish months don't drag the trend fit down when
+    # recent demand has accelerated. SKUs with <60 days fall through to
+    # `_naive_forecast`.
+    since = today - timedelta(days=90)
     rows = await get_sales_daily_for_user(user_id, sku=sku, since=since)
     result = await asyncio.to_thread(_forecast_one, rows, horizon, today)
     result["sku"] = sku
@@ -349,11 +388,12 @@ async def refresh_forecasts_for_user(
     provided). Called by the nightly job after ingest. Also computes the
     reorder fields so the dashboard can render from a single read."""
     today = datetime.now(timezone.utc)
-    # Train on the trailing 30 days — SellerBoard-style. With ≤ 41 days
-    # of densified history, `_forecast_one` falls through to
-    # `_naive_forecast` (trimmed-mean × day-of-week multiplier), which is
-    # more stable than Prophet on tiny samples.
-    since = today - timedelta(days=30)
+    # Trailing 90 days — clears MIN_HISTORY_DAYS=60 so Prophet actually
+    # runs (13 weekly cycles is enough for weekly seasonality), but short
+    # enough that old sluggish months don't drag the trend fit down when
+    # recent demand has accelerated. SKUs with <60 days fall through to
+    # `_naive_forecast`.
+    since = today - timedelta(days=90)
 
     if skus is None:
         # Pull the full history once, then group by SKU. Cheaper than 100s

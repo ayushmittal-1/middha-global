@@ -493,6 +493,83 @@ async def fba_returns_by_sku(
     return out
 
 
+async def returned_units_by_sku_daily(
+    user_id: ObjectId,
+    start: datetime,
+    end: datetime,
+) -> dict[str, dict[str, int]]:
+    """Per-day physical FBA customer-return counts per SKU.
+
+    Powers the Restock tab's "Include returns" toggle. Physical
+    customerReturns only — returnless refunds are NOT counted here, per
+    the product decision that "returns" for restock means units back in
+    the warehouse (a returnless refund removes revenue but not a unit).
+
+    Bound by purchaseDate so the return count aligns with the day the
+    demand signal (units_ordered) originally landed on — matches how
+    velocity/forecast treat orders. Keyed by ISO date string
+    (YYYY-MM-DD) so downstream lookups don't fight with datetime/date
+    equality edge cases.
+
+    Uses the same LPN-based dedup as `fba_returns_by_sku` so a single
+    physical unit that Amazon emitted twice (multiple disposition rows)
+    doesn't double-count.
+
+    Known caveat (verified against real Mongo during PR #42 review):
+    physical returns typically arrive 30-60 days AFTER the purchase
+    date. So for a trailing 7d or 30d window, this helper will return
+    very few or zero returns even for a seller with a materially high
+    return rate. The 90d and 180d windows show the true return signal,
+    and the Prophet forecast (trained on 180d of history) reflects the
+    adjustment fully. UI tooltip on the toggle carries the same caveat
+    so users don't misread near-zero recent-window shifts as a bug."""
+    cursor = _db().orders.find(
+        {
+            "sellerId": user_id,
+            "purchaseDate": {"$gte": start, "$lte": end},
+            "hasCustomerReturn": True,
+        },
+        {
+            "orderItems": 1,
+            "customerReturns": 1,
+            "purchaseDate": 1,
+        },
+    )
+
+    out: dict[str, dict[str, int]] = {}
+    async for order in cursor:
+        pd = order.get("purchaseDate")
+        if not isinstance(pd, datetime):
+            continue
+        day_key = pd.date().isoformat()
+        items = list(order.get("orderItems") or [])
+        primary = items[0] if items else {}
+
+        seen_lpn: set[str] = set()
+        for row in order.get("customerReturns") or []:
+            sku = html.unescape(str(row.get("sku") or "")).strip()
+            if not sku:
+                sku = html.unescape(str(primary.get("sellerSku") or "")).strip()
+            if not sku:
+                continue
+            qty = int(row.get("quantity") or 0)
+            if qty <= 0:
+                continue
+            lpn = str(
+                row.get("licensePlateNumber")
+                or row.get("license_plate_number")
+                or ""
+            ).strip()
+            if lpn:
+                if lpn in seen_lpn:
+                    continue
+                seen_lpn.add(lpn)
+            per_day = out.setdefault(sku, {})
+            per_day[day_key] = per_day.get(day_key, 0) + qty
+
+    return out
+
+
 async def fba_aged_inventory_by_sku(user: dict) -> Optional[dict[str, dict]]:
     """Read Aurora's `fbaagedinventoryfees` snapshot for this seller.
 
