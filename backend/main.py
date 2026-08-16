@@ -1052,6 +1052,78 @@ async def delete_purchase_order_endpoint(
     return {"deleted": n}
 
 
+# ── Deals tab ─────────────────────────────────────────────────────────────
+
+
+@app.get("/deals")
+async def deals_endpoint(
+    days_back: int = 90,
+    start: str | None = None,
+    end: str | None = None,
+    user: dict = Depends(protect),
+):
+    """One endpoint powers the Deals tab. Three sections:
+
+      historical      — deals that ran, from Aurora's own promotionIds
+                        + promotionDiscount fields on order line items.
+                        Fully covers Lightning / 7-Day / PED / coupons /
+                        SNS anything Amazon attributed on a sale.
+      coupons         — active coupons via SP-API (best-effort).
+      prime_exclusive — Prime Exclusive Discounts via SP-API (best-effort).
+      unsupported     — informational list of deal types + data points
+                        Amazon doesn't expose via SP-API, with the reason
+                        for each. FE surfaces this so users understand
+                        why "Lightning Deals" isn't listed here.
+
+    Window defaults to trailing 90 days; overridable via
+    `?start=YYYY-MM-DD&end=YYYY-MM-DD` or `?days_back=N`."""
+    import deals
+    from bson import ObjectId as _OID
+    user_id = _OID(str(user["_id"]))
+
+    # Resolve window (same convention as /profitability).
+    end_dt = datetime.now(timezone.utc)
+    if end:
+        try:
+            end_dt = datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
+            # Include the whole 'end' day.
+            end_dt = end_dt.replace(hour=23, minute=59, second=59)
+        except ValueError:
+            pass
+    if start:
+        try:
+            start_dt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
+        except ValueError:
+            start_dt = end_dt - timedelta(days=int(days_back or 90))
+    else:
+        start_dt = end_dt - timedelta(days=int(days_back or 90))
+
+    # Historical — cheap DB read against our own orders.
+    order_docs: list[dict] = []
+    try:
+        order_docs = await aurora_data.fetch_orders_with_items(
+            user,
+            created_after=start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            created_before=end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+    except Exception as e:
+        print(f"[deals] fetch_orders_with_items failed: {e}")
+    historical = deals.aggregate_historical_promotions(order_docs)
+
+    # SP-API best-effort — either can 403/404 without failing the page.
+    coupons = await deals.fetch_active_coupons(user)
+    prime_exclusive = await deals.fetch_prime_exclusive_discounts(user)
+
+    return {
+        "start": start_dt.date().isoformat(),
+        "end": end_dt.date().isoformat(),
+        "historical": historical,
+        "coupons": coupons,
+        "prime_exclusive": prime_exclusive,
+        "unsupported": list(deals.UNSUPPORTED_DEAL_TYPES),
+    }
+
+
 # ── Amazon SP-API data endpoints (for FE tables) ───────────────────────────
 
 ORDERS_SOURCE = os.getenv("AURORA_DATA_SOURCE") or os.getenv("AURORA_ORDERS_SOURCE", "db")

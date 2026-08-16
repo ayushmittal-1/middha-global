@@ -1751,6 +1751,14 @@
       background: #fafafa;
     }
     #keywords-view.visible { display: flex; }
+    #deals-view {
+      display: none;
+      flex-direction: column;
+      flex: 1;
+      overflow-y: auto;
+      background: #fafafa;
+    }
+    #deals-view.visible { display: flex; }
     #keywords-toolbar {
       display: flex; align-items: center; gap: 12px;
       padding: 16px 20px; border-bottom: 1px solid #e5e5e5;
@@ -1910,6 +1918,7 @@
       <button class="tab-btn" data-tab="cogs">COGS</button>
       <button class="tab-btn" data-tab="keywords">Keywords</button>
       <button class="tab-btn" data-tab="listings">Listings</button>
+      <button class="tab-btn" data-tab="deals">Deals</button>
     </nav>
 
     <div id="chat-container">
@@ -2263,6 +2272,42 @@
         </div>
       </div>
       </div><!-- /lo-optimizer-panel -->
+    </div>
+
+    <div id="deals-view">
+      <div id="deals-toolbar" style="display:flex;align-items:center;gap:12px;padding:12px 20px;flex-wrap:wrap;">
+        <h2 style="margin:0;">Deals</h2>
+        <span id="deals-stamp" style="font-size:12px;color:#888;"></span>
+        <label style="font-size:12px;">Window
+          <select id="deals-window" style="margin-left:4px;padding:4px 6px;font-size:12px;border:1px solid #cbd5e1;border-radius:4px;">
+            <option value="30">Last 30 days</option>
+            <option value="90" selected>Last 90 days</option>
+            <option value="180">Last 180 days</option>
+            <option value="365">Last 365 days</option>
+          </select>
+        </label>
+        <button id="deals-refresh" style="padding:4px 12px;font-size:12px;">Refresh</button>
+      </div>
+      <div id="deals-caveat" style="margin:0 20px 12px;padding:10px 14px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:4px;font-size:13px;color:#78350f;">
+        <strong>What's not shown here (and why):</strong>
+        <ul id="deals-unsupported" style="margin:6px 0 0 20px;padding:0;"></ul>
+      </div>
+      <div id="deals-sections" style="padding:0 20px 40px;">
+        <section id="deals-historical-section" style="margin-bottom:32px;">
+          <h3 style="margin:0 0 8px;font-size:15px;">Historical promotions</h3>
+          <p style="margin:0 0 12px;font-size:12px;color:#666;">Deals that ran on your sales, grouped by Amazon promotion ID. Sourced from order line items (<code>promotionIds</code> + <code>promotionDiscount</code>), so this covers Lightning, 7-Day, Best Deal, PED, coupons, and SNS. <strong>Caveat:</strong> Subscribe &amp; Save rows show <code>$0</code> discount because Amazon accounts for the SNS discount in the Finances feed, not on the order line — the units/orders columns are still accurate.</p>
+          <div id="deals-historical-totals" style="display:flex;gap:24px;margin-bottom:8px;font-size:13px;"></div>
+          <div id="deals-historical-body">Loading…</div>
+        </section>
+        <section id="deals-coupons-section" style="margin-bottom:32px;">
+          <h3 style="margin:0 0 8px;font-size:15px;">Active coupons <small style="font-weight:normal;color:#666;">(SP-API)</small></h3>
+          <div id="deals-coupons-body">Loading…</div>
+        </section>
+        <section id="deals-ped-section" style="margin-bottom:32px;">
+          <h3 style="margin:0 0 8px;font-size:15px;">Prime Exclusive Discounts <small style="font-weight:normal;color:#666;">(SP-API)</small></h3>
+          <div id="deals-ped-body">Loading…</div>
+        </section>
+      </div>
     </div>
 
     <div id="keywords-view">
@@ -2865,6 +2910,110 @@
 
     const keywordsViewEl = document.getElementById('keywords-view');
     const listingsViewEl = document.getElementById('listings-view');
+    const dealsViewEl = document.getElementById('deals-view');
+    let dealsLoaded = false;
+
+    async function loadDeals() {
+      const bodyH = document.getElementById('deals-historical-body');
+      const bodyC = document.getElementById('deals-coupons-body');
+      const bodyP = document.getElementById('deals-ped-body');
+      const totalsEl = document.getElementById('deals-historical-totals');
+      const unsupportedEl = document.getElementById('deals-unsupported');
+      const stampEl = document.getElementById('deals-stamp');
+      const windowEl = document.getElementById('deals-window');
+      const days = parseInt(windowEl.value, 10) || 90;
+      bodyH.textContent = 'Loading…';
+      bodyC.textContent = 'Loading…';
+      bodyP.textContent = 'Loading…';
+      totalsEl.innerHTML = '';
+      try {
+        const r = await fetch(`/deals?days_back=${days}`, { headers: authHeaders() });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        stampEl.textContent = `${data.start} → ${data.end}`;
+
+        // Unsupported-list callout — build once per response since the
+        // list is static, but re-render on refresh so it can't get out
+        // of sync with the backend.
+        unsupportedEl.innerHTML = (data.unsupported || []).map(u =>
+          `<li><strong>${escapeHtml(u.name)}</strong> — ${escapeHtml(u.reason)}</li>`
+        ).join('');
+
+        // Historical totals + table.
+        const hist = data.historical || {};
+        const t = hist.totals || {};
+        totalsEl.innerHTML = [
+          `<span><strong>${t.unique_promotions ?? 0}</strong> promotions</span>`,
+          `<span><strong>${(t.units_sold ?? 0).toLocaleString()}</strong> units on promo</span>`,
+          `<span>Gross <strong>$${(t.gross_revenue ?? 0).toLocaleString()}</strong></span>`,
+          `<span>Discount <strong style="color:#dc2626;">−$${(t.discount_amount ?? 0).toLocaleString()}</strong></span>`,
+          `<span>Net <strong>$${(t.net_revenue ?? 0).toLocaleString()}</strong></span>`,
+        ].join('');
+        const promos = hist.promotions || [];
+        if (!promos.length) {
+          bodyH.innerHTML = `<div style="padding:12px;color:#666;">No promotional discounts recorded on orders in this window.</div>`;
+        } else {
+          bodyH.innerHTML = `
+            <table class="restock" style="width:100%;font-size:12px;">
+              <thead>
+                <tr>
+                  <th>Promotion ID</th>
+                  <th class="num">Units</th>
+                  <th class="num">Orders</th>
+                  <th class="num">Gross</th>
+                  <th class="num">Discount</th>
+                  <th class="num">Net</th>
+                  <th class="num">Avg disc/unit</th>
+                  <th>First seen</th>
+                  <th>Last seen</th>
+                  <th>SKUs affected</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${promos.map(p => `
+                  <tr>
+                    <td title="${escapeHtml(p.promotion_id)}"><code>${escapeHtml(p.promotion_id)}</code></td>
+                    <td class="num">${(p.units_sold ?? 0).toLocaleString()}</td>
+                    <td class="num">${(p.orders ?? 0).toLocaleString()}</td>
+                    <td class="num">$${(p.gross_revenue ?? 0).toLocaleString()}</td>
+                    <td class="num" style="color:#dc2626;">−$${(p.discount_amount ?? 0).toLocaleString()}</td>
+                    <td class="num">$${(p.net_revenue ?? 0).toLocaleString()}</td>
+                    <td class="num">$${(p.avg_discount_per_unit ?? 0).toFixed(2)}</td>
+                    <td>${escapeHtml(p.first_seen || '—')}</td>
+                    <td>${escapeHtml(p.last_seen || '—')}</td>
+                    <td title="${escapeHtml((p.skus || []).join(', '))}">${p.sku_count ?? 0} SKUs${p.sku_count > 10 ? ' (top 10 shown on hover)' : ''}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>`;
+        }
+
+        // Coupons.
+        const cp = data.coupons || {};
+        if (cp.unavailable) {
+          bodyC.innerHTML = `<div style="padding:12px;color:#666;font-size:13px;">⚠️ ${escapeHtml(cp.unavailable)}</div>`;
+        } else if (!cp.items || !cp.items.length) {
+          bodyC.innerHTML = `<div style="padding:12px;color:#666;">No active coupons.</div>`;
+        } else {
+          bodyC.innerHTML = `<pre style="background:#f6f7f9;padding:10px;border-radius:4px;font-size:11px;overflow:auto;">${escapeHtml(JSON.stringify(cp.items, null, 2))}</pre>`;
+        }
+
+        // Prime Exclusive Discounts.
+        const pe = data.prime_exclusive || {};
+        if (pe.unavailable) {
+          bodyP.innerHTML = `<div style="padding:12px;color:#666;font-size:13px;">⚠️ ${escapeHtml(pe.unavailable)}</div>`;
+        } else if (!pe.items || !pe.items.length) {
+          bodyP.innerHTML = `<div style="padding:12px;color:#666;">No active Prime Exclusive Discounts.</div>`;
+        } else {
+          bodyP.innerHTML = `<pre style="background:#f6f7f9;padding:10px;border-radius:4px;font-size:11px;overflow:auto;">${escapeHtml(JSON.stringify(pe.items, null, 2))}</pre>`;
+        }
+      } catch (err) {
+        bodyH.innerHTML = `<div style="padding:12px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</div>`;
+      }
+    }
+
+    document.getElementById('deals-refresh')?.addEventListener('click', loadDeals);
+    document.getElementById('deals-window')?.addEventListener('change', loadDeals);
     const kwAsinsEl = document.getElementById('kw-asins');
     const kwCampaignEl = document.getElementById('kw-campaign');
     const kwAdgroupEl = document.getElementById('kw-adgroup');
@@ -2888,6 +3037,7 @@
       const isCogs = tab === 'cogs';
       const isKeywords = tab === 'keywords';
       const isListings = tab === 'listings';
+      const isDeals = tab === 'deals';
       chatContainerEl.style.display = isChat ? 'flex' : 'none';
       inputAreaEl.style.display = isChat ? 'flex' : 'none';
       restockViewEl.classList.toggle('visible', isRestock);
@@ -2897,6 +3047,11 @@
       cogsViewEl.classList.toggle('visible', isCogs);
       keywordsViewEl.classList.toggle('visible', isKeywords);
       listingsViewEl.classList.toggle('visible', isListings);
+      if (dealsViewEl) dealsViewEl.classList.toggle('visible', isDeals);
+      if (isDeals && !dealsLoaded && typeof loadDeals === 'function') {
+        loadDeals();
+        dealsLoaded = true;
+      }
       if (isListings && typeof window.__loadListingsIfNeeded === 'function') {
         window.__loadListingsIfNeeded();
       }
