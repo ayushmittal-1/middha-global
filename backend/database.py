@@ -1070,6 +1070,20 @@ async def latest_inventory_for_user(user_id: ObjectId) -> dict[str, dict]:
             "inbound_shipped": int(inv.get("inboundShippedQuantity") or 0),
             "inbound_working": int(inv.get("inboundWorkingQuantity") or 0),
             "reserved": int(inv.get("reservedQuantity") or 0),
+            # Amazon's reservedQuantity is a sum of 3 sub-buckets:
+            #   pendingCustomerOrderQuantity → allocated to open orders
+            #     not yet shipped
+            #   fcProcessingQuantity → at an FC undergoing processing
+            #     (moves between bins, damage inspection, etc.)
+            #   pendingTransshipmentQuantity → in transit between FCs
+            #     (surfaced separately as fc_transfer for the on-hand math)
+            # Aurora Node's inventory sync flattens the first two into
+            # their own fields on `products.inventory` so we can show
+            # the customer-order vs FC-processing bifurcation the seller
+            # asks about ("why is my inventory reserved?"). See
+            # auroraBackend/src/utils/fbaInventoryFields.js.
+            "reserved_customer_order": int(inv.get("reservedPendingCustomerOrder") or 0),
+            "reserved_fc_processing": int(inv.get("reservedFcProcessing") or 0),
             "unfulfillable": int(inv.get("unfulfillableQuantity") or 0),
             # Seller Central "On-hand (FBA)" = Available + FC Transfer
             # (pendingTransshipment). Reserved (customer orders + FC
