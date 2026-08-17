@@ -540,6 +540,14 @@
     table.restock tbody tr:nth-child(even) { background: #fafbfc; }
     table.restock tbody tr:hover { background: #eef4ff; }
     table.restock tbody tr:last-child { border-bottom: none; }
+    /* Reserved-column bifurcation: (cust + fc) sub-text, small + muted
+       so the total number remains the eye-catcher when scanning. */
+    .reserved-brk {
+      font-size: 10px;
+      color: #6b7280;
+      margin-left: 4px;
+      white-space: nowrap;
+    }
     table.restock td {
       padding: 12px 14px;
       color: #0f172a;
@@ -2000,7 +2008,7 @@
               <th title="Amazon Standard Identification Number">ASIN</th>
               <th title="Fulfillment Network SKU — Amazon's internal barcode ID for FBA units">FNSKU</th>
               <th class="num" title="Seller Central On-hand (FBA) = Available + FC Transfer (pendingTransshipment). Reserved / Unfulfillable / Inbound are separate columns.">On hand</th>
-              <th class="num" title="Units set aside by Amazon for pending customer orders / FC transfers / processing — not sellable right now">Reserved</th>
+              <th class="num" title="Units set aside by Amazon — not sellable right now.&#10;&#10;Bifurcation shown as 'total (cust + fc)':&#10;  cust = pendingCustomerOrder → allocated to open orders that haven't shipped yet&#10;  fc   = fcProcessing → at an FC being moved/inspected&#10;&#10;(pendingTransshipment / units in transit between FCs is counted in On hand, not here.)">Reserved</th>
               <th class="num" title="Units Amazon has received into the network but not yet checked into the destination FC (inboundShippedQuantity)">Sent to FBA</th>
               <th class="num" title="Units on an inbound shipment plan you've created but not yet shipped (inboundWorkingQuantity)">Inbound working</th>
               <th class="num" title="Damaged or customer-returned units currently unsellable">Unfulfillable</th>
@@ -3735,7 +3743,32 @@
           <td title="${escapeHtml(row.asin || '')}">${escapeHtml(row.asin || '—')}</td>
           <td title="${escapeHtml(row.fnsku || '')}">${escapeHtml(row.fnsku || '—')}</td>
           <td class="num">${fmtRestockNum(row.on_hand ?? 0)}</td>
-          <td class="num">${fmtRestockNum(row.reserved ?? 0)}</td>
+          <td class="num" title="${(function(){
+            const cust = Number(row.reserved_customer_order || 0);
+            const fc = Number(row.reserved_fc_processing || 0);
+            const total = Number(row.reserved || 0);
+            const unaccounted = Math.max(0, total - cust - fc);
+            const lines = [
+              `Total reserved: ${total}`,
+              `  Pending customer order: ${cust}`,
+              `  FC processing: ${fc}`,
+            ];
+            if (unaccounted > 0) lines.push(`  Other / uncategorised: ${unaccounted}`);
+            return lines.join('\n');
+          })()}">${(function(){
+            const cust = Number(row.reserved_customer_order || 0);
+            const fc = Number(row.reserved_fc_processing || 0);
+            const total = Number(row.reserved || 0);
+            // Show inline bifurcation as "total (cust + fc)". Total is
+            // preserved as the primary number so sort order + eye scan
+            // don't shift. Falls back to plain total when the bifurcation
+            // fields are missing (older cached response) or when total
+            // is 0 (no reservation at all — no need to clutter with 0+0).
+            if (total === 0) return fmtRestockNum(0);
+            if (cust === 0 && fc === 0) return fmtRestockNum(total);
+            const brk = `<span class="reserved-brk">(${fmtRestockNum(cust)}+${fmtRestockNum(fc)})</span>`;
+            return `${fmtRestockNum(total)} ${brk}`;
+          })()}</td>
           <td class="num">${fmtRestockNum(row.sent_to_fba ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.inbound_working ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.unfulfillable ?? 0)}</td>

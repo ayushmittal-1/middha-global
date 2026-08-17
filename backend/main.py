@@ -673,6 +673,15 @@ async def forecasting_restock(user: dict = Depends(protect)):
             inv_row.get("fulfillable", reorder.get("available", reorder.get("on_hand", 0))) or 0
         )
         reserved = int(inv_row.get("reserved", reorder.get("reserved", 0)) or 0)
+        # Bifurcation of `reserved`. Amazon's reservedQuantity is a
+        # composite of pendingCustomerOrder + fcProcessing + pending-
+        # Transshipment; the third gets exposed separately as
+        # `fc_transfer` and folded into on_hand. This exposes the first
+        # two so the Restock UI can answer "why is my inventory locked
+        # up?" — pending sale (will ship soon) vs FC processing (Amazon
+        # is moving/inspecting it).
+        reserved_customer_order = int(inv_row.get("reserved_customer_order") or 0)
+        reserved_fc_processing = int(inv_row.get("reserved_fc_processing") or 0)
         sent_to_fba = int(inv_row.get("inbound_shipped", reorder.get("sent_to_fba", 0)) or 0)
         inbound_working = int(inv_row.get("inbound_working", reorder.get("inbound_working", 0)) or 0)
         unfulfillable = int(inv_row.get("unfulfillable", reorder.get("unfulfillable", 0)) or 0)
@@ -812,6 +821,8 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "on_hand": on_hand,
             "available": available,
             "reserved": reserved,
+            "reserved_customer_order": reserved_customer_order,
+            "reserved_fc_processing": reserved_fc_processing,
             "sent_to_fba": sent_to_fba,
             "inbound_working": inbound_working,
             "unfulfillable": unfulfillable,
