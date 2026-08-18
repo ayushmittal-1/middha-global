@@ -30,7 +30,7 @@ from marketplace_timezone import (
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+MODEL = "llama-3.3-70b-versatile"
 
 client = AsyncGroq(api_key=GROQ_API_KEY)
 
@@ -2828,8 +2828,7 @@ async def stream_response(user_message: str, *, session_id: str = "default") -> 
                 temperature=0.3,
                 max_tokens=1024,
                 # Discourage the model from emitting the same n-gram over and
-                # over — llama-4-scout is prone to token-repetition loops on
-                # vague prompts ("last 7 ?") and needs a nudge.
+                # over on vague prompts ("last 7 ?").
                 frequency_penalty=0.5,
                 presence_penalty=0.3,
             )
