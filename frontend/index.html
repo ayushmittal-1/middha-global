@@ -2461,7 +2461,14 @@
         return;
       }
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${proto}://${location.host}/ws/chat?token=${encodeURIComponent(token)}`);
+      // Round-4-audit followup on H1: pass the JWT via
+      // Sec-WebSocket-Protocol subprotocol instead of the query string
+      // so it doesn't land in server access logs, reverse-proxy logs, or
+      // browser history. The JS WebSocket API can't set arbitrary
+      // headers but subprotocols work in every browser. Backend
+      // accepts the "bearer" subprotocol during the handshake and
+      // reads the token from the same header.
+      ws = new WebSocket(`${proto}://${location.host}/ws/chat`, ['bearer', token]);
 
       ws.onopen = () => console.log('[ws] connected');
 
