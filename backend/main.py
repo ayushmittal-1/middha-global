@@ -40,6 +40,7 @@ from database import (
     get_forecast_cache,
     get_sales_daily,
     active_inbound_shipments_for_user,
+    awd_inbound_units_by_sku,
     latest_inventory_for_user,
     get_product_settings,
     upsert_product_settings,
@@ -543,6 +544,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
     # refreshes, and we want the UI to reflect that instantly rather than
     # waiting for the next cache rebuild.
     inv_map = await latest_inventory_for_user(user_id)
+    awd_inbound_by_sku = await awd_inbound_units_by_sku(user_id)
 
     # Live Aurora-sourced velocities per SKU for the last 7/30/90 days,
     # so the restock table's Orders/day column reflects real trailing
@@ -826,6 +828,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "sent_to_fba": sent_to_fba,
             "inbound_working": inbound_working,
             "unfulfillable": unfulfillable,
+            "awd_inbound": int(awd_inbound_by_sku.get(sku, 0)),
             "inbound": reorder.get("inbound", 0),
             "ordered": int(ordered_by_sku.get(sku) or 0),
             "avg_daily_demand": reorder.get("avg_daily_demand", 0),

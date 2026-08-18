@@ -1184,6 +1184,39 @@ async def active_inbound_shipments_for_user(
     return by_sku
 
 
+async def awd_inbound_units_by_sku(user_id: ObjectId) -> dict[str, int]:
+    """Per-SKU outstanding units on in-flight AWD (Amazon Warehousing &
+    Distribution) inbound shipments. AWD is bulk storage that must later
+    be replenished to FBA before it's sellable — surfaced as a display-only
+    column, not folded into days-of-cover math.
+
+    Active = not yet fully received into AWD. DELIVERED / CLOSED / CANCELLED
+    are excluded (matches the FBA sibling function's convention).
+    """
+    active_statuses = ["CREATED", "SHIPPED", "IN_TRANSIT", "RECEIVING"]
+    cursor = _db().shipments.find(
+        {
+            "sellerId": user_id,
+            "shipmentType": "awd_dc",
+            "status": {"$in": active_statuses},
+        },
+        {"_id": 0, "lineItems": 1},
+    )
+    by_sku: dict[str, int] = {}
+    async for shp in cursor:
+        for li in shp.get("lineItems") or []:
+            sku = (li.get("sku") or "").strip()
+            if not sku:
+                continue
+            outstanding = max(
+                0,
+                int(li.get("unitsExpected") or 0) - int(li.get("unitsReceived") or 0),
+            )
+            if outstanding > 0:
+                by_sku[sku] = by_sku.get(sku, 0) + outstanding
+    return by_sku
+
+
 async def upsert_forecast_cache(user_id: ObjectId, sku: str, payload: dict) -> None:
     # Keep userId/sku out of $set — Mongo rejects an update that touches
     # the same path in both $set and $setOnInsert.

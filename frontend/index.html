@@ -2011,6 +2011,7 @@
               <th class="num" title="Units set aside by Amazon — not sellable right now.&#10;&#10;Bifurcation shown as 'total (cust + fc)':&#10;  cust = pendingCustomerOrder → allocated to open orders that haven't shipped yet&#10;  fc   = fcProcessing → at an FC being moved/inspected&#10;&#10;(pendingTransshipment / units in transit between FCs is counted in On hand, not here.)">Reserved</th>
               <th class="num" title="Units Amazon has received into the network but not yet checked into the destination FC (inboundShippedQuantity)">Sent to FBA</th>
               <th class="num" title="Units on an inbound shipment plan you've created but not yet shipped (inboundWorkingQuantity)">Inbound working</th>
+              <th class="num" title="Units on in-flight shipments to Amazon Warehousing & Distribution (AWD bulk storage). Not sellable until replenished to FBA — excluded from days-of-cover math.">AWD inbound</th>
               <th class="num" title="Damaged or customer-returned units currently unsellable">Unfulfillable</th>
               <!-- <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th> -->
               <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next arrival</th>
@@ -3771,6 +3772,7 @@
           })()}</td>
           <td class="num">${fmtRestockNum(row.sent_to_fba ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.inbound_working ?? 0)}</td>
+          <td class="num">${fmtRestockNum(row.awd_inbound ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.unfulfillable ?? 0)}</td>
           <!-- <td class="num" title="${inboundTip}">${fmtRestockNum(row.inbound ?? 0)}</td> -->
           <td title="${inboundTip}">${nextArrivalCell}</td>
