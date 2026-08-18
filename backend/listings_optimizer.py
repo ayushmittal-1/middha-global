@@ -30,11 +30,11 @@ import httpx
 from agent import client  # Reuse the existing Groq client instance.
 
 # Override the model rather than reusing agent.MODEL. The listing rewrite
-# leans on JSON mode + strict guideline-following, which needs the 70B
+# leans on JSON mode + strict guideline-following, which needs the flagship
 # tier; agent.py's default model may have drifted or been deprecated by
 # Groq. Keep this feature independent so it stays working even if the
 # chat path's model config changes.
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "openai/gpt-oss-120b"
 
 # Vision model for image compliance checks. Groq's llama-4-scout is
 # vision-capable but locked behind their Dev tier — free-tier accounts
