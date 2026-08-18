@@ -18,8 +18,8 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse,
 from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
 from token_encryption import assert_token_key_configured, _is_production
@@ -150,36 +150,123 @@ def _max_body_bytes() -> int:
         return 50 * 1024 * 1024
 
 
-class BodySizeLimitMiddleware(BaseHTTPMiddleware):
-    """Reject requests whose Content-Length exceeds the configured cap.
+class BodySizeLimitMiddleware:
+    """Reject request bodies over the configured cap — at the byte level.
 
-    Streaming clients that omit Content-Length are enforced downstream by
-    the reverse-proxy cap (nginx `client_max_body_size` etc) — this
-    middleware is the app-layer defense-in-depth, not the only line."""
+    Round-4-audit followup on C4: the previous implementation only
+    inspected the `Content-Length` header, which a client can omit
+    entirely (chunked transfer-encoding) or misreport. This version is a
+    raw ASGI middleware that wraps `receive` and counts actual bytes as
+    they arrive; the moment cumulative body bytes exceed `max_bytes` we
+    stop draining, hand the app a canned 413 response, and terminate
+    the request without buffering the rest.
+
+    Content-Length is still honored as an early-exit optimisation (a
+    hostile client that DOES report a huge size can be rejected before
+    even one byte of body is read). The streaming path is the real
+    backstop — we no longer depend on nginx `client_max_body_size` or
+    any reverse-proxy config outside this repo."""
 
     def __init__(self, app: ASGIApp, max_bytes: int):
-        super().__init__(app)
+        self._app = app
         self._max_bytes = max_bytes
 
-    async def dispatch(self, request: Request, call_next):
-        cl = request.headers.get("content-length")
-        if cl:
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1")
+                   for k, v in scope.get("headers") or []}
+
+        # Fast path — trust Content-Length when the client provided it.
+        cl_raw = headers.get("content-length")
+        if cl_raw:
             try:
-                length = int(cl)
+                declared = int(cl_raw)
             except ValueError:
-                length = 0
-            if length > self._max_bytes:
-                return JSONResponse(
-                    status_code=413,
-                    content={
-                        "detail": (
-                            f"Request body exceeds {self._max_bytes} bytes "
-                            f"({length} bytes sent). Split the upload or "
-                            "raise AURORA_MAX_BODY_BYTES."
-                        ),
-                    },
-                )
-        return await call_next(request)
+                declared = 0
+            if declared > self._max_bytes:
+                await _send_413(send, self._max_bytes, hint=f"{declared} bytes declared")
+                # Drain what the client already sent so the connection
+                # closes cleanly rather than half-open.
+                await _drain(receive)
+                return
+
+        # Streaming path — count bytes as they arrive.
+        received_so_far = 0
+        oversized = False
+
+        async def counting_receive():
+            nonlocal received_so_far, oversized
+            message = await receive()
+            if message.get("type") == "http.request":
+                body = message.get("body", b"") or b""
+                received_so_far += len(body)
+                if received_so_far > self._max_bytes:
+                    oversized = True
+                    # Truncate the body we forward — the app will still
+                    # get the message but we've already scheduled a 413.
+                    # We keep `more_body` accurate so the app doesn't
+                    # hang waiting for more.
+                    message = {
+                        "type": "http.request",
+                        "body": b"",
+                        "more_body": False,
+                    }
+            return message
+
+        oversize_response_sent = False
+        app_response_started = False
+
+        async def guarded_send(message):
+            nonlocal oversize_response_sent, app_response_started
+            if oversize_response_sent:
+                # Once we've sent 413, drop everything the app tries to
+                # send after — otherwise the app's body would concatenate
+                # onto our 413 body and produce a malformed response.
+                return
+            if oversized and not app_response_started:
+                oversize_response_sent = True
+                await _send_413(send, self._max_bytes, hint=f"{received_so_far} bytes streamed")
+                return
+            app_response_started = True
+            await send(message)
+
+        await self._app(scope, counting_receive, guarded_send)
+
+        # Edge case: the app decided not to read the body at all (e.g.
+        # a route that ignores the payload). If we detected oversize
+        # while draining but never got to send the 413, send it now.
+        if oversized and not oversize_response_sent and not app_response_started:
+            await _send_413(send, self._max_bytes, hint=f"{received_so_far} bytes streamed")
+
+
+async def _send_413(send, max_bytes: int, *, hint: str) -> None:
+    detail = (
+        f"Request body exceeds {max_bytes} bytes ({hint}). "
+        "Split the upload or raise AURORA_MAX_BODY_BYTES."
+    )
+    body = json.dumps({"detail": detail}).encode("utf-8")
+    await send({
+        "type": "http.response.start",
+        "status": 413,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode("ascii")),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
+async def _drain(receive) -> None:
+    """Consume any remaining request messages so the client's send loop
+    doesn't stall on backpressure. Bounded — a hostile client that keeps
+    streaming forever can't wedge this."""
+    for _ in range(1024):
+        message = await receive()
+        if not message.get("more_body"):
+            break
 
 
 _PRODUCTION = _is_production()
@@ -261,8 +348,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # Rate limiter must be attached to the app + wire the 429 handler.
+# Round-4-audit followup on C2: the exception handler alone doesn't
+# enforce the Limiter's `default_limits` on undecorated routes — you
+# also need SlowAPIMiddleware. Without it, only `@limiter.limit` -
+# decorated endpoints (currently just /api/auth/login) get throttled;
+# everything else (chat, forecasting, profitability, campaigns) has
+# no ceiling. Adding the middleware makes AURORA_DEFAULT_RATE_LIMIT
+# apply to every route.
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 # Order matters: body-size cap runs BEFORE CORS so a hostile pre-flight
 # with a giant body is rejected at the entrance, not after CORS burns
@@ -304,7 +399,23 @@ async def login(request: Request, body: LoginRequest):
 
 @app.websocket("/ws/chat")
 async def ws_chat(websocket: WebSocket):
-    await websocket.accept()
+    # Round-4-audit followup on H1: JS WebSocket API can't set an
+    # Authorization header but it CAN pass subprotocols. The FE now
+    # sends `new WebSocket(url, ["bearer", <jwt>])`; when the server
+    # sees "bearer" in Sec-WebSocket-Protocol we must echo it back in
+    # the 101 handshake response — otherwise the browser closes the
+    # connection with a mismatched-subprotocol error. Auth itself
+    # happens after accept (same as before) via authenticate_ws which
+    # already knows how to read the subprotocol.
+    requested_protocols = [
+        p.strip()
+        for p in websocket.headers.get("sec-websocket-protocol", "").split(",")
+        if p.strip()
+    ]
+    if any(p.lower() == "bearer" for p in requested_protocols):
+        await websocket.accept(subprotocol="bearer")
+    else:
+        await websocket.accept()
     user, auth_error = await authenticate_ws(websocket)
     if not user:
         print(f"[ws_chat] auth failed: {auth_error}")

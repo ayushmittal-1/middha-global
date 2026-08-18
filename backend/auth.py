@@ -17,6 +17,7 @@ import jwt
 from bson import ObjectId
 from fastapi import Depends, Header, HTTPException, WebSocket, status
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo import ReturnDocument
 
 from token_encryption import hydrate_user_tokens
 
@@ -240,13 +241,34 @@ async def authenticate_credentials(email: str, password: str) -> dict:
     except (ValueError, TypeError):
         ok = False
     if not ok:
-        new_count = int(user.get("failedLoginCount") or 0) + 1
-        update: dict = {"failedLoginCount": new_count, "lastFailedLoginAt": now}
-        lockout_seconds = compute_login_lockout_seconds(new_count, now)
-        if lockout_seconds:
-            update["loginLockedUntil"] = now + timedelta(seconds=lockout_seconds)
+        # Round-4-audit followup on M4: the previous read-then-write
+        # pattern (find_one → increment in Python → update_one) had a
+        # race — two concurrent failed attempts both read count=4,
+        # both wrote count=5, and the true count silently landed at 5
+        # instead of 6. Under credential-stuffing that could keep an
+        # attacker's parallel attempts under the lockout threshold
+        # indefinitely. `find_one_and_update` with `$inc` is atomic at
+        # the Mongo level — N concurrent failures produce distinct
+        # sequential counter values.
         try:
-            await users.update_one({"_id": user["_id"]}, {"$set": update})
+            updated = await users.find_one_and_update(
+                {"_id": user["_id"]},
+                {
+                    "$inc": {"failedLoginCount": 1},
+                    "$set": {"lastFailedLoginAt": now},
+                },
+                projection={"failedLoginCount": 1},
+                return_document=ReturnDocument.AFTER,
+            )
+            new_count = int((updated or {}).get("failedLoginCount") or 0)
+            lockout_seconds = compute_login_lockout_seconds(new_count, now)
+            if lockout_seconds:
+                # Second write is fine — the counter is already atomic.
+                # This just stamps the lockout expiry for this attempt.
+                await users.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {"loginLockedUntil": now + timedelta(seconds=lockout_seconds)}},
+                )
         except Exception:
             # Persistence failure must not turn into a 500 on the login
             # path — the user still gets a 401 for wrong password.
