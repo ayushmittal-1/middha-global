@@ -990,10 +990,27 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
     ]
 
     # ── Backtest / holdout validation ────────────────────────────────────
-    # Train on days [-120, -31], predict days [-30, -1], compare against
-    # actual. 90-day training window matches the live refresh (model.py
-    # `since = 90 days`) so the backtest measures the SAME model users see
-    # — Prophet on SKUs with enough history, naive on the rest.
+    # Prefer the winner's backtest that the nightly cache job already
+    # scored — same 30-day holdout, but computed against ALL candidate
+    # models (Prophet, LightGBM, Naive), so the "method" and metrics
+    # reflect whichever model actually won for this SKU. Falls back to a
+    # live Prophet-only backtest when the cache doesn't have it (older
+    # cache entries from before the multi-model picker shipped).
+    cached_backtest = c.get("backtest")
+    if isinstance(cached_backtest, dict) and cached_backtest.get("metrics"):
+        return {
+            "sku": sku,
+            "asin": c.get("asin"),
+            "method": live_method,
+            "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
+            "horizon_days": c.get("horizon_days"),
+            "drivers": live_drivers,
+            "reorder": reorder,
+            "forecast": live_forecast,
+            "history": history,
+            "inbound_shipments": shipments,
+            "backtest": cached_backtest,
+        }
     backtest: dict | None = None
     try:
         bt_since = now_utc - _td(days=120)
