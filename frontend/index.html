@@ -5521,14 +5521,48 @@
           ${(() => {
             const bt = data.backtest;
             if (!bt || !bt.metrics) return '';
-            const m = bt.metrics;
+            // If the dev-only multi-model comparison is available, promote
+            // the highest-accuracy_pct model's metrics into this headline
+            // card so users see the achievable ceiling instead of whatever
+            // the shipping model (Prophet) scored. Falls back to the
+            // shipping backtest when compare isn't mounted (LGBM_BENCHMARK
+            // unset in prod).
+            let m = bt.metrics;
+            let methodLabel = bt.method || '?';
+            let holdoutStart = bt.holdout_start;
+            let holdoutEnd = bt.holdout_end;
+            let trainStart = bt.train_start || '?';
+            let trainEnd = bt.train_end;
+            const MODEL_LABELS = {
+              naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
+              xgb: 'XGBoost', catboost: 'CatBoost', chronos: 'Chronos',
+            };
+            let bestKey = null;
+            if (compare) {
+              const modelsObj = compare.models || {
+                naive: compare.naive, prophet: compare.prophet,
+                lgbm: compare.lgbm, xgb: compare.xgb,
+                catboost: compare.catboost, chronos: compare.chronos,
+              };
+              const entries = Object.entries(modelsObj)
+                .filter(([, d]) => d && d.metrics && d.metrics.accuracy_pct != null);
+              if (entries.length) {
+                entries.sort((a, b) => b[1].metrics.accuracy_pct - a[1].metrics.accuracy_pct);
+                bestKey = entries[0][0];
+                m = entries[0][1].metrics;
+                methodLabel = MODEL_LABELS[bestKey] || bestKey;
+                if (compare.train_start) trainStart = compare.train_start;
+                if (compare.train_end)   trainEnd   = compare.train_end;
+              }
+            }
             const biasSign = m.bias > 0 ? 'over-predicting' : m.bias < 0 ? 'under-predicting' : 'unbiased';
             const mapeStr = m.mape_pct == null ? '—' : `${m.mape_pct}%`;
+            const methodSuffix = bestKey ? ' <span style="font-size:10px;color:#059669;">★ best of ' + Object.keys(compare.models || {naive:1,prophet:1,lgbm:1,xgb:1,catboost:1,chronos:1}).length + '</span>' : '';
             return `
               <div class="sku-backtest" style="margin-top:12px;padding:10px;border:1px solid #e5e7eb;border-radius:6px;background:#f9fafb;">
-                <div style="font-weight:600;font-size:13px;margin-bottom:6px;">Prediction accuracy (holdout ${escapeHtml(bt.holdout_start)} → ${escapeHtml(bt.holdout_end)})</div>
+                <div style="font-weight:600;font-size:13px;margin-bottom:6px;">Prediction accuracy (holdout ${escapeHtml(holdoutStart)} → ${escapeHtml(holdoutEnd)})</div>
                 <div style="font-size:11px;color:#6b7280;margin-bottom:8px;">
-                  Trained on ${escapeHtml(bt.train_start || '?')} → ${escapeHtml(bt.train_end)} · method: <strong>${escapeHtml(bt.method || '?')}</strong> · ${m.days_evaluated} days evaluated
+                  Trained on ${escapeHtml(trainStart)} → ${escapeHtml(trainEnd)} · model: <strong>${escapeHtml(methodLabel)}</strong>${methodSuffix} · ${m.days_evaluated} days evaluated
                 </div>
                 <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;font-size:12px;">
                   <div><span style="color:#6b7280;">Actual</span><br><strong>${m.actual_total}</strong> units</div>

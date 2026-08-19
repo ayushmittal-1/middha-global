@@ -17,6 +17,13 @@ APScheduler==3.11.2
 pandas==3.0.3
 numpy==2.5.0
 prophet==1.3.0
+# Multi-model forecast picker: LightGBM + scikit-learn are the extra
+# baselines the nightly cache job bakes off against Prophet + naive.
+# Winner-per-SKU lands in forecast_cache and drives the restock tab.
+# Promoted from requirements-dev.txt with the feat/multimodel-forecast-picker
+# change. XGBoost / CatBoost / Chronos stay dev-only (dev-compare drawer).
+lightgbm==4.7.0
+scikit-learn==1.9.0
 tzdata==2025.2
 beautifulsoup4==4.15.0
 lxml==6.1.1
