@@ -891,24 +891,26 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
     since = datetime.now(timezone.utc) - _td(days=90)
     raw_history = await get_sales_daily(sku=sku, since=since)
 
-    # Live model refresh: recompute the forecast on the current
-    # 30-day training window so the chart's p50/p90 reflects the model
-    # we're actually using. Also recompute the reorder-side numbers
-    # (days_of_cover, stockout_date, ship-by dates) off the same
-    # weighted velocity that drives the restock table's Orders/day,
-    # so this modal and the row underneath tell one consistent story.
+    # Live model refresh: recompute the forecast on the same 540-day
+    # window the nightly cache job uses, so the top-card method label
+    # and the accuracy card's "★ best" model agree. Using 30 days here
+    # stunts _forecast_one below MIN_HISTORY_DAYS and forces every SKU
+    # into naive regardless of what the picker actually chose.
     now_utc = datetime.now(timezone.utc)
-    train_since = now_utc - _td(days=30)
+    train_since = now_utc - _td(days=540)
     train_rows = await get_sales_daily(sku=sku, since=train_since)
     try:
         fresh = _forecast_one(train_rows, horizon=90, today=now_utc)
         live_forecast = fresh.get("forecast") or c.get("forecast")
-        live_method = fresh.get("method") or c.get("method")
         live_drivers = fresh.get("drivers") or c.get("drivers")
     except Exception:
         live_forecast = c.get("forecast")
-        live_method = c.get("method")
         live_drivers = c.get("drivers")
+    # Method label always comes from the cache — the picker chose that
+    # model based on a full 30-day backtest across prophet/naive/lgbm/
+    # ensemble. `_forecast_one` above only knows prophet/naive, so
+    # trusting its output would mislabel every LGBM or ensemble winner.
+    live_method = c.get("method")
 
     # Weighted velocity from the last 180 days of Aurora sales — same
     # blend the restock endpoint uses.

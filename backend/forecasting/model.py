@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
@@ -185,21 +186,20 @@ PRIME_EVENTS["ds"] = pd.to_datetime(PRIME_EVENTS["ds"])
 # ── Series prep ────────────────────────────────────────────────────────────
 
 
-def _build_series(rows: list[dict], today: datetime) -> pd.DataFrame:
-    """Build a dense daily series from sparse salesDaily rows.
+def _build_series_full(rows: list[dict], today: datetime) -> pd.DataFrame:
+    """Dense daily series including stockout days (with flag column).
 
-    - Rows are left-joined onto a daily index from first observed date to
-      yesterday; missing days are filled with 0 units (legitimate no-sale).
-    - Rows flagged stockout_corrected are dropped — Prophet sees them as
-      simply missing.
+    Same densification as `_build_series` but does NOT drop stockout-
+    corrected rows — callers that need the flag (imputation, recovery
+    bump detection) get it here. Returns columns
+    `[ds, y, ad_spend, stockout_corrected]`.
     """
     if not rows:
-        return pd.DataFrame(columns=["ds", "y", "ad_spend"])
+        return pd.DataFrame(
+            columns=["ds", "y", "ad_spend", "stockout_corrected"],
+        )
     df = pd.DataFrame(rows)
     df["ds"] = pd.to_datetime(df["date"]).dt.tz_localize(None).dt.normalize()
-    # Traffic-only and ads-only rows can land in salesDaily without
-    # units_ordered (the upsert merges fields). Treat the missing column
-    # as zero so those rows densify cleanly without crashing the fit.
     if "units_ordered" not in df.columns:
         df["units_ordered"] = 0
     if "ad_spend" not in df.columns:
@@ -213,15 +213,105 @@ def _build_series(rows: list[dict], today: datetime) -> pd.DataFrame:
     start = df["ds"].min()
     end = pd.Timestamp(today.date()) - pd.Timedelta(days=1)
     if pd.isna(start) or start > end:
-        return pd.DataFrame(columns=["ds", "y", "ad_spend"])
-
+        return pd.DataFrame(
+            columns=["ds", "y", "ad_spend", "stockout_corrected"],
+        )
     full_idx = pd.DataFrame({"ds": pd.date_range(start, end, freq="D")})
     merged = full_idx.merge(df, on="ds", how="left")
     merged["y"] = merged["y"].fillna(0.0)
     merged["ad_spend"] = merged["ad_spend"].fillna(0.0)
-    merged["stockout_corrected"] = merged["stockout_corrected"].fillna(False).astype(bool)
-    merged = merged[~merged["stockout_corrected"]].copy()
-    return merged[["ds", "y", "ad_spend"]]
+    merged["stockout_corrected"] = (
+        merged["stockout_corrected"].fillna(False).astype(bool)
+    )
+    return merged[["ds", "y", "ad_spend", "stockout_corrected"]]
+
+
+def _build_series(rows: list[dict], today: datetime) -> pd.DataFrame:
+    """Legacy dense daily series with stockout days DROPPED.
+
+    Used for driver-stat computation (recent_avg, dow_mult, weighted
+    velocity) — anything that should reflect real observed sales, not
+    imputed placeholders. Model fits should call `_build_series_imputed`
+    instead so the training signal is continuous across stockout gaps.
+    """
+    full = _build_series_full(rows, today)
+    if full.empty:
+        return pd.DataFrame(columns=["ds", "y", "ad_spend"])
+    return full[~full["stockout_corrected"]][["ds", "y", "ad_spend"]].copy()
+
+
+IMPUTATION_MIN_INSTOCK_DAYS = 14
+IMPUTATION_DECLINE_GUARD_RATIO = 0.5
+
+
+def _build_series_imputed(rows: list[dict], today: datetime) -> pd.DataFrame:
+    """Dense daily series with stockout days IMPUTED (not dropped).
+
+    For each stockout-corrected day, replace y with the trailing 28-day
+    non-stockout mean × that day's day-of-week multiplier (computed
+    from the trailing 56 non-stockout days). This gives Prophet/LGBM a
+    continuous positive series so their trend doesn't decay to zero
+    during long stockouts and their forecast doesn't collapse.
+
+    Two guards protect against over-prediction:
+      1. Skip when the SKU has < IMPUTATION_MIN_INSTOCK_DAYS non-stockout
+         days total — trailing mean is too noisy to trust.
+      2. Skip when the SKU is in decline: recent 14-day in-stock mean <
+         IMPUTATION_DECLINE_GUARD_RATIO × trailing 60-day in-stock mean.
+         Imputing here would fill stockout days with the old high level
+         and cause naive/Prophet to over-forecast the recovery (the Kiwi
+         Shoe Shine Sponge failure mode: 474 predicted vs 97 actual).
+    """
+    full = _build_series_full(rows, today)
+    if full.empty:
+        return pd.DataFrame(columns=["ds", "y", "ad_spend"])
+
+    out = full.copy().reset_index(drop=True)
+    in_stock = out[~out["stockout_corrected"]]
+    if len(in_stock) < IMPUTATION_MIN_INSTOCK_DAYS:
+        return out[["ds", "y", "ad_spend"]]
+
+    # Decline guard: compare recent 14-day in-stock mean to 60-day
+    # trailing mean. A ratio below the guard ratio signals genuine
+    # decay (not stockout-driven), and imputation would mask it.
+    recent14 = in_stock.tail(14)
+    baseline60 = in_stock.tail(60)
+    recent_mean = float(recent14["y"].mean()) if not recent14.empty else 0.0
+    baseline_mean = float(baseline60["y"].mean()) if not baseline60.empty else 0.0
+    if baseline_mean > 0 and recent_mean / baseline_mean < IMPUTATION_DECLINE_GUARD_RATIO:
+        # Genuine decline — leave stockouts dropped so downstream models
+        # see the current low level instead of the historical high.
+        return out[~out["stockout_corrected"]][["ds", "y", "ad_spend"]].copy()
+
+    # Precompute DOW multipliers from the trailing 56 non-stockout rows.
+    tail56 = in_stock.tail(56)
+    overall = float(tail56["y"].mean()) if not tail56.empty else 0.0
+    dow_mult: dict[int, float] = {}
+    if overall > 0:
+        for dow, group in tail56.groupby(tail56["ds"].dt.dayofweek):
+            g_mean = float(group["y"].mean())
+            dow_mult[int(dow)] = g_mean / overall if overall else 1.0
+
+    # Rolling trailing-28d non-stockout mean, indexed by position.
+    # Walk once, maintaining a deque of the last 28 non-stockout y values.
+    from collections import deque
+    window: deque[float] = deque(maxlen=28)
+    y_col = out["y"].to_numpy(copy=True)
+    stockout_col = out["stockout_corrected"].to_numpy()
+    ds_col = out["ds"]
+    for i in range(len(out)):
+        if not stockout_col[i]:
+            window.append(float(y_col[i]))
+            continue
+        if not window:
+            # Stockout at the very start of history — leave as 0.
+            continue
+        base = sum(window) / len(window)
+        mult = dow_mult.get(int(ds_col.iloc[i].dayofweek), 1.0)
+        y_col[i] = max(0.0, base * mult)
+
+    out["y"] = y_col
+    return out[["ds", "y", "ad_spend"]]
 
 
 # ── Naive fallback ─────────────────────────────────────────────────────────
@@ -289,17 +379,26 @@ def _prophet_forecast(series: pd.DataFrame, horizon: int, today: datetime) -> di
 
     use_ad_regressor = (series["ad_spend"] > 0).mean() >= 0.10
 
+    # Prior scale trades reactivity against stability. With ≥ 365 days of
+    # history Prophet has enough anchors that a moderate prior (0.15)
+    # captures real trend shifts without letting the last 30 days
+    # extrapolate to zero — the runaway-decline failure mode we saw with
+    # 0.5 on the 540-day window. Short-history SKUs still benefit from
+    # a hotter prior, so scale by log(history length).
+    n_hist = len(series)
+    if n_hist >= 365:
+        cps = 0.15
+    elif n_hist >= 180:
+        cps = 0.25
+    else:
+        cps = 0.5
     model = Prophet(
         interval_width=0.80,
         weekly_seasonality=True,
-        yearly_seasonality=True,
+        yearly_seasonality=n_hist >= 365,
         daily_seasonality=False,
         holidays=PRIME_EVENTS,
-        # Default 0.05 is too conservative for this catalog — Prophet
-        # regresses to the historical mean and misses recent acceleration
-        # in demand. 0.5 lets the trend chase the last 30-60 days harder
-        # so July's uptick is actually captured.
-        changepoint_prior_scale=0.5,
+        changepoint_prior_scale=cps,
     )
     model.add_country_holidays(country_name="US")
     if use_ad_regressor:
@@ -352,14 +451,20 @@ def _forecast_one(rows: list[dict], horizon: int, today: datetime) -> dict:
     otherwise. Kept as the primitive that the dev-only /compare endpoint
     treats as the "Prophet path" — the multi-model picker below wraps
     this plus LGBM plus naive with backtest-based selection."""
-    series = _build_series(rows, today)
-    if len(series) < MIN_HISTORY_DAYS:
-        return _naive_forecast(series, horizon, today)
-    try:
-        return _prophet_forecast(series, horizon, today)
-    except Exception as e:
-        log.warning("prophet failed (%s), falling back to naive", e)
-        return _naive_forecast(series, horizon, today)
+    # Imputed series for the fit — stockouts filled with trailing-mean ×
+    # DOW so Prophet's trend doesn't decay to zero during long gaps.
+    # Naive uses the raw series so its recent_avg reflects real sales.
+    fit_series = _build_series_imputed(rows, today)
+    raw_series = _build_series(rows, today)
+    if len(raw_series) < MIN_HISTORY_DAYS:
+        result = _naive_forecast(raw_series, horizon, today)
+    else:
+        try:
+            result = _prophet_forecast(fit_series, horizon, today)
+        except Exception as e:
+            log.warning("prophet failed (%s), falling back to naive", e)
+            result = _naive_forecast(raw_series, horizon, today)
+    return _apply_recovery_bump(result, rows, today)
 
 
 # ── Multi-model backtest picker ───────────────────────────────────────────
@@ -378,6 +483,78 @@ def _forecast_one(rows: list[dict], horizon: int, today: datetime) -> dict:
 
 BACKTEST_HOLDOUT_DAYS = 30
 BACKTEST_ACCURACY_FLOOR_PCT = 10.0
+
+# Post-restock recovery bump. When the training data ends with a
+# sustained stockout period, the first ~2 weeks of real demand after
+# restock consistently over-perform baseline — pent-up buyers plus
+# Amazon's ranking algorithm re-boosting a listing that just came back
+# in stock. Empirically 1.3x for 14 days matches observed lift on this
+# catalog. Requires ≥ 5 stockout days in a row so single-day gaps
+# (weekend fulfillment delays, brief restock hiccups) don't trigger it.
+RECOVERY_BUMP_FACTOR = 1.3
+RECOVERY_BUMP_DAYS = 14
+RECOVERY_MIN_STOCKOUT_STREAK = 5
+
+
+def _recovery_streak(rows: list[dict], as_of: datetime) -> int:
+    """Count consecutive stockout-corrected days ending at `as_of - 1d`.
+
+    Returns 0 if the most recent non-stockout day is `as_of - 1d` — i.e.
+    the SKU is currently in stock and not recovering. Used to gate the
+    recovery bump: apply only when streak ≥ RECOVERY_MIN_STOCKOUT_STREAK.
+    """
+    if not rows:
+        return 0
+    as_of_naive = as_of.replace(tzinfo=None) if as_of.tzinfo else as_of
+    by_day: dict[datetime, bool] = {}
+    for r in rows:
+        d = r.get("date")
+        if not isinstance(d, datetime):
+            continue
+        d = d.replace(tzinfo=None) if d.tzinfo else d
+        d = datetime(d.year, d.month, d.day)
+        by_day[d] = bool(r.get("stockout_corrected", False))
+    streak = 0
+    cursor = datetime(as_of_naive.year, as_of_naive.month, as_of_naive.day) - timedelta(days=1)
+    while cursor in by_day:
+        if by_day[cursor]:
+            streak += 1
+            cursor -= timedelta(days=1)
+        else:
+            break
+    return streak
+
+
+def _apply_recovery_bump(
+    result: dict, rows: list[dict], as_of: datetime,
+) -> dict:
+    """Boost the first RECOVERY_BUMP_DAYS of the forecast when the SKU
+    just came out of a sustained stockout. Mutates and returns `result`.
+
+    The bump multiplies p50 and p90 only — driver stats are untouched
+    because they describe the historical training period, not the
+    forecast. When no bump applies, returns result unchanged.
+    """
+    streak = _recovery_streak(rows, as_of)
+    if streak < RECOVERY_MIN_STOCKOUT_STREAK:
+        return result
+    fc = result.get("forecast") or []
+    for i, r in enumerate(fc[:RECOVERY_BUMP_DAYS]):
+        r["p50"] = round(float(r.get("p50", 0)) * RECOVERY_BUMP_FACTOR, 2)
+        r["p90"] = round(float(r.get("p90", 0)) * RECOVERY_BUMP_FACTOR, 2)
+    result.setdefault("drivers", {})["recovery_bump"] = {
+        "streak_days": streak,
+        "factor": RECOVERY_BUMP_FACTOR,
+        "applied_to_days": min(RECOVERY_BUMP_DAYS, len(fc)),
+    }
+    return result
+
+# Actual-total floor below which accuracy_pct is dominated by rounding
+# noise (5 real units, 4 predicted → 80% but meaningless). Metrics
+# below this threshold are still computed so the picker's tie-breaker
+# has something to sort on, but `low_volume=True` is attached so the
+# FE/benchmark harness can exclude them from fleet-level medians.
+BACKTEST_LOW_VOLUME_THRESHOLD = 30
 
 
 def _row_day_naive(r: dict) -> datetime | None:
@@ -459,8 +636,42 @@ def _score_forecast_days(
         "predicted_total": round(pred_total, 1),
         "coverage_pct": round((coverage_hits / n) * 100, 1),
         "days_evaluated": n,
+        "low_volume": actual_total < BACKTEST_LOW_VOLUME_THRESHOLD,
     }
     return bt_days, metrics
+
+
+def _try_deepts_train(
+    series_by_sku: dict, train_end: object,
+):
+    """Wrap DeepAR + TFT training so a missing torch/gluonts wheel or a
+    small-catalog user doesn't crash the whole picker. Returns a dict
+    `{"deepar": forecaster_or_none, "tft": forecaster_or_none, "module": module_or_none}`.
+
+    Both models train in one call so we amortize the torch import.
+    Disabled entirely when the DEEPTS_ENABLED env is not truthy — deep
+    training adds 2-10 min per refresh and needs opt-in until the
+    hosting box has been sized for it.
+    """
+    if os.getenv("DEEPTS_ENABLED", "").lower() not in ("1", "true", "yes"):
+        return {"deepar": None, "tft": None, "module": None}
+    try:
+        from forecasting.deepts import model as deepts_module
+    except ImportError:
+        log.info("deepts not installed — picker will skip DeepAR/TFT")
+        return {"deepar": None, "tft": None, "module": None}
+    if not deepts_module._bench_load_ok():
+        return {"deepar": None, "tft": None, "module": None}
+    out = {"deepar": None, "tft": None, "module": deepts_module}
+    try:
+        out["deepar"] = deepts_module.train_deepar(series_by_sku, train_end=train_end)
+    except Exception as e:
+        log.warning("deepar train failed: %s — skipping", e)
+    try:
+        out["tft"] = deepts_module.train_tft(series_by_sku, train_end=train_end)
+    except Exception as e:
+        log.warning("tft train failed: %s — skipping", e)
+    return out
 
 
 def _try_lgbm_train(
@@ -512,13 +723,18 @@ def _multimodel_forecast(
     horizon: int,
     today: datetime,
     cutoff: datetime,
+    deepts_state: dict | None = None,
 ) -> dict:
     """Bake off Prophet + LGBM + Naive on the same 30-day holdout, pick
     the winner, refit it on FULL history, return the winner's forecast +
     the full backtest table so the drawer can show all three side-by-side
     without a live re-fit."""
     train_rows, holdout_by_day = _split_train_holdout(rows, cutoff)
+    # `_series` = raw (stockouts dropped) — for driver stats and the
+    # MIN_HISTORY_DAYS gate. `_fit` = imputed — what Prophet/LGBM see so
+    # their trend/lags don't decay through long stockout gaps.
     train_series = _build_series(train_rows, cutoff)
+    train_fit = _build_series_imputed(train_rows, cutoff)
     full_series = _build_series(rows, today)
 
     candidates: dict[str, dict] = {}
@@ -529,8 +745,9 @@ def _multimodel_forecast(
     if len(train_series) >= MIN_HISTORY_DAYS:
         try:
             proph_bt_result = _prophet_forecast(
-                train_series, horizon=BACKTEST_HOLDOUT_DAYS, today=cutoff,
+                train_fit, horizon=BACKTEST_HOLDOUT_DAYS, today=cutoff,
             )
+            _apply_recovery_bump(proph_bt_result, train_rows, cutoff)
             prophet_bt_days, prophet_metrics = _score_forecast_days(
                 proph_bt_result.get("forecast") or [], holdout_by_day,
             )
@@ -544,9 +761,12 @@ def _multimodel_forecast(
 
     # ── Naive backtest (always runnable, useful floor) ────────
     try:
+        # Naive uses the imputed series too — otherwise a SKU whose recent
+        # 28 raw days were all stockouts collapses to base=0.
         naive_bt_result = _naive_forecast(
-            train_series, horizon=BACKTEST_HOLDOUT_DAYS, today=cutoff,
+            train_fit, horizon=BACKTEST_HOLDOUT_DAYS, today=cutoff,
         )
+        _apply_recovery_bump(naive_bt_result, train_rows, cutoff)
         naive_bt_days, naive_metrics = _score_forecast_days(
             naive_bt_result.get("forecast") or [], holdout_by_day,
         )
@@ -567,6 +787,7 @@ def _multimodel_forecast(
                     lgbm_state, target_series, sku,
                     horizon=BACKTEST_HOLDOUT_DAYS, today=cutoff,
                 )
+                _apply_recovery_bump(lgbm_bt_result, train_rows, cutoff)
                 lgbm_bt_days, lgbm_metrics = _score_forecast_days(
                     lgbm_bt_result.get("forecast") or [], holdout_by_day,
                 )
@@ -578,57 +799,241 @@ def _multimodel_forecast(
             except Exception as e:
                 log.warning("lgbm backtest failed for sku=%s: %s", sku, e)
 
-    # ── Pick winner and refit on full history ─────────────────
-    winner = _pick_winner(candidates)
-    winner_metrics = (candidates.get(winner) or {}).get("backtest_metrics") if winner else None
+    # ── DeepAR / TFT backtests (deep-learning candidates) ────
+    # Only run when the user-global fit produced state — training is
+    # expensive (~1-5 min per model per user) and is guarded behind
+    # DEEPTS_ENABLED. When disabled the whole block silently no-ops.
+    if deepts_state and deepts_state.get("module") is not None:
+        deepts_mod = deepts_state["module"]
+        target_series = all_train_series_by_sku.get(sku)
+        for kind_key in ("deepar", "tft"):
+            fc_state = deepts_state.get(kind_key)
+            if fc_state is None or target_series is None or target_series.empty:
+                continue
+            try:
+                bt_result = deepts_mod.forecast_sku(
+                    fc_state, target_series, sku,
+                    horizon=BACKTEST_HOLDOUT_DAYS, today=cutoff,
+                )
+                _apply_recovery_bump(bt_result, train_rows, cutoff)
+                bt_days, metrics = _score_forecast_days(
+                    bt_result.get("forecast") or [], holdout_by_day,
+                )
+                candidates[kind_key] = {
+                    "method_label": kind_key,
+                    "backtest_days": bt_days,
+                    "backtest_metrics": metrics,
+                }
+            except Exception as e:
+                log.warning("%s backtest failed for sku=%s: %s", kind_key, sku, e)
+
+    # ── Ensemble candidate ───────────────────────────────────
+    # Per-day mean of the models that produced a non-zero p50. When one
+    # model collapses to zero on stockout-recovery SKUs (prophet often
+    # does), the ensemble stays anchored by the survivors. Scored on
+    # the same holdout so the picker can prefer it when it wins.
+    per_day_p50: dict[str, list[float]] = {}
+    per_day_p90: dict[str, list[float]] = {}
+    for cand_key, cand in candidates.items():
+        if cand_key == "ensemble":
+            continue
+        for d in cand.get("backtest_days") or []:
+            if d["p50"] > 0:
+                per_day_p50.setdefault(d["date"], []).append(d["p50"])
+                per_day_p90.setdefault(d["date"], []).append(d["p90"])
+    if per_day_p50:
+        ens_forecast = []
+        # Iterate over the union of dates any candidate produced so a
+        # missing day is treated as 0 (matches how _score_forecast_days
+        # handles gaps).
+        all_dates = sorted({
+            d["date"]
+            for cand in candidates.values()
+            for d in cand.get("backtest_days") or []
+        })
+        for date in all_dates:
+            p50s = per_day_p50.get(date, [])
+            p90s = per_day_p90.get(date, [])
+            p50 = sum(p50s) / len(p50s) if p50s else 0.0
+            p90 = max(p90s) if p90s else 0.0
+            ens_forecast.append({"date": date, "p50": p50, "p90": p90})
+        ens_days, ens_metrics = _score_forecast_days(ens_forecast, holdout_by_day)
+        if ens_metrics:
+            candidates["ensemble"] = {
+                "method_label": "ensemble",
+                "backtest_days": ens_days,
+                "backtest_metrics": ens_metrics,
+            }
+
+    # ── Pick backtest winner (this identifies the reported metrics) ──
+    # `bt_winner` is what the drawer's "Prediction accuracy" card shows —
+    # the actual best-scoring candidate. `refit_choice` is what we run
+    # forward for production (falls back when the winner isn't refit-
+    # able, e.g. ensemble has no forward implementation yet).
+    bt_winner = _pick_winner(candidates)
+    winner_metrics = (candidates.get(bt_winner) or {}).get("backtest_metrics") if bt_winner else None
     winner_acc = (winner_metrics or {}).get("accuracy_pct")
     forced_fallback_reason: str | None = None
     # Guardrail: pathological winner (accuracy < 10%) → prefer naive so the
     # reorder math doesn't chase a broken forecast. Only applies when naive
     # is a viable candidate (i.e. produced its own backtest).
-    if winner and winner != "naive" and winner_acc is not None and winner_acc < BACKTEST_ACCURACY_FLOOR_PCT:
+    if bt_winner and bt_winner != "naive" and winner_acc is not None and winner_acc < BACKTEST_ACCURACY_FLOOR_PCT:
         if "naive" in candidates:
             forced_fallback_reason = (
-                f"forced_naive: {winner} accuracy_pct={winner_acc} "
+                f"forced_naive: {bt_winner} accuracy_pct={winner_acc} "
                 f"< floor {BACKTEST_ACCURACY_FLOOR_PCT}"
             )
-            winner = "naive"
+            bt_winner = "naive"
 
-    # Refit winner on FULL history for the actual production forecast.
-    if winner == "prophet" and len(full_series) >= MIN_HISTORY_DAYS:
+    # Refit choice: usually the backtest winner. For ensemble we compute
+    # a forward ensemble at the end by blending each base model's full-
+    # history forecast — but first we still need to compute those base
+    # forecasts, so refit_choice runs the "core" model whose singleton
+    # forecast is also useful metadata.
+    refit_choice = bt_winner
+    if bt_winner == "ensemble":
+        # Which base model should headline the drawer's method label
+        # when ensemble wins — the strongest refit-able base.
+        alt = _pick_winner({
+            k: v for k, v in candidates.items() if k != "ensemble"
+        })
+        refit_choice = alt or "naive"
+
+    # Refit chosen model on FULL history for the actual production forecast.
+    full_fit = _build_series_imputed(rows, today)
+    if refit_choice == "prophet" and len(full_series) >= MIN_HISTORY_DAYS:
         try:
-            fwd = _prophet_forecast(full_series, horizon, today)
+            fwd = _prophet_forecast(full_fit, horizon, today)
         except Exception as e:
             log.warning("prophet full-refit failed for sku=%s: %s — "
                         "falling back to naive", sku, e)
-            winner = "naive"
-            fwd = _naive_forecast(full_series, horizon, today)
-    elif winner == "lgbm" and lgbm_state is not None and lgbm_module is not None:
+            refit_choice = "naive"
+            fwd = _naive_forecast(full_fit, horizon, today)
+    elif refit_choice == "lgbm" and lgbm_state is not None and lgbm_module is not None:
         # LGBM was trained on data up to cutoff (t-30d). For the forward
         # forecast we ideally want a model trained on data up to today.
         # Pragmatically: re-use the same LGBM state to keep the picker
         # cheap. The 30-day gap in LGBM training data usually costs
         # ~1-2 accuracy points vs a fresh fit; acceptable trade-off for
         # avoiding a second N-SKU training pass per user.
-        target_series = _build_series(rows, today)
         try:
             fwd = lgbm_module.forecast_sku(
-                lgbm_state, target_series, sku, horizon, today,
+                lgbm_state, full_fit, sku, horizon, today,
             )
         except Exception as e:
             log.warning("lgbm forward-forecast failed for sku=%s: %s — "
                         "falling back to naive", sku, e)
-            winner = "naive"
-            fwd = _naive_forecast(full_series, horizon, today)
+            refit_choice = "naive"
+            fwd = _naive_forecast(full_fit, horizon, today)
+    elif refit_choice in ("deepar", "tft") and deepts_state and deepts_state.get(refit_choice) is not None:
+        # Same trade-off as LGBM: reuse the pre-cutoff trained model
+        # rather than retrain forward-fresh. Deep model training is
+        # expensive enough (minutes per user) that a nightly retrain
+        # would blow up the refresh job.
+        try:
+            fwd = deepts_state["module"].forecast_sku(
+                deepts_state[refit_choice], full_fit, sku, horizon, today,
+            )
+        except Exception as e:
+            log.warning("%s forward-forecast failed for sku=%s: %s — "
+                        "falling back to naive", refit_choice, sku, e)
+            refit_choice = "naive"
+            fwd = _naive_forecast(full_fit, horizon, today)
     else:
-        winner = "naive"
-        fwd = _naive_forecast(full_series, horizon, today)
+        refit_choice = "naive"
+        fwd = _naive_forecast(full_fit, horizon, today)
+    _apply_recovery_bump(fwd, rows, today)
+
+    # ── Forward ensemble ──────────────────────────────────────
+    # When ensemble won the backtest, blend the FULL-history forecasts
+    # from every model that can produce one. Mean of positive p50s per
+    # day; missing models are excluded rather than treated as zero (a
+    # zero p50 usually means the model degenerated for that SKU — pull-
+    # ing it into the average would drag the ensemble down).
+    if bt_winner == "ensemble":
+        base_forecasts: list[list[dict]] = []
+        # Prophet forward.
+        if len(full_series) >= MIN_HISTORY_DAYS:
+            try:
+                p_fwd = _prophet_forecast(full_fit, horizon, today)
+                _apply_recovery_bump(p_fwd, rows, today)
+                base_forecasts.append(p_fwd.get("forecast") or [])
+            except Exception as e:
+                log.warning("prophet forward for ensemble failed sku=%s: %s", sku, e)
+        # Naive forward — always cheap.
+        try:
+            n_fwd = _naive_forecast(full_fit, horizon, today)
+            _apply_recovery_bump(n_fwd, rows, today)
+            base_forecasts.append(n_fwd.get("forecast") or [])
+        except Exception as e:
+            log.warning("naive forward for ensemble failed sku=%s: %s", sku, e)
+        # LGBM forward — reuse the pre-cutoff state to avoid a second fit.
+        if lgbm_state is not None and lgbm_module is not None:
+            try:
+                l_fwd = lgbm_module.forecast_sku(
+                    lgbm_state, full_fit, sku, horizon, today,
+                )
+                _apply_recovery_bump(l_fwd, rows, today)
+                base_forecasts.append(l_fwd.get("forecast") or [])
+            except Exception as e:
+                log.warning("lgbm forward for ensemble failed sku=%s: %s", sku, e)
+        # Deep models forward — same reuse pattern.
+        if deepts_state and deepts_state.get("module") is not None:
+            deepts_mod = deepts_state["module"]
+            for kind_key in ("deepar", "tft"):
+                fc_state = deepts_state.get(kind_key)
+                if fc_state is None:
+                    continue
+                try:
+                    d_fwd = deepts_mod.forecast_sku(
+                        fc_state, full_fit, sku, horizon, today,
+                    )
+                    _apply_recovery_bump(d_fwd, rows, today)
+                    base_forecasts.append(d_fwd.get("forecast") or [])
+                except Exception as e:
+                    log.warning("%s forward for ensemble failed sku=%s: %s",
+                                kind_key, sku, e)
+        if base_forecasts:
+            by_date_p50: dict[str, list[float]] = {}
+            by_date_p90: dict[str, list[float]] = {}
+            for fc in base_forecasts:
+                for r in fc:
+                    p50 = float(r.get("p50") or 0)
+                    p90 = float(r.get("p90") or 0)
+                    if p50 > 0:
+                        by_date_p50.setdefault(r["date"], []).append(p50)
+                        by_date_p90.setdefault(r["date"], []).append(p90)
+            all_dates = sorted({r["date"] for fc in base_forecasts for r in fc})
+            ens_fwd = []
+            for date in all_dates:
+                p50s = by_date_p50.get(date, [])
+                p90s = by_date_p90.get(date, [])
+                p50 = sum(p50s) / len(p50s) if p50s else 0.0
+                p90 = max(p90s) if p90s else 0.0
+                ens_fwd.append({
+                    "date": date,
+                    "p50": round(p50, 2),
+                    "p90": round(p90, 2),
+                })
+            fwd = {
+                "method": "ensemble",
+                "forecast": ens_fwd,
+                # Reuse drivers from the refit_choice base — the ensemble
+                # itself has no distinct "recent_avg" concept, and the FE
+                # drawer keys off these fields for the sparkline overlay.
+                "drivers": fwd.get("drivers", {}),
+            }
+
+    # The "winner" for reporting / UI badging is the backtest winner.
+    # `refit_choice` describes which base model's drivers back the ensemble.
+    winner = bt_winner or refit_choice
 
     # Attach picker metadata so the drawer can render "★ best of N" and
     # the FE tooltip explains WHY this model was chosen.
-    fwd["method"] = fwd.get("method") or winner
+    fwd["method"] = winner
     fwd["picker"] = {
         "winner": winner,
+        "refit_choice": refit_choice,
         "candidates": {
             k: (v.get("backtest_metrics") or {}).get("accuracy_pct")
             for k, v in candidates.items()
@@ -671,12 +1076,13 @@ async def forecast_sku_for_user(
     """Build a forecast for a single SKU. Used by the agent tool and the
     nightly refresh job."""
     today = datetime.now(timezone.utc)
-    # Trailing 90 days — clears MIN_HISTORY_DAYS=60 so Prophet actually
-    # runs (13 weekly cycles is enough for weekly seasonality), but short
-    # enough that old sluggish months don't drag the trend fit down when
-    # recent demand has accelerated. SKUs with <60 days fall through to
-    # `_naive_forecast`.
-    since = today - timedelta(days=90)
+    # Trailing 540 days — matches the compare-endpoint window so Prophet
+    # gets a full annual cycle for yearly seasonality and LGBM's lag_28 /
+    # roll_56 features are populated. The older changepoint_prior_scale
+    # tuning (see _prophet_forecast) is what stops the extra history
+    # from dragging the recent trend down. SKUs with <60 days still
+    # fall through to `_naive_forecast`.
+    since = today - timedelta(days=540)
     rows = await get_sales_daily_for_user(user_id, sku=sku, since=since)
     result = await asyncio.to_thread(_forecast_one, rows, horizon, today)
     result["sku"] = sku
@@ -693,12 +1099,13 @@ async def refresh_forecasts_for_user(
     provided). Called by the nightly job after ingest. Also computes the
     reorder fields so the dashboard can render from a single read."""
     today = datetime.now(timezone.utc)
-    # Trailing 90 days — clears MIN_HISTORY_DAYS=60 so Prophet actually
-    # runs (13 weekly cycles is enough for weekly seasonality), but short
-    # enough that old sluggish months don't drag the trend fit down when
-    # recent demand has accelerated. SKUs with <60 days fall through to
-    # `_naive_forecast`.
-    since = today - timedelta(days=90)
+    # Trailing 540 days — matches the compare-endpoint window so Prophet
+    # gets a full annual cycle for yearly seasonality and LGBM's lag_28 /
+    # roll_56 features are populated. The older changepoint_prior_scale
+    # tuning (see _prophet_forecast) is what stops the extra history
+    # from dragging the recent trend down. SKUs with <60 days still
+    # fall through to `_naive_forecast`.
+    since = today - timedelta(days=540)
 
     if skus is None:
         # Pull the full history once, then group by SKU. Cheaper than 100s
@@ -739,11 +1146,18 @@ async def refresh_forecasts_for_user(
             r for r in sku_rows
             if (d := _row_day_naive(r)) is not None and d < cutoff_naive
         ]
-        s = _build_series(train_rows_for_lgbm, cutoff)
+        s = _build_series_imputed(train_rows_for_lgbm, cutoff)
         if not s.empty:
             train_series_by_sku[sku_key] = s
     lgbm_state, lgbm_module = await asyncio.to_thread(
         _try_lgbm_train, train_series_by_sku,
+        pd.Timestamp(cutoff.date()) - pd.Timedelta(days=1),
+    )
+    # DeepAR / TFT — heavy, opt-in via DEEPTS_ENABLED. Trained once
+    # per user across all SKUs (user-global panel) so each SKU's
+    # backtest can score the deep candidates alongside the others.
+    deepts_state = await asyncio.to_thread(
+        _try_deepts_train, train_series_by_sku,
         pd.Timestamp(cutoff.date()) - pd.Timedelta(days=1),
     )
     # Pulled once; each SKU's shipments feed the stockout timeline sim.
@@ -761,6 +1175,7 @@ async def refresh_forecasts_for_user(
                 sku, rows, train_series_by_sku,
                 lgbm_state, lgbm_module,
                 horizon, today, cutoff,
+                deepts_state,
             )
         except Exception as e:
             log.exception("forecast failed for sku=%s: %s", sku, e)

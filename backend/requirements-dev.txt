@@ -10,3 +10,10 @@
 
 lightgbm>=4.0
 scikit-learn>=1.3
+
+# DeepAR + TFT via gluonts. Heavy: pulls in torch + pytorch-lightning
+# (~1.5 GB total). Gated behind the DEEPTS_ENABLED env flag — nothing
+# imports these unless the flag is set, so production images that
+# don't want the RAM cost can skip installing them.
+gluonts[torch]>=0.16
+pytorch-lightning>=2.0

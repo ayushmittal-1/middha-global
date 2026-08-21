@@ -22,7 +22,8 @@ from fastapi import APIRouter, Depends
 from auth import protect
 from database import get_sales_daily
 from forecasting.model import (
-    _build_series,
+    _apply_recovery_bump,
+    _build_series_imputed,
     _forecast_one,
     _is_real_sku,
     _naive_forecast,
@@ -34,10 +35,23 @@ log = logging.getLogger("forecasting.lgbm.routes")
 
 router = APIRouter(prefix="/forecasting", tags=["forecasting-benchmark"])
 
-# Backtest window — matches main.py:713-820 exactly so the accuracy_pct
-# reported here is on the same footing as what the SKU drawer shows.
-TRAIN_DAYS = 120
+# Backtest window. 540 days of history gives Prophet a full annual cycle
+# for yearly seasonality and populates LGBM's lag_28/roll_56 features
+# properly — 120 days (the earlier value that matched main.py's live-
+# fallback backtest) meant Prophet's yearly term was unfit and LGBM
+# threw out ~56 rows of usable training per SKU. Holdout is still 30
+# days so accuracy_pct here is directly comparable to what the SKU
+# drawer's "Prediction accuracy" card shows.
+TRAIN_DAYS = 540
 HOLDOUT_DAYS = 30
+
+# Below this actual-total, accuracy_pct is dominated by rounding — a
+# SKU with 5 units in a 30-day window and a 4-unit prediction reports
+# 80% but tells you nothing. The FE (and the local benchmark harness)
+# filters `low_volume=True` rows out of median calculations so the
+# fleet-level number reflects SKUs the model was actually asked to
+# forecast, not noise.
+LOW_VOLUME_ACTUAL_THRESHOLD = 30
 
 
 def _compute_metrics(bt_days: list[dict]) -> dict | None:
@@ -79,6 +93,7 @@ def _compute_metrics(bt_days: list[dict]) -> dict | None:
         "predicted_total": round(pred_total, 1),
         "coverage_pct": round((coverage_hits / n) * 100, 1),
         "days_evaluated": n,
+        "low_volume": actual_total < LOW_VOLUME_ACTUAL_THRESHOLD,
     }
 
 
@@ -95,10 +110,16 @@ def _naive_backtest(sku_rows: list[dict], cutoff: datetime,
                     holdout_by_day: dict[str, int]) -> dict:
     """Force-run the naive fallback so it can be compared directly. In
     production it only fires when history < MIN_HISTORY_DAYS — here we
-    always invoke it so the 3-way comparison has a baseline row."""
+    always invoke it so the 3-way comparison has a baseline row.
+
+    Uses the imputed series (stockouts filled with trailing DOW mean,
+    subject to the decline guard) so the numbers match what the
+    production picker sees for naive.
+    """
     train_rows = [r for r in sku_rows if _row_day_naive(r) < cutoff.replace(tzinfo=None)]
-    series = _build_series(train_rows, cutoff)
+    series = _build_series_imputed(train_rows, cutoff)
     result = _naive_forecast(series, horizon=HOLDOUT_DAYS, today=cutoff)
+    _apply_recovery_bump(result, train_rows, cutoff)
     return _score_forecast(result, holdout_by_day)
 
 
@@ -109,11 +130,21 @@ def _lgbm_backtest(
     holdout_by_day: dict[str, int],
 ) -> dict:
     """Train the user-global LightGBM on every SKU's data up to `cutoff`,
-    then score its target-SKU forecast on the same holdout dict."""
-    series_by_sku: dict[str, pd.DataFrame] = {}
+    then score its target-SKU forecast on the same holdout dict.
+
+    Uses imputed series for the LGBM panel so the compare-endpoint
+    numbers match the nightly-picker output; without imputation the
+    LGBM lag features across stockout gaps go NaN and the model
+    diverges from what production actually runs.
+    """
+    train_rows_by_sku: dict[str, list[dict]] = {}
     for sku, rows in all_user_rows_by_sku.items():
-        train_rows = [r for r in rows if _row_day_naive(r) < cutoff.replace(tzinfo=None)]
-        s = _build_series(train_rows, cutoff)
+        train_rows_by_sku[sku] = [
+            r for r in rows if _row_day_naive(r) < cutoff.replace(tzinfo=None)
+        ]
+    series_by_sku: dict[str, pd.DataFrame] = {}
+    for sku, train_rows in train_rows_by_sku.items():
+        s = _build_series_imputed(train_rows, cutoff)
         if not s.empty:
             series_by_sku[sku] = s
     if not series_by_sku:
@@ -130,6 +161,7 @@ def _lgbm_backtest(
 
     result = lgbm_forecast_sku(fc, target_series, target_sku,
                                horizon=HOLDOUT_DAYS, today=cutoff)
+    _apply_recovery_bump(result, train_rows_by_sku.get(target_sku, []), cutoff)
     return _score_forecast(result, holdout_by_day)
 
 
@@ -140,6 +172,47 @@ def _row_day_naive(r: dict) -> datetime | None:
     if not isinstance(d, datetime):
         return None
     return d.replace(tzinfo=None) if d.tzinfo is not None else d
+
+
+def _ensemble_backtest(
+    base_results: list[dict], holdout_by_day: dict[str, int],
+) -> dict:
+    """Blend the three base backtests: per-day mean of positive p50s.
+
+    Missing days (a base backtest that didn't produce this date) are
+    excluded rather than treated as zero — a zero prediction usually
+    means the model degenerated and pulling it into the mean drags the
+    ensemble down. p90 is the max across surviving bases (a conservative
+    upper bound, not a mean, so coverage stays honest)."""
+    by_date_p50: dict[str, list[float]] = {}
+    by_date_p90: dict[str, list[float]] = {}
+    all_dates: set[str] = set()
+    for res in base_results:
+        for d in res.get("days") or []:
+            all_dates.add(d["date"])
+            if d["p50"] > 0:
+                by_date_p50.setdefault(d["date"], []).append(d["p50"])
+                by_date_p90.setdefault(d["date"], []).append(d["p90"])
+    if not all_dates:
+        return {"method": "ensemble", "days": [], "metrics": None}
+    ens_days = []
+    for date in sorted(all_dates):
+        p50s = by_date_p50.get(date, [])
+        p90s = by_date_p90.get(date, [])
+        p50 = sum(p50s) / len(p50s) if p50s else 0.0
+        p90 = max(p90s) if p90s else 0.0
+        ens_days.append({
+            "date": date,
+            "actual": int(holdout_by_day.get(date, 0)),
+            "p50": round(p50, 2),
+            "p90": round(p90, 2),
+        })
+    return {
+        "method": "ensemble",
+        "days": ens_days,
+        "metrics": _compute_metrics(ens_days),
+        "drivers": None,
+    }
 
 
 def _score_forecast(result: dict, holdout_by_day: dict[str, int]) -> dict:
@@ -214,6 +287,14 @@ async def compare_models(sku: str, user: dict = Depends(protect)):
             "error": str(e),
         }
 
+    # Ensemble candidate — per-day mean of positive p50s across the three
+    # base backtests. Matches the production picker's ensemble so the
+    # drawer's Model comparison panel shows the same fourth row the
+    # picker actually chose from.
+    ensemble_result = _ensemble_backtest(
+        [prophet_result, naive_result, lgbm_result], holdout_by_day,
+    )
+
     return {
         "sku": sku,
         "train_start": since.date().isoformat(),
@@ -224,6 +305,7 @@ async def compare_models(sku: str, user: dict = Depends(protect)):
         "prophet": prophet_result,
         "lgbm": lgbm_result,
         "naive": naive_result,
+        "ensemble": ensemble_result,
     }
 
 
