@@ -3206,9 +3206,8 @@
           return d.toLocaleDateString();
         } catch { return iso; }
       }
-      // Products load same-origin from Middha (/listings/products) so the
-      // AI iframe never cross-origin fetches Aurora — that fails in prod
-      // when Aurora CORS allowlists auroratest.in but not the AI host.
+      // Prefer same-origin /listings/products (no Aurora CORS). Fall back to
+      // /listings/config aurora_products_url for older cached HTML only.
       async function loadListingsList() {
         listStatus.textContent = 'Loading…';
         listTbody.innerHTML = '<tr><td colspan="5" style="padding:20px;text-align:center;color:#9ca3af;font-size:13px;">Loading…</td></tr>';
@@ -3221,9 +3220,36 @@
             listing: 'listed',
           });
           if (loSearchTerm) qs.set('search', loSearchTerm);
-          const aurora = await loSafeJsonFetch(`/listings/products?${qs}`, {
-            headers: authHeaders(),
-          });
+
+          let aurora;
+          try {
+            aurora = await loSafeJsonFetch(`/listings/products?${qs}`, {
+              headers: authHeaders(),
+            });
+          } catch (primaryErr) {
+            // Older servers without /listings/products — try Aurora URL from config.
+            let auroraUrl = null;
+            try {
+              const c = await loSafeJsonFetch('/listings/config', {
+                headers: authHeaders(),
+              });
+              auroraUrl = c.products_path
+                ? `${c.products_path}?${qs}`
+                : (c.aurora_products_url
+                  ? `${c.aurora_products_url}?${qs}`
+                  : null);
+            } catch (_) { /* ignore */ }
+            if (!auroraUrl) throw primaryErr;
+            if (auroraUrl.startsWith('/')) {
+              aurora = await loSafeJsonFetch(auroraUrl, { headers: authHeaders() });
+            } else {
+              const auroraResp = await fetch(auroraUrl, { headers: authHeaders() });
+              if (!auroraResp.ok) {
+                throw new Error(`Aurora products: HTTP ${auroraResp.status}`);
+              }
+              aurora = await auroraResp.json();
+            }
+          }
           if (aurora.success === false) {
             throw new Error(aurora.error || 'Failed to load products');
           }

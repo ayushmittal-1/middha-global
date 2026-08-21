@@ -1879,15 +1879,18 @@ def _listing_analysis_cache():
 async def listings_config():
     """Frontend config for the Listings tab.
 
-    Products are served same-origin via ``GET /listings/products`` (shared
-    Mongo) so the AI iframe never cross-origin fetches Aurora — that path
-    fails in production when Aurora CORS only allows auroratest.in, not the
-    AI host (TypeError: Failed to fetch).
+    New frontends use same-origin ``GET /listings/products`` (avoids CORS
+    Failed to fetch from the AI iframe). Older cached frontends still read
+    ``aurora_products_url`` — keep that populated so a mixed deploy does not
+    show "Aurora products URL not configured".
     """
+    aurora_api = os.getenv(
+        "AURORA_API_URL", "https://aurorabackend-is4p.onrender.com/api/ads",
+    ).rstrip("/")
+    api_base = aurora_api.rsplit("/", 1)[0] if "/" in aurora_api else aurora_api
     return {
         "products_path": "/listings/products",
-        # Kept for older cached frontends; prefer products_path.
-        "aurora_products_url": None,
+        "aurora_products_url": f"{api_base}/products",
     }
 
 
