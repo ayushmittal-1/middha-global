@@ -97,10 +97,10 @@ class LoginRequest(BaseModel):
 # env var is forgotten on a fresh box. Additional origins (staging,
 # preview environments, partner integrations) still come from the env.
 PRODUCTION_BASELINE_ORIGINS = (
+    "https://middha-global-1.onrender.com",
     "https://middha-global.onrender.com",
     "https://www.auroratest.in",
     "https://auroratest.in",
-    "https://middha-global-1.onrender.com",
 )
 
 
@@ -1877,15 +1877,132 @@ def _listing_analysis_cache():
 
 @app.get("/listings/config")
 async def listings_config():
-    """Tell the frontend where Aurora's products endpoint lives so it can
-    fetch the list directly instead of us proxying it. Derived from
-    AURORA_API_URL (already used by campaigns.py) by stripping the /ads
-    suffix — one env var to configure, works in dev and prod."""
-    aurora_api = os.getenv(
-        "AURORA_API_URL", "https://aurorabackend-is4p.onrender.com/api/ads",
-    ).rstrip("/")
-    api_base = aurora_api.rsplit("/", 1)[0] if "/" in aurora_api else aurora_api
-    return {"aurora_products_url": f"{api_base}/products"}
+    """Frontend config for the Listings tab.
+
+    Products are served same-origin via ``GET /listings/products`` (shared
+    Mongo) so the AI iframe never cross-origin fetches Aurora — that path
+    fails in production when Aurora CORS only allows auroratest.in, not the
+    AI host (TypeError: Failed to fetch).
+    """
+    return {
+        "products_path": "/listings/products",
+        # Kept for older cached frontends; prefer products_path.
+        "aurora_products_url": None,
+    }
+
+
+@app.get("/listings/products")
+async def listings_products(
+    page: int = 1,
+    limit: int = 25,
+    search: str = "",
+    listing: str = "listed",
+    sortBy: str = "lastUpdatedTime",
+    sortOrder: str = "desc",
+    user: dict = Depends(protect),
+):
+    """Paginated products for the Listings tab (same Mongo as Aurora).
+
+    Same-origin for the AI iframe — avoids CORS Failed to fetch in prod.
+    Response shape matches Aurora ``GET /api/products``.
+    """
+    try:
+        from database import _db, _user_oid
+        import re as _re
+
+        page = max(1, int(page or 1))
+        limit = min(100, max(1, int(limit or 25)))
+        skip = (page - 1) * limit
+        seller_id = _user_oid()
+
+        and_clauses: list[dict] = [{"sellerId": seller_id}]
+        listing_key = (listing or "listed").strip().lower()
+        removed_re = _re.compile(
+            r"^(Removed from Seller Central|No Seller Central listing)$",
+            _re.I,
+        )
+        if listing_key == "listed":
+            and_clauses.append({
+                "$nor": [
+                    {"isListedOnAmazon": False},
+                    {"listingStatus": removed_re},
+                    {
+                        "status": "Inactive",
+                        "listingStatus": None,
+                        "listingCreatedDate": None,
+                    },
+                ],
+            })
+        elif listing_key == "active":
+            and_clauses.append({
+                "status": "Active",
+                "$nor": [
+                    {"isListedOnAmazon": False},
+                    {"listingStatus": removed_re},
+                ],
+            })
+
+        q = (search or "").strip()
+        if q:
+            rx = {"$regex": _re.escape(q), "$options": "i"}
+            and_clauses.append({
+                "$or": [
+                    {"title": rx},
+                    {"sku": rx},
+                    {"asin": rx},
+                    {"brand": rx},
+                    {"fnSku": rx},
+                ],
+            })
+
+        match = {"$and": and_clauses} if len(and_clauses) > 1 else and_clauses[0]
+        allowed_sort = {
+            "title", "sku", "asin", "status", "listingStatus",
+            "lastUpdatedTime", "updatedAt", "lastSynced",
+        }
+        sort_field = sortBy if sortBy in allowed_sort else "lastUpdatedTime"
+        sort_dir = -1 if str(sortOrder).lower() != "asc" else 1
+
+        coll = _db().products
+        total = await coll.count_documents(match)
+        cursor = (
+            coll.find(
+                match,
+                {
+                    "_id": 0,
+                    "asin": 1,
+                    "sku": 1,
+                    "sellerSku": 1,
+                    "title": 1,
+                    "brand": 1,
+                    "category": 1,
+                },
+            )
+            .sort([(sort_field, sort_dir), ("title", 1)])
+            .skip(skip)
+            .limit(limit)
+        )
+        data = await cursor.to_list(limit)
+        pages = max(1, (total + limit - 1) // limit)
+        return {
+            "success": True,
+            "count": len(data),
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "pages": pages,
+            },
+            "data": data,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"listings products failed: {e}",
+            "count": 0,
+            "pagination": {"page": 1, "limit": limit, "total": 0, "pages": 1},
+            "data": [],
+        }
 
 
 @app.get("/listings/prefill/{asin}")

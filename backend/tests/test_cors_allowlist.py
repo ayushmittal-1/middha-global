@@ -17,8 +17,10 @@ from main import parse_allowed_origins, PRODUCTION_BASELINE_ORIGINS
 def test_baseline_origins_include_the_two_render_and_auroratest_ones():
     """Regression guard against a partial revert. The two production
     origins the operator asked for MUST always be present."""
+    assert "https://middha-global-1.onrender.com" in PRODUCTION_BASELINE_ORIGINS
     assert "https://middha-global.onrender.com" in PRODUCTION_BASELINE_ORIGINS
     assert "https://www.auroratest.in" in PRODUCTION_BASELINE_ORIGINS
+    assert "https://auroratest.in" in PRODUCTION_BASELINE_ORIGINS
 
 
 def test_empty_env_in_production_still_gets_baseline():
@@ -42,6 +44,7 @@ def test_env_extras_are_unioned_with_baseline():
         production=True,
     )
     # Baselines present
+    assert "https://middha-global-1.onrender.com" in origins
     assert "https://middha-global.onrender.com" in origins
     # Extras present
     assert "https://staging.middha-global.onrender.com" in origins
@@ -64,15 +67,15 @@ def test_trailing_slashes_are_stripped():
 
 
 def test_duplicates_are_deduped_preserving_order():
-    """The baseline includes middha-global; adding it again via env
+    """The baseline includes middha-global-1; adding it again via env
     shouldn't duplicate it."""
     origins = parse_allowed_origins(
-        "https://middha-global.onrender.com, https://new.example",
+        "https://middha-global-1.onrender.com, https://new.example",
         production=True,
     )
-    assert origins.count("https://middha-global.onrender.com") == 1
+    assert origins.count("https://middha-global-1.onrender.com") == 1
     # Order: baselines first (as declared), then env extras.
-    assert origins.index("https://middha-global.onrender.com") < origins.index(
+    assert origins.index("https://middha-global-1.onrender.com") < origins.index(
         "https://new.example"
     )
 

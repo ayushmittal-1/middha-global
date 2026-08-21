@@ -41,15 +41,6 @@ def aurora_db_enabled() -> bool:
     return source.strip().lower() == "db"
 
 
-def _money_amount(block: Optional[dict]) -> float:
-    if not block:
-        return 0.0
-    try:
-        return float(block.get("amount") or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable
 
@@ -179,6 +170,105 @@ def is_excluded_order_status(status: Optional[str]) -> bool:
     }
 
 
+def _money_amount(value) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        try:
+            return float(value.get("amount") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# Amazon referral is a category %. Fees API returns a rounded $ at listing
+# price; using referral$/listing$ as the rate (e.g. 0.73/4.89 ≈ 14.93%)
+# then re-applying to other sale prices compounds rounding error vs SC.
+_KNOWN_REFERRAL_RATES = (0.08, 0.10, 0.12, 0.15, 0.17, 0.20, 0.45)
+_DEFAULT_REFERRAL_RATE = 0.15
+
+
+def round_money(value: float | Decimal | str) -> float:
+    """Penny round with ROUND_HALF_UP (Amazon / Seller Central), not banker's.
+
+    Python's built-in ``round(2.295, 2)`` → ``2.29``; Amazon charges ``2.30``.
+    """
+    try:
+        d = value if isinstance(value, Decimal) else Decimal(str(value))
+    except Exception:
+        return 0.0
+    return float(d.quantize(_PENNY, rounding=ROUND_HALF_UP))
+
+
+def snap_referral_rate(
+    listing_price: float | None,
+    referral_per_unit: float | None,
+    default: float = _DEFAULT_REFERRAL_RATE,
+) -> float:
+    """Return the category referral rate, snapping past Fees API rounding.
+
+    If ``round_money(listing × 0.15) == referral_per_unit``, use **0.15** — not
+    ``referral/listing``. That matches Seller Central (e.g. $5.07 → $0.76,
+    $5.99 → $0.90).
+    """
+    listing = float(listing_price or 0)
+    ref = float(referral_per_unit or 0)
+    if listing > 0 and ref > 0:
+        for rate in _KNOWN_REFERRAL_RATES:
+            if round_money(Decimal(str(listing)) * Decimal(str(rate))) == round_money(ref):
+                return float(rate)
+        return ref / listing
+    return float(default)
+
+
+def line_referral_fee(
+    line_revenue: float,
+    rate: float = _DEFAULT_REFERRAL_RATE,
+    quantity: int = 1,
+) -> float:
+    """Per-line referral matching Seller Central unit rounding.
+
+    Amazon rounds referral per unit (half-up to the cent) then multiplies by
+    quantity. Built-in ``round()`` is banker's rounding and undercounts cases
+    like ``$15.30 × 15%`` → ``$2.29`` instead of ``$2.30``.
+    """
+    rev = max(0.0, float(line_revenue or 0))
+    r = float(rate)
+    qty = max(1, int(quantity or 1))
+    if rev <= 0:
+        return 0.0
+    if qty <= 1:
+        return round_money(Decimal(str(rev)) * Decimal(str(r)))
+    unit_rev = Decimal(str(rev)) / Decimal(qty)
+    per_unit = round_money(unit_rev * Decimal(str(r)))
+    return round_money(Decimal(str(per_unit)) * Decimal(qty))
+
+
+def line_item_quantity(item: dict) -> int:
+    """Amazon line quantity for profitability / velocity.
+
+    Always prefer ``quantityOrdered`` (All Orders `quantity`). Fall back to
+    ``quantityShipped`` when ordered is missing. Never treat "one order" as
+    one unit — a 3-unit line must count as 3.
+    """
+    for key in ("quantityOrdered", "quantityShipped", "quantity"):
+        raw = item.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            qty = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if qty > 0:
+            return qty
+    return 0
+
+
 def line_item_sales_amount(item: dict) -> float:
     """Net line revenue: itemSubtotal − promotionDiscount (Aurora order sync shape)."""
     subtotal = _money_amount(item.get("itemSubtotal"))
@@ -192,15 +282,55 @@ def line_item_sales_amount(item: dict) -> float:
     return 0.0
 
 
+def recompute_referral_totals(
+    order_docs: list[dict],
+    sku_data: dict[str, dict],
+    rate_by_sku: dict[str, float] | None = None,
+) -> None:
+    """Overwrite ``referral_total`` using per-line ``round(revenue × rate, 2)``.
+
+    Stored ``orderItems.referralFee`` often used ``referral$/listing$`` as the
+    rate (Fees API rounding), which drifts on other sale prices. Pass snapped
+    category rates from ``snap_referral_rate`` (default 15%).
+    """
+    rates = rate_by_sku or {}
+    rates_lower = {str(k).lower(): float(v) for k, v in rates.items()}
+    for d in sku_data.values():
+        d["referral_total"] = 0.0
+
+    for doc in order_docs or []:
+        if is_excluded_order_status(doc.get("orderStatus")):
+            continue
+        for it in doc.get("orderItems") or []:
+            sku = it.get("sellerSku")
+            if not sku or sku not in sku_data:
+                continue
+            amount = line_item_sales_amount(it)
+            if amount <= 0:
+                continue
+            qty = line_item_quantity(it) or 1
+            rate = rates.get(sku)
+            if rate is None:
+                rate = rates_lower.get(str(sku).lower(), _DEFAULT_REFERRAL_RATE)
+            sku_data[sku]["referral_total"] += line_referral_fee(
+                amount, float(rate), qty,
+            )
+
+
 def aggregate_sku_metrics_from_orders(
     order_docs: list[dict],
+    referral_rate: float = _DEFAULT_REFERRAL_RATE,
 ) -> tuple[dict[str, dict], list[dict], int]:
     """Build per-SKU units/revenue/fees from Aurora order line items.
 
     Returns (sku_data, na_price_rows, orders_count).
-    referralFee / fulfillmentFee on each line item are line totals (see
-    auroraBackend orderSyncService).
+
+    Referral is ``round(line_revenue × rate, 2)`` per line (default 15%), not
+    the stored ``referralFee`` (which can use a drifted listing ratio). Call
+    ``recompute_referral_totals`` after product fees load to snap the rate per
+    SKU. Fulfillment still uses stored line ``fulfillmentFee``.
     """
+    rate = float(referral_rate or _DEFAULT_REFERRAL_RATE)
     sku_data: dict[str, dict] = defaultdict(
         lambda: {
             "units": 0,
@@ -222,14 +352,19 @@ def aggregate_sku_metrics_from_orders(
             sku = it.get("sellerSku")
             if not sku:
                 continue
-            qty = int(it.get("quantityOrdered") or 0)
+            qty = line_item_quantity(it)
             amount = line_item_sales_amount(it)
+            # Always count ordered units — Amazon All Orders includes $0 /
+            # replacement / promo lines. Only revenue is omitted when price
+            # is missing so P&L isn't polluted by unknown dollars.
             if amount <= 0 and qty > 0:
                 na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
-                continue
             sku_data[sku]["units"] += qty
-            sku_data[sku]["revenue"] += amount
-            sku_data[sku]["referral_total"] += _money_amount(it.get("referralFee"))
+            if amount > 0:
+                sku_data[sku]["revenue"] += amount
+                sku_data[sku]["referral_total"] += line_referral_fee(
+                    amount, rate, qty or 1,
+                )
             sku_data[sku]["fba_total"] += _money_amount(it.get("fulfillmentFee"))
             if not sku_data[sku]["asin"] and it.get("asin"):
                 sku_data[sku]["asin"] = it["asin"]
@@ -351,6 +486,21 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
     return out
 
 
+def returned_qty_for_sku(physical: int, refunded: int) -> int:
+    """Units to treat as returned for profitability.
+
+    Physical FBA return rows alone are not enough — Seller Central can still
+    show Payment complete with no refund (sticky/mis-attributed report rows).
+    Require a Finances refund; then take max(physical, refunded) so multi-LPN
+    returns aren't under-counted.
+    """
+    physical = int(physical or 0)
+    refunded = int(refunded or 0)
+    if refunded <= 0:
+        return 0
+    return max(physical, refunded)
+
+
 async def fba_returns_by_sku(
     user: dict,
     start: datetime,
@@ -358,10 +508,11 @@ async def fba_returns_by_sku(
 ) -> dict[str, dict]:
     """Per-SKU returned/refunded units for orders PURCHASED in [start, end].
 
-    Matches the Aurora Returned Orders tab:
-      - physical FBA returns (`customerReturns` / hasCustomerReturn)
+    Matches the Aurora Returned Orders tab for refunded sales:
       - Finances refunds (`refunds` / hasRefund), including returnless refunds
-        that never appear in the FBA Customer Returns report
+      - physical FBA returns (`customerReturns`) only when a refund also exists
+        for that SKU (Seller Central "Payment complete" with no refund must
+        not count as returned — sticky / mis-attributed FBA report rows)
 
     Bound by `purchaseDate` (same sale-window as the rest of Profitability),
     not return/refund date. For an order that has BOTH a physical return and a
@@ -394,29 +545,37 @@ async def fba_returns_by_sku(
     out: dict[str, dict] = {}
     async for order in cursor:
         items = list(order.get("orderItems") or [])
-        items_by_sku = {
-            html.unescape(str(it.get("sellerSku") or "")).strip(): it
-            for it in items
-            if str(it.get("sellerSku") or "").strip()
-        }
+        # Sum quantityOrdered across split lines for the same SKU — capping
+        # returns at a single line's qty under-counts multi-line orders.
+        ordered_by_sku: dict[str, float] = {}
+        referral_by_sku: dict[str, float] = {}
+        asin_from_items: dict[str, str] = {}
         primary = items[0] if items else {}
+        for it in items:
+            sku_key = html.unescape(str(it.get("sellerSku") or "")).strip()
+            if not sku_key:
+                continue
+            ordered_by_sku[sku_key] = ordered_by_sku.get(sku_key, 0.0) + float(
+                line_item_quantity(it)
+            )
+            referral_by_sku[sku_key] = referral_by_sku.get(sku_key, 0.0) + float(
+                (it.get("referralFee") or {}).get("amount") or 0
+            )
+            if it.get("asin") and sku_key not in asin_from_items:
+                asin_from_items[sku_key] = str(it["asin"])
 
         return_units: dict[str, int] = {}
         refund_units: dict[str, int] = {}
-        asin_by_sku: dict[str, str] = {}
+        asin_by_sku: dict[str, str] = dict(asin_from_items)
 
-        # One physical unit == one license-plate-number. Amazon can emit multiple
-        # disposition/status rows for the same LPN; counting each would inflate
-        # Return Proc. Rows without LPN are summed as before.
+        # One physical unit == one license-plate-number. Count 1 per unique
+        # LPN (not 1 per order). Rows without LPN use the row quantity.
         seen_lpn: set[str] = set()
         for row in order.get("customerReturns") or []:
             sku = html.unescape(str(row.get("sku") or "")).strip()
             if not sku:
                 sku = html.unescape(str(primary.get("sellerSku") or "")).strip()
             if not sku:
-                continue
-            qty = int(row.get("quantity") or 0)
-            if qty <= 0:
                 continue
             lpn = str(
                 row.get("licensePlateNumber")
@@ -427,6 +586,11 @@ async def fba_returns_by_sku(
                 if lpn in seen_lpn:
                     continue
                 seen_lpn.add(lpn)
+                qty = 1  # one LPN = one physical returned unit
+            else:
+                qty = int(row.get("quantity") or 0)
+            if qty <= 0:
+                continue
             return_units[sku] = return_units.get(sku, 0) + qty
             if row.get("asin"):
                 asin_by_sku[sku] = str(row["asin"])
@@ -458,19 +622,24 @@ async def fba_returns_by_sku(
                 refund_units[sku] = refund_units.get(sku, 0) + qty
 
         for sku in set(return_units) | set(refund_units):
-            # Same unit often appears as both an FBA return and a Finances refund.
-            qty = max(return_units.get(sku, 0), refund_units.get(sku, 0))
+            qty = returned_qty_for_sku(
+                return_units.get(sku, 0),
+                refund_units.get(sku, 0),
+            )
             if qty <= 0:
                 continue
 
-            item = items_by_sku.get(sku) or primary
-            ordered = float(item.get("quantityOrdered") or 0)
+            ordered = float(ordered_by_sku.get(sku) or 0)
+            if ordered <= 0 and primary:
+                ordered = float(line_item_quantity(primary))
             # Cap at units ordered — multiple Finances refund txs can each repeat
             # ProductContext.quantityShipped (e.g. fee adjustments), which would
             # otherwise double returned_units above what the customer bought.
             if ordered > 0:
                 qty = min(qty, int(ordered))
-            referral_total = float((item.get("referralFee") or {}).get("amount") or 0)
+            referral_total = float(referral_by_sku.get(sku) or 0)
+            if referral_total <= 0 and primary:
+                referral_total = float((primary.get("referralFee") or {}).get("amount") or 0)
             referral_per_unit = (referral_total / ordered) if ordered > 0 else 0.0
 
             entry = out.setdefault(
@@ -482,7 +651,6 @@ async def fba_returns_by_sku(
             if not entry["asin"]:
                 entry["asin"] = (
                     asin_by_sku.get(sku)
-                    or item.get("asin")
                     or None
                 )
 
@@ -1238,7 +1406,7 @@ async def aggregate_sales_daily_from_orders(
             sku = (it.get("sellerSku") or "").strip()
             if not sku:
                 continue
-            qty = int(it.get("quantityOrdered") or 0)
+            qty = line_item_quantity(it)
             if qty <= 0:
                 continue
             revenue = line_item_sales_amount(it)
