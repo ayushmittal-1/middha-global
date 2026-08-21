@@ -40,7 +40,8 @@ def test_multi_unit_order_counts_quantity_not_one():
     assert sku_data["SKU-A"]["revenue"] == 14.7
 
 
-def test_zero_price_lines_still_count_ordered_units():
+def test_zero_price_lines_excluded_from_units_and_revenue():
+    """$0 / replacement lines must not dilute Units or avg price."""
     orders = [
         {
             "amazonOrderId": "111-1",
@@ -70,7 +71,7 @@ def test_zero_price_lines_still_count_ordered_units():
         }
     ]
     sku_data, na_rows, _ = aggregate_sku_metrics_from_orders(orders)
-    assert sku_data["SKU-A"]["units"] == 5
+    assert sku_data["SKU-A"]["units"] == 2
     assert sku_data["SKU-A"]["revenue"] == 9.8
     assert sum(r["qty"] for r in na_rows) == 3
 
@@ -85,6 +86,7 @@ def test_returns_reduce_by_quantity_not_order_count_and_keep_units():
             "fba_total": 15.0,
         }
     }
+    # Legacy map (units only) still uses kept/ordered ratio.
     returns = {"SKU-A": {"returned_units": 3, "refunded_referral": 1.5, "asin": "B00TEST001"}}
     _apply_returns_to_sku_data(sku_data, returns)
     assert sku_data["SKU-A"]["units"] == 10  # still ordered qty
@@ -92,6 +94,37 @@ def test_returns_reduce_by_quantity_not_order_count_and_keep_units():
     assert sku_data["SKU-A"]["returned_units"] == 3  # qty, not 1
     assert sku_data["SKU-A"]["net_units"] == 7
     assert abs(sku_data["SKU-A"]["revenue"] - 34.3) < 0.001
+
+
+def test_returns_subtract_actual_refunded_line_not_sku_average():
+    """Mixed prices: proportional kept/ordered drifts (Andexports B08P3CD3WR)."""
+    sku_data = {
+        "SKU-A": {
+            "units": 35,
+            "revenue": 399.68,
+            "asin": "B08P3CD3WR",
+            "referral_total": 59.90,
+            "fba_total": 152.25,
+        }
+    }
+    returns = {
+        "SKU-A": {
+            "returned_units": 1,
+            "refunded_revenue": 11.76,
+            "refunded_referral": 1.76,
+            "refunded_fulfillment": 4.35,
+            "asin": "B08P3CD3WR",
+        }
+    }
+    _apply_returns_to_sku_data(sku_data, returns, {"SKU-A": 0.15})
+    assert sku_data["SKU-A"]["units"] == 35
+    assert sku_data["SKU-A"]["returned_units"] == 1
+    assert sku_data["SKU-A"]["net_units"] == 34
+    assert abs(sku_data["SKU-A"]["revenue"] - 387.92) < 0.001
+    # Not the buggy proportional 399.68 * 34/35 = 388.26
+    assert abs(sku_data["SKU-A"]["revenue"] - 388.26) > 0.01
+    assert abs(sku_data["SKU-A"]["referral_total"] - 58.14) < 0.01
+    assert abs(sku_data["SKU-A"]["fba_total"] - 147.90) < 0.01
 
 
 def test_physical_return_without_refund_does_not_count():

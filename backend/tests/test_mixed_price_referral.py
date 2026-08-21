@@ -185,6 +185,52 @@ def test_aggregate_fulfillment_split_matches_revenue_calculator():
     assert split_bundled_fulfillment_for_units(632.10, 210) == (611.10, 21.00)
 
 
+def test_sparse_order_fulfillment_uses_product_fees():
+    """Andexports-style: only a few lines have fulfillmentFee — don't understate."""
+    # 210 units, but only ~10 lines stored $3.01 → line_ful ≈ 30.10
+    line_ful = round(3.01 * 10, 2)
+    referral, fba, fuel, source = resolve_sku_referral_fba_fuel(
+        line_referral=159.74,
+        line_fba=line_ful,
+        bill_units=210,
+        revenue=1065.62,
+        product_fees={
+            "referral_per_unit": 0.73,
+            "fba_per_unit": 2.91,
+            "fuel_per_unit": 0.10,
+            "fulfillment_per_unit": 3.01,
+            "listing_price": 4.89,
+        },
+    )
+    assert source == "order_lines"
+    assert referral == 159.74
+    assert fba == 611.10
+    assert fuel == 21.00
+    # Must NOT split the sparse $30.10 across 210 units
+    assert fba + fuel != line_ful
+
+
+def test_full_order_fulfillment_still_uses_line_split():
+    """Allmart-style: every unit has fulfillmentFee — keep line-based split."""
+    line_ful = round(3.01 * 210, 2)
+    referral, fba, fuel, source = resolve_sku_referral_fba_fuel(
+        line_referral=159.74,
+        line_fba=line_ful,
+        bill_units=210,
+        revenue=1065.62,
+        product_fees={
+            "referral_per_unit": 0.73,
+            "fba_per_unit": 2.91,
+            "fuel_per_unit": 0.10,
+            "fulfillment_per_unit": 3.01,
+            "listing_price": 4.89,
+        },
+    )
+    assert source == "order_lines"
+    assert fba == 611.10
+    assert fuel == 21.00
+
+
 def test_products_fees_uses_snapped_15_percent():
     referral, fba, fuel, source = resolve_sku_referral_fba_fuel(
         line_referral=0,
@@ -200,8 +246,8 @@ def test_products_fees_uses_snapped_15_percent():
         },
     )
     assert source == "products_fees"
-    # Single total round (no per-line) — still snaps to 15%, not 0.73/4.89
-    assert referral == round(1065.62 * 0.15, 2)
+    # Per-unit half-up × units (not a single round of total revenue)
+    assert referral == round(0.76 * 210, 2)
     assert referral != round(1065.62 * (0.73 / 4.89), 2)
     # Bundled $3.01 with fuel=0 is split to $2.91 + $0.10 before × units
     assert fba == 611.10

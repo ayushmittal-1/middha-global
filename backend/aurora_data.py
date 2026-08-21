@@ -354,17 +354,18 @@ def aggregate_sku_metrics_from_orders(
                 continue
             qty = line_item_quantity(it)
             amount = line_item_sales_amount(it)
-            # Always count ordered units — Amazon All Orders includes $0 /
-            # replacement / promo lines. Only revenue is omitted when price
-            # is missing so P&L isn't polluted by unknown dollars.
-            if amount <= 0 and qty > 0:
-                na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
+            # Skip $0 / missing-price lines entirely for Units, revenue, avg,
+            # and line fees — replacements/promos with $0 item-price dilute
+            # avg price and confuse Excel comparisons (e.g. B08P3CD3WR).
+            if amount <= 0:
+                if qty > 0:
+                    na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
+                continue
             sku_data[sku]["units"] += qty
-            if amount > 0:
-                sku_data[sku]["revenue"] += amount
-                sku_data[sku]["referral_total"] += line_referral_fee(
-                    amount, rate, qty or 1,
-                )
+            sku_data[sku]["revenue"] += amount
+            sku_data[sku]["referral_total"] += line_referral_fee(
+                amount, rate, qty or 1,
+            )
             sku_data[sku]["fba_total"] += _money_amount(it.get("fulfillmentFee"))
             if not sku_data[sku]["asin"] and it.get("asin"):
                 sku_data[sku]["asin"] = it["asin"]
@@ -519,11 +520,17 @@ async def fba_returns_by_sku(
     refund for the same SKU, units are counted once (max of the two) so the
     20% return-processing fee is not double-charged.
 
-    Referral base uses the order line's own referralFee:
+    Referral / revenue / FBA use the returned order lines (not a SKU-wide
+    average). Mixed sale prices make ``revenue × kept/ordered`` drift — e.g.
+    Andexports B08P3CD3WR July: proportional $388.26 vs true $387.92 after
+    subtracting the $11.76 refunded line.
 
         refunded_referral += (referralFee.amount / quantityOrdered) × qty
+        refunded_revenue  += (line_sales / quantityOrdered) × qty
+        refunded_fulfillment += (fulfillmentFee.amount / quantityOrdered) × qty
 
-    Returns {sku: {returned_units, refunded_referral, asin}}.
+    Returns {sku: {returned_units, refunded_referral, refunded_revenue,
+    refunded_fulfillment, asin}}.
     """
     seller_id = ObjectId(str(user["_id"]))
     cursor = _db().orders.find(
@@ -549,6 +556,8 @@ async def fba_returns_by_sku(
         # returns at a single line's qty under-counts multi-line orders.
         ordered_by_sku: dict[str, float] = {}
         referral_by_sku: dict[str, float] = {}
+        revenue_by_sku: dict[str, float] = {}
+        fulfillment_by_sku: dict[str, float] = {}
         asin_from_items: dict[str, str] = {}
         primary = items[0] if items else {}
         for it in items:
@@ -560,6 +569,12 @@ async def fba_returns_by_sku(
             )
             referral_by_sku[sku_key] = referral_by_sku.get(sku_key, 0.0) + float(
                 (it.get("referralFee") or {}).get("amount") or 0
+            )
+            revenue_by_sku[sku_key] = revenue_by_sku.get(sku_key, 0.0) + float(
+                line_item_sales_amount(it)
+            )
+            fulfillment_by_sku[sku_key] = fulfillment_by_sku.get(sku_key, 0.0) + float(
+                (it.get("fulfillmentFee") or {}).get("amount") or 0
             )
             if it.get("asin") and sku_key not in asin_from_items:
                 asin_from_items[sku_key] = str(it["asin"])
@@ -640,14 +655,34 @@ async def fba_returns_by_sku(
             referral_total = float(referral_by_sku.get(sku) or 0)
             if referral_total <= 0 and primary:
                 referral_total = float((primary.get("referralFee") or {}).get("amount") or 0)
+            revenue_total = float(revenue_by_sku.get(sku) or 0)
+            if revenue_total <= 0 and primary:
+                revenue_total = float(line_item_sales_amount(primary))
+            fulfillment_total = float(fulfillment_by_sku.get(sku) or 0)
+            if fulfillment_total <= 0 and primary:
+                fulfillment_total = float(
+                    (primary.get("fulfillmentFee") or {}).get("amount") or 0
+                )
             referral_per_unit = (referral_total / ordered) if ordered > 0 else 0.0
+            revenue_per_unit = (revenue_total / ordered) if ordered > 0 else 0.0
+            fulfillment_per_unit = (
+                (fulfillment_total / ordered) if ordered > 0 else 0.0
+            )
 
             entry = out.setdefault(
                 sku,
-                {"returned_units": 0, "refunded_referral": 0.0, "asin": None},
+                {
+                    "returned_units": 0,
+                    "refunded_referral": 0.0,
+                    "refunded_revenue": 0.0,
+                    "refunded_fulfillment": 0.0,
+                    "asin": None,
+                },
             )
             entry["returned_units"] += qty
             entry["refunded_referral"] += referral_per_unit * qty
+            entry["refunded_revenue"] += revenue_per_unit * qty
+            entry["refunded_fulfillment"] += fulfillment_per_unit * qty
             if not entry["asin"]:
                 entry["asin"] = (
                     asin_by_sku.get(sku)
@@ -657,6 +692,10 @@ async def fba_returns_by_sku(
     for entry in out.values():
         entry["returned_units"] = int(entry["returned_units"] or 0)
         entry["refunded_referral"] = abs(float(entry["refunded_referral"] or 0.0))
+        entry["refunded_revenue"] = abs(float(entry["refunded_revenue"] or 0.0))
+        entry["refunded_fulfillment"] = abs(
+            float(entry["refunded_fulfillment"] or 0.0)
+        )
 
     return out
 

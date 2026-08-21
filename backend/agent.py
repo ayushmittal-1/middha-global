@@ -838,10 +838,10 @@ def resolve_sku_referral_fba_fuel(
     """Pick referral / FBA / fuel for one SKU row.
 
     Referral prefers order-line sums (mixed sale prices). FBA/fuel prefer
-    products.fees per-unit base+fuel (Revenue Calculator), because splitting
-    an aggregate order-line fulfillment total drifts by cents. Returns
-    ``(referral, fba, fuel, source)`` where source is
-    ``order_lines`` | ``products_fees`` | ``fees_api`` | ``none``.
+    products.fees per-unit base+fuel when order-line fulfillment is missing
+    or only partially populated (common on accounts synced before the fee
+    map existed — e.g. Andexports ~1% of lines have fulfillmentFee).
+    Splitting a sparse aggregate across all units understates FBA/fuel.
     """
     from amazon_sp import (
         split_bundled_fulfillment_for_units,
@@ -884,6 +884,28 @@ def resolve_sku_referral_fba_fuel(
             fba_unit, fuel_unit = split_bundled_fulfillment_total(ful_unit)
         return round(fba_unit * units, 2), round(fuel_unit * units, 2)
 
+    def _catalog_ful_per_unit() -> float:
+        ful = float(pf.get("fulfillment_per_unit") or 0)
+        if ful > 0:
+            return ful
+        return float(pf.get("fba_per_unit") or 0) + float(pf.get("fuel_per_unit") or 0)
+
+    def _line_fulfillment_complete() -> bool:
+        """True only when order-line fulfillment covers ~all units.
+
+        Sparse fees (a few lines with $3 + many with $0) must NOT be split
+        across total units — that understates FBA/fuel for the whole SKU.
+        """
+        if line_ful <= 0 or units <= 0:
+            return False
+        per = line_ful / units
+        expected = _catalog_ful_per_unit()
+        if expected > 0:
+            # Within 25% of catalog per-unit ⇒ full coverage (Allmart).
+            return abs(per - expected) / expected <= 0.25
+        # No catalog: require a plausible FBA per-unit floor.
+        return per >= 1.0
+
     def _line_fba_fuel() -> tuple[float, float]:
         # Prefer catalog per-unit split when it matches the line total.
         if pf_ok and units > 0:
@@ -898,13 +920,16 @@ def resolve_sku_referral_fba_fuel(
         return split_bundled_fulfillment_for_units(line_ful, units)
 
     if line_ref > 0:
-        if line_ful > 0:
+        if _line_fulfillment_complete():
             fba, fuel = _line_fba_fuel()
         elif pf_ok:
             fba, fuel = _pf_fba_fuel()
         elif est_ok:
             fba = round(float(est.get("fba", 0.0)) * units, 2)
             fuel = round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
+        elif line_ful > 0:
+            # Last resort: only the lines that have fees (incomplete).
+            fba, fuel = split_bundled_fulfillment_for_units(line_ful, units)
         else:
             fba, fuel = 0.0, 0.0
         return line_ref, fba, fuel, "order_lines"
@@ -914,7 +939,14 @@ def resolve_sku_referral_fba_fuel(
         ref_unit = float(pf.get("referral_per_unit") or 0)
         if rev > 0 and (listing_price > 0 or ref_unit > 0):
             rate = aurora_data.snap_referral_rate(listing_price, ref_unit)
-            referral = round(rev * rate, 2)
+            # Prefer per-unit half-up when we know units (matches SC).
+            if units > 0:
+                unit_rev = rev / units
+                referral = aurora_data.round_money(
+                    aurora_data.round_money(unit_rev * rate) * units
+                )
+            else:
+                referral = aurora_data.round_money(rev * rate)
         else:
             referral = round(ref_unit * units, 2)
         fba, fuel = _pf_fba_fuel()
@@ -929,7 +961,11 @@ def resolve_sku_referral_fba_fuel(
         )
 
     if line_ful > 0:
-        fba, fuel = _line_fba_fuel()
+        fba, fuel = (
+            _line_fba_fuel()
+            if _line_fulfillment_complete()
+            else split_bundled_fulfillment_for_units(line_ful, units)
+        )
         return 0.0, fba, fuel, "order_lines"
 
     return 0.0, 0.0, 0.0, "none"
@@ -970,13 +1006,14 @@ def _aggregate_sku_from_sp_api(
             if qty <= 0:
                 qty = int(it.get("QuantityShipped", 0) or 0)
             amount = _sp_item_line_revenue(it)
-            # Count units even when price is missing/$0 — matches Amazon's
-            # All Orders quantity. Skip only the revenue contribution.
-            if amount is None or (amount <= 0 and qty > 0):
-                na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
+            # Skip $0 / missing-price lines for Units + revenue (same as
+            # Aurora DB aggregation). Track them for caveats only.
+            if amount is None or amount <= 0:
+                if qty > 0:
+                    na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
+                continue
             sku_data[sku]["units"] += qty
-            if amount is not None and amount > 0:
-                sku_data[sku]["revenue"] += amount
+            sku_data[sku]["revenue"] += amount
             if not sku_data[sku]["asin"] and it.get("ASIN"):
                 sku_data[sku]["asin"] = it["ASIN"]
     return sku_data, orders_count
@@ -1000,6 +1037,7 @@ def _lookup_returns_for_sku(
 def _apply_returns_to_sku_data(
     sku_data: dict[str, dict],
     returns_by_sku: dict[str, dict],
+    rate_by_sku: dict[str, float] | None = None,
 ) -> None:
     """Attach return quantities without collapsing ordered units.
 
@@ -1007,11 +1045,17 @@ def _apply_returns_to_sku_data(
     (sum of line ``quantityOrdered`` — a 3-unit order counts as 3, not 1).
     ``returned_units`` is the returned/refunded quantity (also unit-based,
     not one-per-order). ``net_units`` = ordered − returned is used for
-    COGS / per-unit fee math. Revenue and Aurora order-line referral/FBA
-    totals scale by kept/ordered so refunded dollars leave the P&L.
+    COGS / per-unit fee math.
+
+    Revenue / referral / FBA subtract the **refunded order lines'** dollars
+    (``refunded_revenue`` / referral / fulfillment). A SKU-wide
+    ``× kept/ordered`` ratio is wrong when sale prices differ across units
+    (Andexports B08P3CD3WR: $399.68 × 34/35 = $388.26 vs true $387.92).
     """
     if not sku_data:
         return
+    rates = rate_by_sku or {}
+    rates_lower = {str(k).lower(): float(v) for k, v in rates.items()}
     for sku, d in sku_data.items():
         ordered = int(d.get("units") or 0)
         d["ordered_units"] = ordered
@@ -1026,21 +1070,69 @@ def _apply_returns_to_sku_data(
             continue
         returned = min(returned, ordered)
         kept = ordered - returned
-        ratio = kept / ordered if ordered else 0.0
         d["returned_units"] = returned
         d["net_units"] = kept
-        d["revenue"] = float(d.get("revenue") or 0.0) * ratio
-        if "referral_total" in d:
-            d["referral_total"] = float(d.get("referral_total") or 0.0) * ratio
-        if "fba_total" in d:
-            d["fba_total"] = float(d.get("fba_total") or 0.0) * ratio
+
+        old_rev = float(d.get("revenue") or 0.0)
+        refunded_rev = abs(float((ret or {}).get("refunded_revenue") or 0.0))
+        refunded_ref = abs(float((ret or {}).get("refunded_referral") or 0.0))
+        refunded_ful = abs(float((ret or {}).get("refunded_fulfillment") or 0.0))
+
+        if refunded_rev > 0:
+            refunded_rev = min(refunded_rev, old_rev)
+            d["revenue"] = max(0.0, old_rev - refunded_rev)
+            rate = rates.get(sku)
+            if rate is None:
+                rate = rates_lower.get(str(sku).lower())
+            if rate is None:
+                rate = aurora_data._DEFAULT_REFERRAL_RATE
+            # Match recompute_referral_totals (snapped % × refunded $).
+            ref_delta = aurora_data.line_referral_fee(
+                refunded_rev, float(rate), returned,
+            )
+            if "referral_total" in d:
+                d["referral_total"] = max(
+                    0.0,
+                    float(d.get("referral_total") or 0.0) - ref_delta,
+                )
+            if "fba_total" in d:
+                if refunded_ful <= 0 and ordered > 0:
+                    refunded_ful = (
+                        float(d.get("fba_total") or 0.0) / ordered
+                    ) * returned
+                d["fba_total"] = max(
+                    0.0,
+                    float(d.get("fba_total") or 0.0) - refunded_ful,
+                )
+        else:
+            # Legacy path when returns map has units only (unit tests / old data).
+            ratio = kept / ordered if ordered else 0.0
+            d["revenue"] = old_rev * ratio
+            if "referral_total" in d:
+                if refunded_ref > 0:
+                    d["referral_total"] = max(
+                        0.0,
+                        float(d.get("referral_total") or 0.0) - refunded_ref,
+                    )
+                else:
+                    d["referral_total"] = float(d.get("referral_total") or 0.0) * ratio
+            if "fba_total" in d:
+                if refunded_ful > 0:
+                    d["fba_total"] = max(
+                        0.0,
+                        float(d.get("fba_total") or 0.0) - refunded_ful,
+                    )
+                else:
+                    d["fba_total"] = float(d.get("fba_total") or 0.0) * ratio
 
 
-# Storage report generation on Amazon's side runs 30-240s for months not
-# yet published. Kick it off in the background, dedupe rapid callers on the
-# same (user, months) key, and let the caller decide whether to wait. Keep
-# strong references so the task isn't garbage-collected mid-flight.
+# Storage / aged-charges report generation on Amazon's side runs 30-240s for
+# months not yet published. Kick them off in the background, dedupe rapid
+# callers on the same (user, window) key, and let the caller decide whether
+# to wait. Keep strong references so the task isn't garbage-collected mid-flight.
 _STORAGE_BG_TASKS: dict[tuple, asyncio.Task] = {}
+_AGED_BG_TASKS: dict[tuple, asyncio.Task] = {}
+_AGED_CHARGES_WARM_TASKS: dict[tuple, asyncio.Task] = {}
 
 # SP-API's /reports endpoint has a tight per-account quota (~0.02 req/s).
 # Running the storage / aged / removal / placement loaders in parallel
@@ -1533,20 +1625,32 @@ async def compute_profitability_data(
         fin_posted_after = utc_instant_to_iso_z(start_dt - timedelta(days=45))
         refund_posted_after = utc_instant_to_iso_z(start_dt)
         try:
-            fin = await amazon_sp.get_financial_events(
-                posted_after=fin_posted_after,
-                posted_before=created_before,
-                paginate=True,
-                refund_posted_after=refund_posted_after,
-                placement_posted_after=placement_posted_after,
-                placement_posted_before=placement_posted_before,
-                storage_posted_after=placement_posted_after,
-                storage_posted_before=placement_posted_before,
+            # Cap wall time — busy accounts can page Finances for many minutes
+            # and used to leave "still loading: finances" forever, which also
+            # starved the shared report semaphore for aged/removal.
+            fin = await asyncio.wait_for(
+                amazon_sp.get_financial_events(
+                    posted_after=fin_posted_after,
+                    posted_before=created_before,
+                    paginate=True,
+                    max_pages=40,
+                    refund_posted_after=refund_posted_after,
+                    placement_posted_after=placement_posted_after,
+                    placement_posted_before=placement_posted_before,
+                    storage_posted_after=placement_posted_after,
+                    storage_posted_before=placement_posted_before,
+                ),
+                timeout=70.0,
             )
             fin_by_sku = fin.get("by_sku") or {}
             unattributed_fees = fin.get("unattributed") or unattributed_fees
             fin_placement_window_total = float(fin.get("placement_window_total") or 0)
             fin_storage_window_total = float(fin.get("storage_window_total") or 0)
+        except asyncio.TimeoutError:
+            warnings.append(
+                "Finances API timed out after 70s (too many event pages). "
+                "Low-inv / some settlements may be incomplete — reload later."
+            )
         except Exception as e:
             warnings.append(_sp_report_warning("Finances", e))
 
@@ -1700,90 +1804,129 @@ async def compute_profitability_data(
         _lock_zero_placement("zero_no_window_charges")
 
     async def _load_aged():
-        # Prefer Aurora's fbaagedinventoryfees snapshot (populated by
-        # auroraBackend's fbaAgedInventorySyncService from the FBA Inventory
-        # Planning report). This is the SAME source the legacy planning path
-        # uses — Aurora just runs it on its side and hands us the result.
-        # NOTE: this feeds planning_aged_by_sku only. The actual Aged Inventory
-        # Surcharge dollars used in /profitability come from the CHARGES report
-        # (further below), which Aurora doesn't ingest.
-        nonlocal aged_charges_by_sku, aged_charges_meta, aged_report_total, aged_charges_trusted
-        planning_aged_by_sku: dict[str, float] = {}
-        aged_from_aurora: dict | None = None
-        if use_db:
-            try:
-                aged_from_aurora = await aurora_data.fba_aged_inventory_by_sku(require_user())
-            except Exception as e:
-                warnings.append(_sp_report_warning("Aged inventory (Aurora)", e))
+        """Load Aged Inv dollars for Profit.
 
-        aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
-        # Force a refetch when the cache pre-dates the HDoS / recommended-ship-qty
-        # extraction — an old-shape cache is technically fresh (< 24h) but missing
-        # the fields the Restock table needs. Detect it by looking for any entry
-        # carrying the new keys; if none do, treat as stale.
-        aged_needs_refresh = bool(aged_cache_meta) and not any(
-            (
-                "historical_days_of_supply" in v
-                or "recommended_ship_in_quantity" in v
-            )
-            for v in (aged_cache_meta.get("per_sku") or {}).values()
-        )
-        try:
-            aged_per_sku: dict = {}
-            if aged_from_aurora is not None:
-                # Aurora synced this planning report — use it, skip our fetch.
-                aged_per_sku = aged_from_aurora
-            else:
-                need_aged_fetch = True
-                if aged_cache_meta and not aged_needs_refresh:
-                    aged_per_sku = aged_cache_meta.get("per_sku") or {}
-                    if aged_per_sku:
-                        need_aged_fetch = False
-                if need_aged_fetch:
-                    report_sem = await _get_report_sem()
-                    async with report_sem:
-                        aged_per_sku = await amazon_sp.fetch_aged_inventory_fees_per_sku()
-                    await put_aged_inventory_cache(aged_per_sku)
-            for psku, b in (aged_per_sku or {}).items():
+        Fast path: warmed charges cache (Seller Central amount-charged).
+        Otherwise seed Aurora Inventory Planning estimates immediately (same
+        source Aurora UI shows) so Aged Inv is never stuck at $0, then warm
+        the charges report in a short try + background task. A hung SP-API
+        report must not leave this loader running for 10+ minutes.
+        """
+        nonlocal aged_charges_by_sku, aged_charges_meta, aged_report_total, aged_charges_trusted
+
+        def _planning_fees_from(per_sku: dict | None) -> dict[str, float]:
+            out: dict[str, float] = {}
+            for psku, b in (per_sku or {}).items():
                 if not isinstance(b, dict):
                     continue
                 fee = float(b.get("monthly_fee") or 0)
                 if fee > 0:
-                    planning_aged_by_sku[psku] = fee
-            # Planning report is cached for Restock (HDOS / recommended qty).
-            # Profitability uses the actual AIS charges report below.
-        except Exception as e:
-            warnings.append(_sp_report_warning("Aged inventory planning", e))
-            if _is_sp_access_denied(e):
-                await put_aged_inventory_cache({})
+                    out[psku] = fee
+            return out
 
-        # Actual Aged Inventory Surcharge charges (Seller Central report).
+        def _apply_planning(planning: dict[str, float], *, pending: bool) -> None:
+            nonlocal aged_charges_by_sku, aged_charges_meta, aged_report_total, aged_charges_trusted
+            aged_charges_by_sku = dict(planning)
+            aged_charges_trusted = False
+            aged_charges_meta["source"] = (
+                "planning_estimate_pending_charges"
+                if pending
+                else "planning_estimate_fallback"
+            )
+            aged_report_total = round(
+                sum(float(v or 0) for v in aged_charges_by_sku.values()), 2,
+            )
+            aged_charges_meta["report_total"] = aged_report_total
+
+        def _apply_charges(charges_per_sku: dict, *, source: str) -> None:
+            nonlocal aged_charges_by_sku, aged_charges_meta, aged_report_total, aged_charges_trusted
+            aged_charges_by_sku = _build_aged_charges(charges_per_sku)
+            aged_charges_meta["source"] = source
+            aged_charges_trusted = True
+            aged_report_total = round(
+                sum(float(v or 0) for v in (aged_charges_by_sku or {}).values()),
+                2,
+            )
+            aged_charges_meta["report_total"] = aged_report_total
+
+        async def _load_planning_map() -> dict[str, float]:
+            if use_db:
+                try:
+                    aged_from_aurora = await aurora_data.fba_aged_inventory_by_sku(
+                        require_user(),
+                    )
+                    if aged_from_aurora is not None:
+                        return _planning_fees_from(aged_from_aurora)
+                except Exception as e:
+                    warnings.append(_sp_report_warning("Aged inventory (Aurora)", e))
+            aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
+            return _planning_fees_from(
+                (aged_cache_meta or {}).get("per_sku") if aged_cache_meta else None,
+            )
+
+        async def _fetch_charges() -> dict:
+            report_sem = await _get_report_sem()
+            async with report_sem:
+                return await amazon_sp.fetch_aged_surcharge_charges_per_sku(
+                    start_dt, end_dt, time_zone=mp_tz,
+                )
+
+        # ── 1) Warmed charges cache ──────────────────────────────────────
         try:
             charges_cache = await get_aged_surcharge_charges_cache(
                 charges_start_iso, charges_end_iso, max_age_hours=24,
             )
             if charges_cache and not charges_cache.get("access_denied"):
-                aged_charges_by_sku = _build_aged_charges(
-                    charges_cache.get("per_sku") or {}
+                _apply_charges(charges_cache.get("per_sku") or {}, source="charges_cache")
+                return
+        except Exception as e:
+            warnings.append(_sp_report_warning("Aged inventory charges cache", e))
+
+        # ── 2) Seed Aurora planning NOW (never leave column at $0) ───────
+        planning_aged_by_sku = await _load_planning_map()
+        if planning_aged_by_sku:
+            _apply_planning(planning_aged_by_sku, pending=True)
+
+        # ── 3) Brief try for charges; keep warming in background ─────────
+        warm_key = (
+            str(user.get("_id")) if isinstance(user, dict) else str(user),
+            charges_start_iso,
+            charges_end_iso,
+        )
+
+        async def _warm_charges_cache() -> None:
+            try:
+                charges_per_sku = await asyncio.wait_for(
+                    _fetch_charges(), timeout=180.0,
                 )
-                aged_charges_meta["source"] = "charges_cache"
-                aged_charges_trusted = True
-            else:
-                report_sem = await _get_report_sem()
-                async with report_sem:
-                    charges_per_sku = await amazon_sp.fetch_aged_surcharge_charges_per_sku(
-                        start_dt, end_dt, time_zone=mp_tz,
-                    )
                 await put_aged_surcharge_charges_cache(
                     charges_per_sku, charges_start_iso, charges_end_iso,
                 )
-                aged_charges_by_sku = _build_aged_charges(charges_per_sku)
-                aged_charges_meta["source"] = "charges_report"
-                aged_charges_trusted = True
-            aged_report_total = round(
-                sum(float(v or 0) for v in (aged_charges_by_sku or {}).values()), 2,
+            except Exception:
+                pass
+
+        existing_warm = _AGED_CHARGES_WARM_TASKS.get(warm_key)
+        if existing_warm is None or existing_warm.done():
+            warm_task = _fire_bg(_warm_charges_cache())
+            _AGED_CHARGES_WARM_TASKS[warm_key] = warm_task
+            warm_task.add_done_callback(
+                lambda t, k=warm_key: _AGED_CHARGES_WARM_TASKS.pop(k, None)
             )
-            aged_charges_meta["report_total"] = aged_report_total
+        else:
+            warm_task = existing_warm
+
+        try:
+            await asyncio.wait_for(asyncio.shield(warm_task), timeout=12.0)
+            charges_cache = await get_aged_surcharge_charges_cache(
+                charges_start_iso, charges_end_iso, max_age_hours=24,
+            )
+            if charges_cache and not charges_cache.get("access_denied"):
+                _apply_charges(
+                    charges_cache.get("per_sku") or {}, source="charges_report",
+                )
+                return
+        except asyncio.TimeoutError:
+            pass
         except Exception as e:
             warnings.append(_sp_report_warning("Aged inventory surcharge charges", e))
             if _is_sp_access_denied(e):
@@ -1791,23 +1934,19 @@ async def compute_profitability_data(
                 await put_aged_surcharge_charges_cache(
                     {}, charges_start_iso, charges_end_iso, access_denied=True,
                 )
-            # Prefer planning estimated-ais (SKU-only) over Finances only when
-            # BOTH create and DONE-report reuse failed. Finances posts AIS as a
-            # lumped unattributed total (no SellerSKU), which left every row at $0.
-            if planning_aged_by_sku:
-                aged_charges_by_sku = dict(planning_aged_by_sku)
-                aged_charges_meta["source"] = "planning_estimate_fallback"
-                aged_charges_trusted = False
-                warnings.append(
-                    "Aged Inv: could not load the Aged Inventory Surcharge charges "
-                    "report (create FATAL and no reusable DONE report). Showing "
-                    "Inventory Planning estimated-ais totals — these will NOT match "
-                    "Seller Central amount-charged. Retry later."
-                )
-            else:
-                aged_charges_by_sku = None
-                aged_charges_meta["source"] = "finances_fallback"
-                aged_charges_trusted = False
+
+        if planning_aged_by_sku:
+            _apply_planning(planning_aged_by_sku, pending=True)
+            warnings.append(
+                "Aged Inv: using Aurora Inventory Planning estimated-ais "
+                "(same as Aurora). Seller Central amount-charged is still "
+                "warming in the background — reload in ~1–2 min to upgrade."
+            )
+            return
+
+        aged_charges_by_sku = None
+        aged_charges_meta["source"] = "finances_fallback"
+        aged_charges_trusted = False
 
     async def _load_removal():
         # Removal / Disposal: Seller Central Removal Order Detail only
@@ -1949,13 +2088,11 @@ async def compute_profitability_data(
             warnings.append(f"Ad spend fetch failed ({e}); ad cost set to 0.")
 
 
-    # Storage report generation on Amazon's side can take 30-240s for months
-    # not yet published. Dedupe concurrent callers on the same (user, months)
-    # key so rapid reloads don't pile on Amazon.
-    storage_bg_key = (
-        str(user.get("_id")) if isinstance(user, dict) else str(user),
-        tuple(storage_months_in_window),
-    )
+    # Storage / aged-charges report generation on Amazon's side can take
+    # 30–240s for months not yet published. Dedupe concurrent callers so
+    # rapid reloads / auto-refresh share one in-flight SP-API pull.
+    _uid = str(user.get("_id")) if isinstance(user, dict) else str(user)
+    storage_bg_key = (_uid, tuple(storage_months_in_window))
     existing_storage_task = _STORAGE_BG_TASKS.get(storage_bg_key)
     if existing_storage_task is not None and not existing_storage_task.done():
         storage_task = existing_storage_task
@@ -1964,6 +2101,17 @@ async def compute_profitability_data(
         _STORAGE_BG_TASKS[storage_bg_key] = storage_task
         storage_task.add_done_callback(
             lambda t, k=storage_bg_key: _STORAGE_BG_TASKS.pop(k, None)
+        )
+
+    aged_bg_key = (_uid, charges_start_iso, charges_end_iso)
+    existing_aged_task = _AGED_BG_TASKS.get(aged_bg_key)
+    if existing_aged_task is not None and not existing_aged_task.done():
+        aged_task = existing_aged_task
+    else:
+        aged_task = _fire_bg(_load_aged())
+        _AGED_BG_TASKS[aged_bg_key] = aged_task
+        aged_task.add_done_callback(
+            lambda t, k=aged_bg_key: _AGED_BG_TASKS.pop(k, None)
         )
 
     # COGS is critical — the response is wrong without it. Everything else
@@ -1980,22 +2128,23 @@ async def compute_profitability_data(
         "returns": _fire_bg(_load_returns()),
         "placement": _fire_bg(_load_placement()),
         "product fees": _fire_bg(_load_product_fees_and_batch()),
-        # Storage / reimbursements report creates are slow; soft 5s left them
-        # at $0 on first paint even when Seller Central had rows.
+        # Storage / aged / reimbursements report creates are slow; soft 5s
+        # left them at $0 on first paint even when Seller Central had rows.
         "storage": storage_task,
+        "aged inventory": aged_task,
         "reimbursements": _fire_bg(_load_reimbursements()),
     }
     soft_tasks: dict[str, asyncio.Task] = {
-        "aged inventory": _fire_bg(_load_aged()),
         "removal": _fire_bg(_load_removal()),
         "ads": _fire_bg(_load_ads()),
     }
     # Two-tier wait:
-    # 1) Soft reports (aged / removal / ads) get ~5s — keep running in bg.
-    # 2) Critical fee sources (finances / placement / storage / reimbursements /
-    #    product fees) await longer so first paint is usable.
+    # 1) Soft reports (removal / ads) get ~5s — keep running in bg.
+    # 2) Critical fee sources (incl. aged charges + storage) await longer
+    #    so first paint is usable when Amazon finishes in time; otherwise
+    #    the shared bg task + FE auto-reload hits the warmed cache.
     soft_deadline_s = 5.0
-    critical_deadline_s = 55.0
+    critical_deadline_s = 90.0
     all_tasks = {**critical_tasks, **soft_tasks}
     await asyncio.wait(list(all_tasks.values()), timeout=soft_deadline_s)
     still_critical = [
@@ -2009,6 +2158,45 @@ async def compute_profitability_data(
     partial_status = build_incompleteness_report(
         {name: task.done() for name, task in all_tasks.items()}
     )
+    # Shared aged/storage bg tasks update the *first* caller's locals. If this
+    # request joined an in-flight task (or timed out just as it finished),
+    # re-read the warmed Mongo cache so Aged Inv is not stuck at $0.
+    if not aged_charges_trusted:
+        try:
+            charges_cache = await get_aged_surcharge_charges_cache(
+                charges_start_iso, charges_end_iso, max_age_hours=24,
+            )
+            if charges_cache and not charges_cache.get("access_denied"):
+                aged_charges_by_sku = _build_aged_charges(
+                    charges_cache.get("per_sku") or {}
+                )
+                aged_charges_meta["source"] = "charges_cache"
+                aged_charges_trusted = True
+                aged_report_total = round(
+                    sum(
+                        float(v or 0)
+                        for v in (aged_charges_by_sku or {}).values()
+                    ),
+                    2,
+                )
+                aged_charges_meta["report_total"] = aged_report_total
+                if (
+                    partial_status.get("partial_sections")
+                    and "aged inventory" in partial_status["partial_sections"]
+                    and aged_task.done()
+                ):
+                    partial_status = build_incompleteness_report(
+                        {
+                            name: (
+                                True
+                                if name == "aged inventory"
+                                else task.done()
+                            )
+                            for name, task in all_tasks.items()
+                        }
+                    )
+        except Exception:
+            pass
     if not partial_status["complete"]:
         warnings.append(
             "Still loading in background: "
@@ -2046,8 +2234,8 @@ async def compute_profitability_data(
     # Recompute referral at snapped category % (e.g. 15%) per order line so
     # mixed sale prices match Seller Central. Stored line referralFee used
     # referral$/listing$ and undercounted (e.g. $159.46 vs $159.74).
+    rate_by_sku: dict[str, float] = {}
     if use_db and db_orders and sku_data:
-        rate_by_sku: dict[str, float] = {}
         for _sku in skus:
             _pf = product_fee_fallback.get(_sku) if product_fee_fallback else None
             if not _pf and product_fee_fallback:
@@ -2069,7 +2257,7 @@ async def compute_profitability_data(
 
     # Net out returned/refunded units before fee × units math and storage /
     # ad allocation. Return Proc still uses full returned_units below.
-    _apply_returns_to_sku_data(sku_data, returns_by_sku)
+    _apply_returns_to_sku_data(sku_data, returns_by_sku, rate_by_sku)
 
     # Units sold per ASIN — used to split that ASIN's report fee across SKUs.
     storage_units_by_asin: dict[str, float] = defaultdict(float)
