@@ -838,10 +838,10 @@ def resolve_sku_referral_fba_fuel(
     """Pick referral / FBA / fuel for one SKU row.
 
     Referral prefers order-line sums (mixed sale prices). FBA/fuel prefer
-    products.fees per-unit base+fuel (Revenue Calculator), because splitting
-    an aggregate order-line fulfillment total drifts by cents. Returns
-    ``(referral, fba, fuel, source)`` where source is
-    ``order_lines`` | ``products_fees`` | ``fees_api`` | ``none``.
+    products.fees per-unit base+fuel when order-line fulfillment is missing
+    or only partially populated (common on accounts synced before the fee
+    map existed — e.g. Andexports ~1% of lines have fulfillmentFee).
+    Splitting a sparse aggregate across all units understates FBA/fuel.
     """
     from amazon_sp import (
         split_bundled_fulfillment_for_units,
@@ -884,6 +884,28 @@ def resolve_sku_referral_fba_fuel(
             fba_unit, fuel_unit = split_bundled_fulfillment_total(ful_unit)
         return round(fba_unit * units, 2), round(fuel_unit * units, 2)
 
+    def _catalog_ful_per_unit() -> float:
+        ful = float(pf.get("fulfillment_per_unit") or 0)
+        if ful > 0:
+            return ful
+        return float(pf.get("fba_per_unit") or 0) + float(pf.get("fuel_per_unit") or 0)
+
+    def _line_fulfillment_complete() -> bool:
+        """True only when order-line fulfillment covers ~all units.
+
+        Sparse fees (a few lines with $3 + many with $0) must NOT be split
+        across total units — that understates FBA/fuel for the whole SKU.
+        """
+        if line_ful <= 0 or units <= 0:
+            return False
+        per = line_ful / units
+        expected = _catalog_ful_per_unit()
+        if expected > 0:
+            # Within 25% of catalog per-unit ⇒ full coverage (Allmart).
+            return abs(per - expected) / expected <= 0.25
+        # No catalog: require a plausible FBA per-unit floor.
+        return per >= 1.0
+
     def _line_fba_fuel() -> tuple[float, float]:
         # Prefer catalog per-unit split when it matches the line total.
         if pf_ok and units > 0:
@@ -898,13 +920,16 @@ def resolve_sku_referral_fba_fuel(
         return split_bundled_fulfillment_for_units(line_ful, units)
 
     if line_ref > 0:
-        if line_ful > 0:
+        if _line_fulfillment_complete():
             fba, fuel = _line_fba_fuel()
         elif pf_ok:
             fba, fuel = _pf_fba_fuel()
         elif est_ok:
             fba = round(float(est.get("fba", 0.0)) * units, 2)
             fuel = round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
+        elif line_ful > 0:
+            # Last resort: only the lines that have fees (incomplete).
+            fba, fuel = split_bundled_fulfillment_for_units(line_ful, units)
         else:
             fba, fuel = 0.0, 0.0
         return line_ref, fba, fuel, "order_lines"
@@ -914,7 +939,14 @@ def resolve_sku_referral_fba_fuel(
         ref_unit = float(pf.get("referral_per_unit") or 0)
         if rev > 0 and (listing_price > 0 or ref_unit > 0):
             rate = aurora_data.snap_referral_rate(listing_price, ref_unit)
-            referral = round(rev * rate, 2)
+            # Prefer per-unit half-up when we know units (matches SC).
+            if units > 0:
+                unit_rev = rev / units
+                referral = aurora_data.round_money(
+                    aurora_data.round_money(unit_rev * rate) * units
+                )
+            else:
+                referral = aurora_data.round_money(rev * rate)
         else:
             referral = round(ref_unit * units, 2)
         fba, fuel = _pf_fba_fuel()
@@ -929,7 +961,11 @@ def resolve_sku_referral_fba_fuel(
         )
 
     if line_ful > 0:
-        fba, fuel = _line_fba_fuel()
+        fba, fuel = (
+            _line_fba_fuel()
+            if _line_fulfillment_complete()
+            else split_bundled_fulfillment_for_units(line_ful, units)
+        )
         return 0.0, fba, fuel, "order_lines"
 
     return 0.0, 0.0, 0.0, "none"
