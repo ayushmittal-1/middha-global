@@ -100,6 +100,7 @@ PRODUCTION_BASELINE_ORIGINS = (
     "https://middha-global.onrender.com",
     "https://www.auroratest.in",
     "https://auroratest.in",
+    "https://middha-global-1.onrender.com",
 )
 
 
