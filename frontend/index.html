@@ -3206,28 +3206,13 @@
           return d.toLocaleDateString();
         } catch { return iso; }
       }
-      // Aurora products URL — resolved lazily from Middha's /listings/config
-      // so we don't hardcode it in the FE. Same JWT works on both backends
-      // because they share JWT_SECRET.
-      let auroraProductsUrl = null;
-      async function resolveAuroraUrl() {
-        if (auroraProductsUrl) return auroraProductsUrl;
-        try {
-          const c = await loSafeJsonFetch('/listings/config',
-            { headers: authHeaders() });
-          auroraProductsUrl = c.aurora_products_url;
-        } catch (e) {
-          console.warn('config fetch failed', e);
-        }
-        return auroraProductsUrl;
-      }
-
+      // Products load same-origin from Middha (/listings/products) so the
+      // AI iframe never cross-origin fetches Aurora — that fails in prod
+      // when Aurora CORS allowlists auroratest.in but not the AI host.
       async function loadListingsList() {
         listStatus.textContent = 'Loading…';
         listTbody.innerHTML = '<tr><td colspan="5" style="padding:20px;text-align:center;color:#9ca3af;font-size:13px;">Loading…</td></tr>';
         try {
-          const auroraUrl = await resolveAuroraUrl();
-          if (!auroraUrl) throw new Error('Aurora products URL not configured');
           const qs = new URLSearchParams({
             page: String(loCurrentPage),
             limit: '25',
@@ -3236,14 +3221,13 @@
             listing: 'listed',
           });
           if (loSearchTerm) qs.set('search', loSearchTerm);
-          // Same JWT as Middha — auth.py note: both backends share JWT_SECRET.
-          const auroraResp = await fetch(`${auroraUrl}?${qs}`,
-            { headers: authHeaders() });
-          if (!auroraResp.ok) {
-            throw new Error(`Aurora products: HTTP ${auroraResp.status}`);
+          const aurora = await loSafeJsonFetch(`/listings/products?${qs}`, {
+            headers: authHeaders(),
+          });
+          if (aurora.success === false) {
+            throw new Error(aurora.error || 'Failed to load products');
           }
-          const aurora = await auroraResp.json();
-          // Aurora response shape: {success, count, pagination:{page,limit,total,pages}, data:[...]}
+          // Response shape: {success, count, pagination:{page,limit,total,pages}, data:[...]}
           const items = (aurora.data || []).map(p => ({
             asin: (p.asin || '').trim(),
             sku: p.sku || p.sellerSku || '',
@@ -4164,11 +4148,29 @@
       {
         id: 'units',
         label: 'Units',
-        title: 'Units sold net of returns/refunds (ordered − returned)',
+        title: 'Amazon All Orders quantity — sum of line quantities (a 3-unit order counts as 3, not 1). Returns are listed separately.',
         num: true,
         defaultVisible: true,
-        cell: (r) => `<td class="num">${r.units}</td>`,
+        cell: (r) => `<td class="num" title="${escapeHtml(`Ordered qty ${r.ordered_units != null ? r.ordered_units : r.units} · returned ${r.returned_units || 0} · net ${r.net_units != null ? r.net_units : r.units}`)}">${r.units}</td>`,
         total: (_r, t) => `<td class="num">${t.units}</td>`,
+      },
+      {
+        id: 'ordered_units',
+        label: 'Ordered',
+        title: 'Same as Units — gross quantityOrdered from Amazon orders',
+        num: true,
+        defaultVisible: false,
+        cell: (r) => `<td class="num">${r.ordered_units != null ? r.ordered_units : r.units}</td>`,
+        total: (_r, t) => `<td class="num">${t.ordered_units != null ? t.ordered_units : t.units}</td>`,
+      },
+      {
+        id: 'returned_units',
+        label: 'Returned',
+        title: 'Returned / refunded unit quantity (not order count) for purchases in this window',
+        num: true,
+        defaultVisible: true,
+        cell: (r) => `<td class="num">${r.returned_units || 0}</td>`,
+        total: (_r, t) => `<td class="num">${t.returned_units || 0}</td>`,
       },
       {
         id: 'avg_price',
@@ -4669,7 +4671,7 @@
         const t = data.totals;
         if (t) {
           profitKpisEl.innerHTML = [
-            kpiCard('Units sold', t.units.toLocaleString()),
+            kpiCard('Units sold', (t.units || 0).toLocaleString()),
             kpiCard('Revenue', `$${t.revenue.toLocaleString()}`),
             kpiCard('Amz fees', `$${(t.amazon_fees || 0).toLocaleString()}`),
             kpiCard('Storage', `$${(t.storage_fee || 0).toLocaleString()}`),

@@ -826,6 +826,115 @@ async def _fetch_order_items_paced(
     return items_results
 
 
+def resolve_sku_referral_fba_fuel(
+    *,
+    line_referral: float = 0.0,
+    line_fba: float = 0.0,
+    bill_units: int = 0,
+    revenue: float = 0.0,
+    product_fees: dict | None = None,
+    fee_estimate: dict | None = None,
+) -> tuple[float, float, float, str]:
+    """Pick referral / FBA / fuel for one SKU row.
+
+    Referral prefers order-line sums (mixed sale prices). FBA/fuel prefer
+    products.fees per-unit base+fuel (Revenue Calculator), because splitting
+    an aggregate order-line fulfillment total drifts by cents. Returns
+    ``(referral, fba, fuel, source)`` where source is
+    ``order_lines`` | ``products_fees`` | ``fees_api`` | ``none``.
+    """
+    from amazon_sp import (
+        split_bundled_fulfillment_for_units,
+        split_bundled_fulfillment_total,
+    )
+
+    line_ref = round(float(line_referral or 0), 2)
+    line_ful = round(float(line_fba or 0), 2)
+    units = max(0, int(bill_units or 0))
+    rev = float(revenue or 0)
+    pf = product_fees or {}
+    est = fee_estimate or {}
+
+    pf_ok = bool(
+        float(pf.get("referral_per_unit") or 0) > 0
+        or float(pf.get("fba_per_unit") or 0) > 0
+        or float(pf.get("fuel_per_unit") or 0) > 0
+        or float(pf.get("fulfillment_per_unit") or 0) > 0
+    )
+    est_ok = bool(
+        not est.get("error")
+        and (
+            float(est.get("referral") or 0) > 0
+            or float(est.get("fba") or 0) > 0
+            or float(est.get("fuel_surcharge") or 0) > 0
+        )
+    )
+
+    def _pf_fba_fuel() -> tuple[float, float]:
+        fba_unit = float(pf.get("fba_per_unit") or 0)
+        fuel_unit = float(pf.get("fuel_per_unit") or 0)
+        ful_unit = float(pf.get("fulfillment_per_unit") or 0)
+        # Products often store fees.fbaFee as the full $3.01 bundle with
+        # fuel=0 — always split that into base+fuel before × units.
+        if fuel_unit <= 0 and (ful_unit > 0 or fba_unit > 0):
+            fba_unit, fuel_unit = split_bundled_fulfillment_total(
+                ful_unit if ful_unit > 0 else fba_unit,
+            )
+        elif ful_unit > 0 and abs((fba_unit + fuel_unit) - ful_unit) > 0.02:
+            fba_unit, fuel_unit = split_bundled_fulfillment_total(ful_unit)
+        return round(fba_unit * units, 2), round(fuel_unit * units, 2)
+
+    def _line_fba_fuel() -> tuple[float, float]:
+        # Prefer catalog per-unit split when it matches the line total.
+        if pf_ok and units > 0:
+            fba, fuel = _pf_fba_fuel()
+            if abs((fba + fuel) - line_ful) <= 0.05:
+                return fba, fuel
+        if est_ok and units > 0:
+            fba = round(float(est.get("fba", 0.0)) * units, 2)
+            fuel = round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
+            if abs((fba + fuel) - line_ful) <= 0.05:
+                return fba, fuel
+        return split_bundled_fulfillment_for_units(line_ful, units)
+
+    if line_ref > 0:
+        if line_ful > 0:
+            fba, fuel = _line_fba_fuel()
+        elif pf_ok:
+            fba, fuel = _pf_fba_fuel()
+        elif est_ok:
+            fba = round(float(est.get("fba", 0.0)) * units, 2)
+            fuel = round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
+        else:
+            fba, fuel = 0.0, 0.0
+        return line_ref, fba, fuel, "order_lines"
+
+    if pf_ok:
+        listing_price = float(pf.get("listing_price") or 0)
+        ref_unit = float(pf.get("referral_per_unit") or 0)
+        if rev > 0 and (listing_price > 0 or ref_unit > 0):
+            rate = aurora_data.snap_referral_rate(listing_price, ref_unit)
+            referral = round(rev * rate, 2)
+        else:
+            referral = round(ref_unit * units, 2)
+        fba, fuel = _pf_fba_fuel()
+        return referral, fba, fuel, "products_fees"
+
+    if est_ok:
+        return (
+            round(float(est.get("referral", 0.0)) * units, 2),
+            round(float(est.get("fba", 0.0)) * units, 2),
+            round(float(est.get("fuel_surcharge", 0.0)) * units, 2),
+            "fees_api",
+        )
+
+    if line_ful > 0:
+        fba, fuel = _line_fba_fuel()
+        return 0.0, fba, fuel, "order_lines"
+
+    return 0.0, 0.0, 0.0, "none"
+
+
 def _aggregate_sku_from_sp_api(
     orders: list[dict],
     items_results: list[tuple[str, dict]],
@@ -858,15 +967,16 @@ def _aggregate_sku_from_sp_api(
             if not sku:
                 continue
             qty = int(it.get("QuantityOrdered", 0) or 0)
+            if qty <= 0:
+                qty = int(it.get("QuantityShipped", 0) or 0)
             amount = _sp_item_line_revenue(it)
-            if amount is None:
+            # Count units even when price is missing/$0 — matches Amazon's
+            # All Orders quantity. Skip only the revenue contribution.
+            if amount is None or (amount <= 0 and qty > 0):
                 na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
-                continue
-            if amount <= 0 and qty > 0:
-                na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
-                continue
             sku_data[sku]["units"] += qty
-            sku_data[sku]["revenue"] += amount
+            if amount is not None and amount > 0:
+                sku_data[sku]["revenue"] += amount
             if not sku_data[sku]["asin"] and it.get("ASIN"):
                 sku_data[sku]["asin"] = it["ASIN"]
     return sku_data, orders_count
@@ -891,17 +1001,24 @@ def _apply_returns_to_sku_data(
     sku_data: dict[str, dict],
     returns_by_sku: dict[str, dict],
 ) -> None:
-    """Net units/revenue/line fees by returned quantity (in-place).
+    """Attach return quantities without collapsing ordered units.
 
-    Units become ordered − returned. Revenue and Aurora order-line
-    referral/FBA totals scale by kept/ordered so Referral, FBA, Fuel,
-    COGS, and per-unit allocations all follow remaining quantity.
+    ``units`` / ``ordered_units`` stay as Amazon All Orders quantity
+    (sum of line ``quantityOrdered`` — a 3-unit order counts as 3, not 1).
+    ``returned_units`` is the returned/refunded quantity (also unit-based,
+    not one-per-order). ``net_units`` = ordered − returned is used for
+    COGS / per-unit fee math. Revenue and Aurora order-line referral/FBA
+    totals scale by kept/ordered so refunded dollars leave the P&L.
     """
-    if not returns_by_sku or not sku_data:
+    if not sku_data:
         return
     for sku, d in sku_data.items():
         ordered = int(d.get("units") or 0)
-        if ordered <= 0:
+        d["ordered_units"] = ordered
+        d["returned_units"] = 0
+        d["net_units"] = ordered
+        # Keep d["units"] == ordered so Units column matches All Orders qty.
+        if ordered <= 0 or not returns_by_sku:
             continue
         ret = _lookup_returns_for_sku(returns_by_sku, sku)
         returned = int((ret or {}).get("returned_units") or 0)
@@ -909,8 +1026,9 @@ def _apply_returns_to_sku_data(
             continue
         returned = min(returned, ordered)
         kept = ordered - returned
-        ratio = kept / ordered
-        d["units"] = kept
+        ratio = kept / ordered if ordered else 0.0
+        d["returned_units"] = returned
+        d["net_units"] = kept
         d["revenue"] = float(d.get("revenue") or 0.0) * ratio
         if "referral_total" in d:
             d["referral_total"] = float(d.get("referral_total") or 0.0) * ratio
@@ -1925,6 +2043,30 @@ async def compute_profitability_data(
         storage_meta["source"] = "storage_report"
         storage_meta["window_total"] = round(float(storage_report_total), 2)
 
+    # Recompute referral at snapped category % (e.g. 15%) per order line so
+    # mixed sale prices match Seller Central. Stored line referralFee used
+    # referral$/listing$ and undercounted (e.g. $159.46 vs $159.74).
+    if use_db and db_orders and sku_data:
+        rate_by_sku: dict[str, float] = {}
+        for _sku in skus:
+            _pf = product_fee_fallback.get(_sku) if product_fee_fallback else None
+            if not _pf and product_fee_fallback:
+                _pf = next(
+                    (
+                        v for k, v in product_fee_fallback.items()
+                        if str(k).lower() == str(_sku).lower()
+                    ),
+                    None,
+                )
+            if _pf:
+                rate_by_sku[_sku] = aurora_data.snap_referral_rate(
+                    _pf.get("listing_price"),
+                    _pf.get("referral_per_unit"),
+                )
+            else:
+                rate_by_sku[_sku] = aurora_data._DEFAULT_REFERRAL_RATE
+        aurora_data.recompute_referral_totals(db_orders, sku_data, rate_by_sku)
+
     # Net out returned/refunded units before fee × units math and storage /
     # ad allocation. Return Proc still uses full returned_units below.
     _apply_returns_to_sku_data(sku_data, returns_by_sku)
@@ -1958,30 +2100,18 @@ async def compute_profitability_data(
 
     for sku in skus:
         d = sku_data[sku]
-        units = d["units"]
+        # `units` = Amazon All Orders quantity (sum of quantityOrdered).
+        # COGS / per-unit fees use net_units (ordered − returned).
+        units = int(d.get("units") or 0)
+        ordered_units = int(d.get("ordered_units") or units)
+        returned_units = int(d.get("returned_units") or 0)
+        net_units = int(d.get("net_units") if d.get("net_units") is not None else max(0, ordered_units - returned_units))
+        bill_units = net_units if net_units > 0 else 0
         revenue = round(d["revenue"], 2)
-        avg_price = revenue / units if units else 0.0
+        avg_price = revenue / bill_units if bill_units else 0.0
         asin = d["asin"]
 
-        # Referral / base FBA / fuel.
-        # Priority (keeps UI fast while staying Amazon-accurate):
-        #   1) live Fees API at sale price — only fetched for missing/diverged SKUs
-        #   2) products.fees (listing-price sync — same as Products page)
-        #   3) order line totals (last resort)
-        referral_total = 0.0
-        fba_total = 0.0
-        fuel_total = 0.0
-
         est = fees_by_asin.get(asin) if asin else None
-        est_ok = bool(
-            est
-            and not est.get("error")
-            and (
-                float(est.get("referral") or 0) > 0
-                or float(est.get("fba") or 0) > 0
-                or float(est.get("fuel_surcharge") or 0) > 0
-            )
-        )
         pf = product_fee_fallback.get(sku) if sku in product_fee_fallback else None
         if not pf and product_fee_fallback:
             pf = next(
@@ -1991,49 +2121,21 @@ async def compute_profitability_data(
                 ),
                 None,
             )
-        pf_ok = bool(
-            pf
-            and (
-                float(pf.get("referral_per_unit") or 0) > 0
-                or float(pf.get("fba_per_unit") or 0) > 0
-                or float(pf.get("fuel_per_unit") or 0) > 0
-                or float(pf.get("fulfillment_per_unit") or 0) > 0
-            )
-        )
 
-        # Prefer live estimate when present (selective fetch only puts an ASIN
-        # here when fees were missing or sale price drifted). Otherwise use
-        # products.fees — the fast path for the common case.
-        if est_ok:
-            referral_total = round(float(est.get("referral", 0.0)) * units, 2)
-            fba_total = round(float(est.get("fba", 0.0)) * units, 2)
-            fuel_total = round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
-        elif pf_ok:
-            # Same source as Aurora Products (`products.fees`). FBA + Fuel
-            # equals the Products "FBA Fee" column (fulfillment total).
-            listing_price = float(pf.get("listing_price") or 0)
-            ref_unit = float(pf.get("referral_per_unit") or 0)
-            if listing_price > 0 and ref_unit > 0 and revenue > 0:
-                referral_total = round(revenue * (ref_unit / listing_price), 2)
-            else:
-                referral_total = round(ref_unit * units, 2)
-            fba_unit = float(pf.get("fba_per_unit") or 0)
-            fuel_unit = float(pf.get("fuel_per_unit") or 0)
-            # Safety: if split drifted, re-align to Products fbaFee total.
-            ful_unit = float(pf.get("fulfillment_per_unit") or 0)
-            if ful_unit > 0 and abs((fba_unit + fuel_unit) - ful_unit) > 0.02:
-                fba_unit, fuel_unit = split_bundled_fulfillment_total(ful_unit)
-            fba_total = round(fba_unit * units, 2)
-            fuel_total = round(fuel_unit * units, 2)
-            if not asin and pf.get("asin"):
-                asin = pf["asin"]
-        else:
-            line_ref = round(float(d.get("referral_total") or 0), 2)
-            line_fba = round(float(d.get("fba_total") or 0), 2)
-            if line_ref > 0 or line_fba > 0:
-                referral_total = line_ref
-                fba_total, fuel_total = split_bundled_fulfillment_total(line_fba)
-            elif asin and avg_price > 0:
+        # Referral / base FBA / fuel — prefer order-line sums so mixed sale
+        # prices keep the correct per-unit referral (see resolve_sku_…).
+        referral_total, fba_total, fuel_total, fee_source = resolve_sku_referral_fba_fuel(
+            line_referral=float(d.get("referral_total") or 0),
+            line_fba=float(d.get("fba_total") or 0),
+            bill_units=bill_units,
+            revenue=revenue,
+            product_fees=pf,
+            fee_estimate=est,
+        )
+        if fee_source == "products_fees" and not asin and pf and pf.get("asin"):
+            asin = pf["asin"]
+        if fee_source == "none":
+            if asin and avg_price > 0:
                 fee_errors.append(f"{sku} ({asin}): no fee data in products.fees or Fees API")
             elif avg_price > 0:
                 fee_errors.append(f"{sku}: no ASIN found in order items")
@@ -2043,9 +2145,9 @@ async def compute_profitability_data(
         amazon_fees = round(referral_total + fba_total + fuel_total, 2)
 
         # Ads: per-campaign attribution when the campaign lists this SKU,
-        # plus a share of the unattributed pool spread per unit.
+        # plus a share of the unattributed pool spread per kept unit.
         ad_cost = round(
-            float(ad_by_sku.get(sku, 0.0)) + ad_unattr_per_unit * units, 2,
+            float(ad_by_sku.get(sku, 0.0)) + ad_unattr_per_unit * bill_units, 2,
         )
 
         # Finances API fees per SKU + share of unattributed pool
@@ -2070,7 +2172,7 @@ async def compute_profitability_data(
         elif storage_from_finances:
             storage = round(
                 float(fin_sku.get("storage", 0.0) or 0)
-                + unattr_per_unit.get("storage", 0.0) * units,
+                + unattr_per_unit.get("storage", 0.0) * bill_units,
                 2,
             )
         else:
@@ -2088,11 +2190,10 @@ async def compute_profitability_data(
         # ASIN incorrectly charged Return Proc on never-returned SKUs.
         ret = _lookup_returns_for_sku(returns_by_sku, sku)
         refunded_referral = float((ret or {}).get("refunded_referral") or 0.0)
-        returned_units = int((ret or {}).get("returned_units") or 0)
         return_processing_fee = round(0.20 * refunded_referral, 2)
         low_inventory_fee = round(
             (fin_sku.get("low_inventory", 0.0)
-             + unattr_per_unit["low_inventory"] * units), 2)
+             + unattr_per_unit["low_inventory"] * bill_units), 2)
 
         # Inbound placement: dated window charges (or Finances window total)
         # go on Totals as BLENDED. Rows stay $0. Never fee_rate × units sold.
@@ -2129,15 +2230,15 @@ async def compute_profitability_data(
         # Reimbursements: always BLENDED account income; rows stay $0.
         reimbursement = 0.0
 
-        # COGS components (only when uploaded)
+        # COGS components (only when uploaded) — billed on kept (net) units
         cogs_row = cogs_map.get(sku)
         if cogs_row:
-            product_cost = round(cogs_row["unit_cost"] * units, 2)
-            inbound = round(cogs_row["inbound_shipping_per_unit"] * units, 2)
+            product_cost = round(cogs_row["unit_cost"] * bill_units, 2)
+            inbound = round(cogs_row["inbound_shipping_per_unit"] * bill_units, 2)
         else:
             product_cost = 0.0
             inbound = 0.0
-            missing_cogs.append({"sku": sku, "units": units, "revenue": revenue})
+            missing_cogs.append({"sku": sku, "units": bill_units, "revenue": revenue})
 
         net = round(
             revenue - amazon_fees - storage - product_cost - inbound - ad_cost
@@ -2151,6 +2252,9 @@ async def compute_profitability_data(
             "sku": sku,
             "asin": asin,
             "units": units,
+            "ordered_units": ordered_units,
+            "returned_units": returned_units,
+            "net_units": net_units,
             "avg_price": round(avg_price, 2),
             "revenue": revenue,
             "referral_fee": referral_total,
@@ -2177,6 +2281,8 @@ async def compute_profitability_data(
         rows.append(row)
 
         totals["units"] += units
+        totals["ordered_units"] += ordered_units
+        totals["returned_units"] += returned_units
         totals["revenue"] += revenue
         totals["referral_fee"] += referral_total
         totals["fba_fee"] += fba_total
@@ -2282,6 +2388,8 @@ async def compute_profitability_data(
     rev = totals["revenue"]
     totals_out = {k: round(v, 2) for k, v in totals.items()}
     totals_out["units"] = int(totals["units"])
+    totals_out["ordered_units"] = int(totals.get("ordered_units") or totals["units"])
+    totals_out["returned_units"] = int(totals.get("returned_units") or 0)
     totals_out["margin"] = round((totals["net"] / rev * 100), 1) if rev > 0 else 0.0
     totals_out["storage_report_total"] = round(float(storage_report_total or 0), 2)
     totals_out["storage_unallocated"] = storage_unallocated

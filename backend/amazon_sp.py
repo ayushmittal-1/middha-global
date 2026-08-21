@@ -505,11 +505,12 @@ def _fee_line_amount(entry: dict) -> float:
 
 
 def split_bundled_fulfillment_total(total: float) -> tuple[float, float]:
-    """Split a bundled FBA fulfillment total into base + fuel (Revenue Calculator).
+    """Split a *per-unit* bundled FBA total into base + fuel (Revenue Calculator).
 
-    Amazon displays these at cent precision (e.g. $3.86 → base $3.73 + fuel $0.13).
-    Rounding to 4dp first (3.7295 / 0.1305) then × units drifts by a few cents
-    vs the calculator even though FBA+Fuel still matches.
+    Amazon displays these at cent precision (e.g. $3.01 → base $2.91 + fuel $0.10).
+    Always split the per-unit amount, then multiply by units — splitting an
+    aggregate (e.g. $632.10 for 210 units) drifts by cents even though
+    base+fuel still equals the total.
     """
     if total <= 0:
         return 0.0, 0.0
@@ -517,6 +518,26 @@ def split_bundled_fulfillment_total(total: float) -> tuple[float, float]:
     base = round(total / 1.035, 2)
     fuel = round(total - base, 2)
     return base, fuel
+
+
+def split_bundled_fulfillment_for_units(
+    total: float, units: int,
+) -> tuple[float, float]:
+    """Split a multi-unit bundled fulfillment total via per-unit rounding.
+
+    ``split(total)`` on the aggregate drifts; ``split(total/units)×units``
+    matches Seller Central / Revenue Calculator (e.g. 210×$3.01 →
+    FBA $611.10 + fuel $21.00, not $610.72 + $21.38).
+    """
+    total = round(float(total or 0), 2)
+    units = max(0, int(units or 0))
+    if total <= 0:
+        return 0.0, 0.0
+    if units <= 1:
+        return split_bundled_fulfillment_total(total)
+    per_unit = round(total / units, 2)
+    base_u, fuel_u = split_bundled_fulfillment_total(per_unit)
+    return round(base_u * units, 2), round(fuel_u * units, 2)
 
 
 def parse_fee_detail_lines(detail_list: list) -> dict:
