@@ -651,33 +651,124 @@ async def get_aged_surcharge_charges_cache(
     start_iso: str,
     end_iso: str,
     max_age_hours: int = 24,
+    months: list[str] | None = None,
 ) -> dict | None:
     """Cached actual AIS charged amounts for a profitability window.
 
-    Invalidates when the window changes or the doc is older than TTL —
-    different date ranges must not reuse each other's charge totals.
+    schemaVersion ≥ 4 stores many windows under ``windows`` so viewing August
+    no longer wipes a previously warmed March cache (the v3 single-slot doc
+    caused historical months to re-fetch, hit Reports 429, and show $0).
+
+    Also stores ``byMonth`` (Event Month → perSku). When the exact window
+    key misses, we merge byMonth for ``months`` so March 1–31 and slight
+    end-time variants still hit the same Seller Central CSV totals.
     """
     user_id = _user_oid()
     doc = await _aged_surcharge_charges_cache().find_one({"userId": user_id})
     if not doc:
         return None
-    # v3 = marketplace-TZ months + reuse validated by snapshot Event Month.
-    if int(doc.get("schemaVersion") or 1) < 3:
+
+    def _fresh(updated, *, denied: bool, ttl_hours: int) -> bool:
+        if not updated:
+            return False
+        if getattr(updated, "tzinfo", None) is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
+        if denied and age_hours > 1:
+            return False
+        return age_hours <= ttl_hours
+
+    def _ttl_for_end(end_iso_val: str) -> int:
+        ttl = max_age_hours
+        try:
+            end_dt = datetime.fromisoformat(str(end_iso_val).replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            if end_dt < datetime.now(timezone.utc) - timedelta(days=3):
+                ttl = max(ttl, 24 * 45)
+        except Exception:
+            pass
+        return ttl
+
+    schema = int(doc.get("schemaVersion") or 1)
+    window_key = _fee_window_cache_key(start_iso, end_iso)
+
+    if schema >= 4:
+        entry = (doc.get("windows") or {}).get(window_key)
+        if isinstance(entry, dict) and entry.get("startIso") == start_iso and entry.get("endIso") == end_iso:
+            ttl = _ttl_for_end(end_iso)
+            if _fresh(entry.get("updatedAt"), denied=bool(entry.get("accessDenied")), ttl_hours=ttl):
+                updated = entry["updatedAt"]
+                if getattr(updated, "tzinfo", None) is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                return {
+                    "per_sku": entry.get("perSku", {}) or {},
+                    "updated_at": updated.isoformat(),
+                    "access_denied": bool(entry.get("accessDenied")),
+                }
+
+        # Fallback: merge Event-Month buckets (survives window-key drift).
+        wanted = [m for m in (months or []) if re.match(r"^\d{4}-\d{2}$", str(m))]
+        by_month = doc.get("byMonth") or {}
+        if wanted and all(str(m) in by_month for m in wanted):
+            merged: dict = {}
+            newest = None
+            for m in wanted:
+                bucket = by_month.get(str(m)) or {}
+                updated = bucket.get("updatedAt")
+                ttl = max(max_age_hours, 24 * 45)
+                if not _fresh(updated, denied=bool(bucket.get("accessDenied")), ttl_hours=ttl):
+                    merged = {}
+                    break
+                if newest is None or (updated and updated > newest):
+                    newest = updated
+                for sku, row in (bucket.get("perSku") or {}).items():
+                    if not isinstance(row, dict):
+                        fee = float(row or 0)
+                        if fee <= 0:
+                            continue
+                        dest = merged.setdefault(
+                            sku, {"charged_total": 0.0, "qty_charged": 0, "asin": None},
+                        )
+                        dest["charged_total"] = float(dest["charged_total"]) + fee
+                        continue
+                    dest = merged.setdefault(
+                        sku,
+                        {
+                            "charged_total": 0.0,
+                            "qty_charged": 0,
+                            "asin": row.get("asin"),
+                        },
+                    )
+                    dest["charged_total"] = float(dest["charged_total"]) + float(
+                        row.get("charged_total") or 0
+                    )
+                    dest["qty_charged"] = int(dest.get("qty_charged") or 0) + int(
+                        row.get("qty_charged") or 0
+                    )
+                    if row.get("asin") and not dest.get("asin"):
+                        dest["asin"] = row["asin"]
+            if merged and newest is not None:
+                if getattr(newest, "tzinfo", None) is None:
+                    newest = newest.replace(tzinfo=timezone.utc)
+                return {
+                    "per_sku": merged,
+                    "updated_at": newest.isoformat(),
+                    "access_denied": False,
+                }
+        return None
+
+    # Legacy v3 single-slot doc — only hit when the window still matches.
+    if schema < 3:
         return None
     if doc.get("startIso") != start_iso or doc.get("endIso") != end_iso:
         return None
-    updated = doc.get("updatedAt")
-    if not updated:
+    ttl = _ttl_for_end(end_iso)
+    if not _fresh(doc.get("updatedAt"), denied=bool(doc.get("accessDenied")), ttl_hours=ttl):
         return None
-    if updated.tzinfo is None:
+    updated = doc["updatedAt"]
+    if getattr(updated, "tzinfo", None) is None:
         updated = updated.replace(tzinfo=timezone.utc)
-    age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
-    if age_hours > max_age_hours:
-        return None
-    # Poisoned 403 / empty denial — retry within 1h so a transient denial
-    # does not blank Storage/Aged/Removal for a full day.
-    if doc.get("accessDenied") and age_hours > 1:
-        return None
     return {
         "per_sku": doc.get("perSku", {}),
         "updated_at": updated.isoformat(),
@@ -685,24 +776,56 @@ async def get_aged_surcharge_charges_cache(
     }
 
 
+def _fee_window_cache_key(start_iso: str, end_iso: str) -> str:
+    """Mongo-safe key for a profitability window (no '.' / '$')."""
+    return (
+        str(start_iso).replace(".", "_").replace("$", "_")
+        + "__"
+        + str(end_iso).replace(".", "_").replace("$", "_")
+    )
+
+
 async def put_aged_surcharge_charges_cache(
     per_sku: dict,
     start_iso: str,
     end_iso: str,
     access_denied: bool = False,
+    months: list[str] | None = None,
 ) -> None:
+    """Upsert one window's AIS charges without deleting other months' caches."""
     user_id = _user_oid()
+    now = datetime.now(timezone.utc)
+    window_key = _fee_window_cache_key(start_iso, end_iso)
+    entry = {
+        "perSku": per_sku,
+        "startIso": start_iso,
+        "endIso": end_iso,
+        "accessDenied": access_denied,
+        "updatedAt": now,
+    }
+    sets: dict = {
+        f"windows.{window_key}": entry,
+        "schemaVersion": 4,
+        "updatedAt": now,
+        "perSku": per_sku,
+        "startIso": start_iso,
+        "endIso": end_iso,
+        "accessDenied": access_denied,
+    }
+    # Also index by Event Month so slight window-key drift still resolves.
+    # Only for single-month windows — a multi-month merge must not be stored
+    # under each month (byMonth fallback would double-count on read).
+    if months and len([m for m in months if re.match(r"^\d{4}-\d{2}$", str(m))]) == 1:
+        key = str(next(m for m in months if re.match(r"^\d{4}-\d{2}$", str(m)))).strip()
+        sets[f"byMonth.{key}"] = {
+            "perSku": per_sku,
+            "accessDenied": access_denied,
+            "updatedAt": now,
+        }
     await _aged_surcharge_charges_cache().update_one(
         {"userId": user_id},
         {
-            "$set": {
-                "perSku": per_sku,
-                "startIso": start_iso,
-                "endIso": end_iso,
-                "accessDenied": access_denied,
-                "schemaVersion": 3,
-                "updatedAt": datetime.now(timezone.utc),
-            },
+            "$set": sets,
             "$setOnInsert": {"userId": user_id},
         },
         upsert=True,

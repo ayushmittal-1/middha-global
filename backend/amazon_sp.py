@@ -1361,18 +1361,20 @@ async def fetch_storage_fees_for_months(
 
     per_asin, parsed_months = parse_storage_fee_report(text)
     filtered = filter_storage_to_months(per_asin, months)
-    # Return only months we actually got rows for (may be subset if Amazon omitted data).
+    # Only months that were BOTH requested AND present in month_of_charge.
+    # Neighbor-month responses (asked August, Amazon returned June) must NOT
+    # be reported as found — otherwise callers empty-check / cover the wrong
+    # month and August profitability can inherit June dollars via cache.
     found_months = sorted(
         {m for by_month in filtered.values() for m in by_month.keys()}
     )
-    if not found_months and parsed_months:
-        # Amazon sometimes returns a neighboring month_of_charge when the
-        # requested month isn't published yet — keep whatever we parsed so
-        # cache can still grow; caller filters to the profitability window.
-        return normalize_storage_fee_map(per_asin), sorted(parsed_months)
-    return normalize_storage_fee_map(filtered), found_months or [
-        m for m in months if m in parsed_months
-    ]
+    if found_months:
+        return normalize_storage_fee_map(filtered), found_months
+    # Keep neighbor rows for cache growth only; found_months stays empty so
+    # the requested month remains "missing" until Amazon publishes it.
+    if parsed_months:
+        return normalize_storage_fee_map(per_asin), []
+    return {}, []
 
 
 async def fetch_storage_fees_by_asin_month(
@@ -1557,6 +1559,7 @@ async def get_financial_events(
     unattributed = _empty_fee_bucket()
     removal_by_order: dict[str, float] = defaultdict(float)
     pages = 0
+    truncated = False
     page_params = dict(base_params)
 
     if storage_posted_after is None:
@@ -1763,6 +1766,7 @@ async def get_financial_events(
 
         next_token = payload.get("NextToken")
         if not paginate or not next_token or pages >= max_pages:
+            truncated = bool(paginate and next_token and pages >= max_pages)
             break
         # SP-API continuations: only NextToken (rest of the query is
         # remembered by Amazon).
@@ -1788,6 +1792,9 @@ async def get_financial_events(
         "storage_window_total": storage_window_total,
         "pages": pages,
         "posted_after": posted_after,
+        # True when max_pages stopped the walk with more NextToken pages left.
+        # Callers must not treat Low Inv / Finances storage as final in that case.
+        "truncated": truncated,
     }
 
 

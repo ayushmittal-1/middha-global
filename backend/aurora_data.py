@@ -373,6 +373,72 @@ def aggregate_sku_metrics_from_orders(
     return sku_data, na_price_rows, eligible_orders
 
 
+def _pack_product_fee_doc(doc: dict) -> dict | None:
+    """Normalize one products document into per-unit fee fields."""
+    fees = doc.get("fees") or {}
+    price = _money_amount((doc.get("price") or {}))
+    breakdown = fees.get("breakdown") or []
+    stored_fba = _money_amount(fees.get("fbaFee"))
+    referral = _money_amount(fees.get("referralFee"))
+    total = _money_amount(fees.get("totalFees"))
+
+    # Referral: prefer stored field (Products column); else breakdown / estimate.
+    if referral <= 0 and breakdown:
+        referral = float(parse_fee_detail_lines(breakdown).get("referral") or 0)
+    if referral <= 0 and total > 0 and stored_fba > 0:
+        referral = max(total - stored_fba, 0.0)
+    elif referral <= 0 and price > 0:
+        referral = price * 0.15
+
+    # Fulfillment: Products page displays fees.fbaFee — keep that total.
+    # Split into base + fuel for Profitability's two columns.
+    fba = 0.0
+    fuel = 0.0
+    if stored_fba > 0:
+        if breakdown:
+            parsed = parse_fee_detail_lines(breakdown)
+            p_fba = float(parsed.get("fba") or 0)
+            p_fuel = float(parsed.get("fuel_surcharge") or 0)
+            if p_fba > 0 and abs((p_fba + p_fuel) - stored_fba) <= 0.02:
+                fba, fuel = p_fba, p_fuel
+            elif p_fba > 0 and p_fuel > 0:
+                # Explicit base+fuel lines — trust breakdown even when
+                # legacy stored fbaFee was base-only (missing fuel).
+                fba, fuel = p_fba, p_fuel
+            else:
+                fba, fuel = split_bundled_fulfillment_total(stored_fba)
+        else:
+            fba, fuel = split_bundled_fulfillment_total(stored_fba)
+    elif breakdown:
+        parsed = parse_fee_detail_lines(breakdown)
+        fba = float(parsed.get("fba") or 0)
+        fuel = float(parsed.get("fuel_surcharge") or 0)
+    if referral <= 0 and fba <= 0 and fuel <= 0:
+        return None
+    ft = str(doc.get("fulfillmentType") or "").upper()
+    is_fba = ft != "FBM"
+    return {
+        "referral_per_unit": referral,
+        "fba_per_unit": fba,
+        "fuel_per_unit": fuel,
+        # Full Products-page FBA fee (base+fuel) for diagnostics / UI parity.
+        "fulfillment_per_unit": round(fba + fuel, 4) if (fba + fuel) > 0 else stored_fba,
+        "listing_price": price,
+        "asin": doc.get("asin"),
+        "is_fba": is_fba,
+        "fulfillment_type": doc.get("fulfillmentType") or None,
+    }
+
+
+def _fulfillment_per_unit(pf: dict | None) -> float:
+    if not pf:
+        return 0.0
+    bundled = float(pf.get("fulfillment_per_unit") or 0)
+    if bundled > 0:
+        return bundled
+    return float(pf.get("fba_per_unit") or 0) + float(pf.get("fuel_per_unit") or 0)
+
+
 async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str, dict]:
     """Per-unit fees from Aurora `products.fees` (same source as Products page).
 
@@ -397,66 +463,11 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
     out: dict[str, dict] = {}
     found_lower: set[str] = set()
 
-    def _pack(sku: str, doc: dict) -> dict | None:
-        fees = doc.get("fees") or {}
-        price = _money_amount((doc.get("price") or {}))
-        breakdown = fees.get("breakdown") or []
-        stored_fba = _money_amount(fees.get("fbaFee"))
-        referral = _money_amount(fees.get("referralFee"))
-        total = _money_amount(fees.get("totalFees"))
-
-        # Referral: prefer stored field (Products column); else breakdown / estimate.
-        if referral <= 0 and breakdown:
-            referral = float(parse_fee_detail_lines(breakdown).get("referral") or 0)
-        if referral <= 0 and total > 0 and stored_fba > 0:
-            referral = max(total - stored_fba, 0.0)
-        elif referral <= 0 and price > 0:
-            referral = price * 0.15
-
-        # Fulfillment: Products page displays fees.fbaFee — keep that total.
-        # Split into base + fuel for Profitability's two columns.
-        fba = 0.0
-        fuel = 0.0
-        if stored_fba > 0:
-            if breakdown:
-                parsed = parse_fee_detail_lines(breakdown)
-                p_fba = float(parsed.get("fba") or 0)
-                p_fuel = float(parsed.get("fuel_surcharge") or 0)
-                if p_fba > 0 and abs((p_fba + p_fuel) - stored_fba) <= 0.02:
-                    fba, fuel = p_fba, p_fuel
-                elif p_fba > 0 and p_fuel > 0:
-                    # Explicit base+fuel lines — trust breakdown even when
-                    # legacy stored fbaFee was base-only (missing fuel).
-                    fba, fuel = p_fba, p_fuel
-                else:
-                    fba, fuel = split_bundled_fulfillment_total(stored_fba)
-            else:
-                fba, fuel = split_bundled_fulfillment_total(stored_fba)
-        elif breakdown:
-            parsed = parse_fee_detail_lines(breakdown)
-            fba = float(parsed.get("fba") or 0)
-            fuel = float(parsed.get("fuel_surcharge") or 0)
-        if referral <= 0 and fba <= 0 and fuel <= 0:
-            return None
-        ft = str(doc.get("fulfillmentType") or "").upper()
-        is_fba = ft != "FBM"
-        return {
-            "referral_per_unit": referral,
-            "fba_per_unit": fba,
-            "fuel_per_unit": fuel,
-            # Full Products-page FBA fee (base+fuel) for diagnostics / UI parity.
-            "fulfillment_per_unit": round(fba + fuel, 4) if (fba + fuel) > 0 else stored_fba,
-            "listing_price": price,
-            "asin": doc.get("asin"),
-            "is_fba": is_fba,
-            "fulfillment_type": doc.get("fulfillmentType") or None,
-        }
-
     async for doc in cursor:
         sku = doc.get("sku")
         if not sku:
             continue
-        packed = _pack(str(sku), doc)
+        packed = _pack_product_fee_doc(doc)
         if not packed:
             continue
         # Key by the order SKU spelling when casings differ.
@@ -477,12 +488,98 @@ async def product_fee_estimates_by_sku(user: dict, skus: list[str]) -> dict[str,
             sku = doc.get("sku")
             if not sku:
                 continue
-            packed = _pack(str(sku), doc)
+            packed = _pack_product_fee_doc(doc)
             if not packed:
                 continue
             order_sku = wanted_lower.get(str(sku).lower(), str(sku))
             out[order_sku] = packed
             out[str(sku)] = packed
+
+    return out
+
+
+async def enrich_product_fees_from_asin_siblings(
+    user: dict,
+    sku_data: dict[str, dict],
+    fee_map: dict[str, dict],
+) -> dict[str, dict]:
+    """Fill missing / zero FBA from another product on the same ASIN.
+
+    Accounts like Eleet mint many ``amzn.gr.*`` SKUs. Some have referral but
+    ``fees.fbaFee=$0`` (or no products row), while the merchant SKU on the
+    same ASIN has a full FBA card. Without this, Profitability shows $0 FBA
+    on those rows even though Amazon charged the same size-tier fee.
+    """
+    if not sku_data:
+        return fee_map
+    seller_id = ObjectId(str(user["_id"]))
+    out = dict(fee_map or {})
+
+    need_asins: set[str] = set()
+    sku_asin: dict[str, str] = {}
+    for sku, d in sku_data.items():
+        asin = (
+            (d.get("asin") or (out.get(sku) or {}).get("asin") or "")
+        ).strip().upper()
+        if not asin:
+            continue
+        sku_asin[sku] = asin
+        if _fulfillment_per_unit(out.get(sku)) <= 0:
+            need_asins.add(asin)
+    if not need_asins:
+        return out
+
+    # asin -> (prefer_merchant: bool score, packed fees)
+    donor_by_asin: dict[str, dict] = {}
+    donor_is_gr: dict[str, bool] = {}
+
+    def _consider_donor(sku: str, pf: dict) -> None:
+        asin = (pf.get("asin") or sku_asin.get(sku) or "").strip().upper()
+        if not asin or asin not in need_asins:
+            return
+        if _fulfillment_per_unit(pf) <= 0:
+            return
+        is_gr = str(sku).lower().startswith("amzn.gr.")
+        prev = donor_by_asin.get(asin)
+        if prev is None or (donor_is_gr.get(asin, True) and not is_gr):
+            donor_by_asin[asin] = pf
+            donor_is_gr[asin] = is_gr
+
+    for sku, pf in list(out.items()):
+        _consider_donor(sku, pf)
+
+    still = sorted(a for a in need_asins if a not in donor_by_asin)
+    if still:
+        async for doc in _db().products.find(
+            {"sellerId": seller_id, "asin": {"$in": still}},
+            {"sku": 1, "asin": 1, "fees": 1, "price": 1, "fulfillmentType": 1},
+        ):
+            sku = doc.get("sku")
+            if not sku:
+                continue
+            packed = _pack_product_fee_doc(doc)
+            if not packed:
+                continue
+            _consider_donor(str(sku), packed)
+
+    for sku, asin in sku_asin.items():
+        donor = donor_by_asin.get(asin)
+        if not donor or _fulfillment_per_unit(donor) <= 0:
+            continue
+        pf = out.get(sku)
+        if pf is None:
+            out[sku] = {
+                **donor,
+                "asin": asin,
+            }
+            continue
+        if _fulfillment_per_unit(pf) > 0:
+            continue
+        pf["fba_per_unit"] = float(donor.get("fba_per_unit") or 0)
+        pf["fuel_per_unit"] = float(donor.get("fuel_per_unit") or 0)
+        pf["fulfillment_per_unit"] = float(donor.get("fulfillment_per_unit") or 0)
+        if not pf.get("asin"):
+            pf["asin"] = asin
 
     return out
 
