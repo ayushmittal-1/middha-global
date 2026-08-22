@@ -1,19 +1,11 @@
-# Local-only dependencies for the LightGBM forecasting benchmark.
-# NOT installed in the production image — the /forecasting/sku/{sku}/compare
-# endpoint is gated behind the LGBM_BENCHMARK env flag and only mounts when
-# these packages are importable.
+# Local-only supplemental dependencies. All forecasting model libraries
+# (lightgbm, xgboost, gluonts[torch], pytorch-lightning) have been
+# promoted to requirements.txt because production runs them when the
+# LGBM_BENCHMARK / DEEPTS_ENABLED env flags are on. This file exists
+# for any future dev-only tooling (test runners, profilers, notebooks)
+# that shouldn't ship to prod.
 #
 # Install locally with:
 #   pip install -r requirements-dev.txt
 
 -r requirements.txt
-
-lightgbm>=4.0
-scikit-learn>=1.3
-
-# DeepAR + TFT via gluonts. Heavy: pulls in torch + pytorch-lightning
-# (~1.5 GB total). Gated behind the DEEPTS_ENABLED env flag — nothing
-# imports these unless the flag is set, so production images that
-# don't want the RAM cost can skip installing them.
-gluonts[torch]>=0.16
-pytorch-lightning>=2.0

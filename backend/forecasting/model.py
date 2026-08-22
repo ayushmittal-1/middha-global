@@ -698,6 +698,27 @@ def _try_lgbm_train(
     return forecaster, lgbm_module
 
 
+def _try_xgb_train(
+    series_by_sku: dict, train_end: object,
+):
+    """Sibling of _try_lgbm_train for the XGBoost candidate. Lightweight
+    dep (~50 MB wheel) so no env-flag gate — trains whenever the wheel
+    is importable. Silent skip on any failure keeps the picker resilient.
+    """
+    try:
+        from forecasting.xgb import model as xgb_module
+    except ImportError:
+        log.info("xgboost not installed — picker will skip XGBoost")
+        return None, None
+    try:
+        forecaster = xgb_module.train_user_global(series_by_sku, train_end=train_end)
+    except Exception as e:
+        log.warning("xgb train_user_global failed (%s) — skipping XGBoost "
+                    "in this picker run", e)
+        return None, None
+    return forecaster, xgb_module
+
+
 def _pick_winner(candidates: dict[str, dict]) -> str | None:
     """Return the key of the candidate with the highest metrics.accuracy_pct.
     Ties broken by lower MAE. Returns None when no candidate scored."""
@@ -724,6 +745,8 @@ def _multimodel_forecast(
     today: datetime,
     cutoff: datetime,
     deepts_state: dict | None = None,
+    xgb_state=None,
+    xgb_module=None,
 ) -> dict:
     """Bake off Prophet + LGBM + Naive on the same 30-day holdout, pick
     the winner, refit it on FULL history, return the winner's forecast +
@@ -798,6 +821,27 @@ def _multimodel_forecast(
                 }
             except Exception as e:
                 log.warning("lgbm backtest failed for sku=%s: %s", sku, e)
+
+    # ── XGBoost backtest (sibling of LGBM, same features) ────
+    if xgb_state is not None and xgb_module is not None:
+        target_series = all_train_series_by_sku.get(sku)
+        if target_series is not None and not target_series.empty:
+            try:
+                xgb_bt_result = xgb_module.forecast_sku(
+                    xgb_state, target_series, sku,
+                    horizon=BACKTEST_HOLDOUT_DAYS, today=cutoff,
+                )
+                _apply_recovery_bump(xgb_bt_result, train_rows, cutoff)
+                xgb_bt_days, xgb_metrics = _score_forecast_days(
+                    xgb_bt_result.get("forecast") or [], holdout_by_day,
+                )
+                candidates["xgb"] = {
+                    "method_label": "xgb",
+                    "backtest_days": xgb_bt_days,
+                    "backtest_metrics": xgb_metrics,
+                }
+            except Exception as e:
+                log.warning("xgb backtest failed for sku=%s: %s", sku, e)
 
     # ── DeepAR / TFT backtests (deep-learning candidates) ────
     # Only run when the user-global fit produced state — training is
@@ -925,6 +969,16 @@ def _multimodel_forecast(
                         "falling back to naive", sku, e)
             refit_choice = "naive"
             fwd = _naive_forecast(full_fit, horizon, today)
+    elif refit_choice == "xgb" and xgb_state is not None and xgb_module is not None:
+        try:
+            fwd = xgb_module.forecast_sku(
+                xgb_state, full_fit, sku, horizon, today,
+            )
+        except Exception as e:
+            log.warning("xgb forward-forecast failed for sku=%s: %s — "
+                        "falling back to naive", sku, e)
+            refit_choice = "naive"
+            fwd = _naive_forecast(full_fit, horizon, today)
     elif refit_choice in ("deepar", "tft") and deepts_state and deepts_state.get(refit_choice) is not None:
         # Same trade-off as LGBM: reuse the pre-cutoff trained model
         # rather than retrain forward-fresh. Deep model training is
@@ -977,6 +1031,16 @@ def _multimodel_forecast(
                 base_forecasts.append(l_fwd.get("forecast") or [])
             except Exception as e:
                 log.warning("lgbm forward for ensemble failed sku=%s: %s", sku, e)
+        # XGBoost forward — reuse pre-cutoff state, same reason as LGBM.
+        if xgb_state is not None and xgb_module is not None:
+            try:
+                x_fwd = xgb_module.forecast_sku(
+                    xgb_state, full_fit, sku, horizon, today,
+                )
+                _apply_recovery_bump(x_fwd, rows, today)
+                base_forecasts.append(x_fwd.get("forecast") or [])
+            except Exception as e:
+                log.warning("xgb forward for ensemble failed sku=%s: %s", sku, e)
         # Deep models forward — same reuse pattern.
         if deepts_state and deepts_state.get("module") is not None:
             deepts_mod = deepts_state["module"]
@@ -1153,6 +1217,10 @@ async def refresh_forecasts_for_user(
         _try_lgbm_train, train_series_by_sku,
         pd.Timestamp(cutoff.date()) - pd.Timedelta(days=1),
     )
+    xgb_state, xgb_module = await asyncio.to_thread(
+        _try_xgb_train, train_series_by_sku,
+        pd.Timestamp(cutoff.date()) - pd.Timedelta(days=1),
+    )
     # DeepAR / TFT — heavy, opt-in via DEEPTS_ENABLED. Trained once
     # per user across all SKUs (user-global panel) so each SKU's
     # backtest can score the deep candidates alongside the others.
@@ -1176,6 +1244,7 @@ async def refresh_forecasts_for_user(
                 lgbm_state, lgbm_module,
                 horizon, today, cutoff,
                 deepts_state,
+                xgb_state, xgb_module,
             )
         except Exception as e:
             log.exception("forecast failed for sku=%s: %s", sku, e)

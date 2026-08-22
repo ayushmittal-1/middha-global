@@ -37,6 +37,7 @@ from forecasting.model import (  # noqa: E402
     _row_day_naive,
     _try_deepts_train,
     _try_lgbm_train,
+    _try_xgb_train,
 )
 import pandas as pd  # noqa: E402
 
@@ -97,6 +98,12 @@ async def run(user_id_hex: str, limit: int, train_days: int) -> None:
         pd.Timestamp(cutoff.date()) - pd.Timedelta(days=1),
     )
     print(f"[bench] lgbm_state={'ok' if lgbm_state else 'skipped'}")
+    print(f"[bench] training XGBoost on {len(train_series_by_sku)} SKU panels...")
+    xgb_state, xgb_module = _try_xgb_train(
+        train_series_by_sku,
+        pd.Timestamp(cutoff.date()) - pd.Timedelta(days=1),
+    )
+    print(f"[bench] xgb_state={'ok' if xgb_state else 'skipped'}")
     print(f"[bench] training DeepAR + TFT (if DEEPTS_ENABLED)...")
     deepts_state = _try_deepts_train(
         train_series_by_sku,
@@ -116,6 +123,8 @@ async def run(user_id_hex: str, limit: int, train_days: int) -> None:
                 lgbm_state, lgbm_module,
                 horizon=30, today=today, cutoff=cutoff,
                 deepts_state=deepts_state,
+                xgb_state=xgb_state,
+                xgb_module=xgb_module,
             )
         except Exception as e:
             print(f"[bench] {i:>3}/{len(picks)} {sku[:40]:<40} ERROR {e}")

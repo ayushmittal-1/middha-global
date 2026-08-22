@@ -165,6 +165,55 @@ def _lgbm_backtest(
     return _score_forecast(result, holdout_by_day)
 
 
+def _xgb_backtest(
+    all_user_rows_by_sku: dict[str, list[dict]],
+    target_sku: str,
+    cutoff: datetime,
+    holdout_by_day: dict[str, int],
+) -> dict:
+    """Sibling of _lgbm_backtest — trains a user-global XGBoost panel on
+    the same imputed features and scores the target SKU's forecast.
+
+    Kept in this routes module (rather than a new xgb/routes.py) so
+    the compare endpoint stays in one place and doesn't need a second
+    mount point.
+    """
+    try:
+        from forecasting.xgb.model import (
+            forecast_sku as xgb_forecast_sku,
+            train_user_global as xgb_train,
+        )
+    except ImportError:
+        return {"method": "xgb_missing", "days": [], "metrics": None}
+
+    train_rows_by_sku: dict[str, list[dict]] = {}
+    for sku, rows in all_user_rows_by_sku.items():
+        train_rows_by_sku[sku] = [
+            r for r in rows if _row_day_naive(r) < cutoff.replace(tzinfo=None)
+        ]
+    series_by_sku: dict[str, pd.DataFrame] = {}
+    for sku, train_rows in train_rows_by_sku.items():
+        s = _build_series_imputed(train_rows, cutoff)
+        if not s.empty:
+            series_by_sku[sku] = s
+    if not series_by_sku:
+        return {"method": "xgb_empty", "days": [], "metrics": None}
+
+    train_end_ts = pd.Timestamp(cutoff.date()) - pd.Timedelta(days=1)
+    fc = xgb_train(series_by_sku, train_end=train_end_ts)
+    if fc is None:
+        return {"method": "xgb_skipped", "days": [], "metrics": None}
+
+    target_series = series_by_sku.get(target_sku)
+    if target_series is None or target_series.empty:
+        return {"method": "xgb_no_history", "days": [], "metrics": None}
+
+    result = xgb_forecast_sku(fc, target_series, target_sku,
+                              horizon=HOLDOUT_DAYS, today=cutoff)
+    _apply_recovery_bump(result, train_rows_by_sku.get(target_sku, []), cutoff)
+    return _score_forecast(result, holdout_by_day)
+
+
 def _row_day_naive(r: dict) -> datetime | None:
     """Strip tz so date comparisons with `cutoff_naive` work regardless of
     whether Mongo returned naive or aware datetimes."""
@@ -286,13 +335,23 @@ async def compare_models(sku: str, user: dict = Depends(protect)):
             "metrics": None,
             "error": str(e),
         }
+    try:
+        xgb_result = _xgb_backtest(rows_by_sku, sku, cutoff, holdout_by_day)
+    except Exception as e:
+        log.exception("xgb backtest failed for sku=%s", sku)
+        xgb_result = {
+            "method": "xgb_error",
+            "days": [],
+            "metrics": None,
+            "error": str(e),
+        }
 
-    # Ensemble candidate — per-day mean of positive p50s across the three
-    # base backtests. Matches the production picker's ensemble so the
-    # drawer's Model comparison panel shows the same fourth row the
-    # picker actually chose from.
+    # Ensemble candidate — per-day mean of positive p50s across every
+    # base backtest. Matches the production picker's ensemble so the
+    # drawer's Model comparison panel shows the same competitive row
+    # the picker actually chose from.
     ensemble_result = _ensemble_backtest(
-        [prophet_result, naive_result, lgbm_result], holdout_by_day,
+        [prophet_result, naive_result, lgbm_result, xgb_result], holdout_by_day,
     )
 
     return {
@@ -304,6 +363,7 @@ async def compare_models(sku: str, user: dict = Depends(protect)):
         "n_user_skus": len(rows_by_sku),
         "prophet": prophet_result,
         "lgbm": lgbm_result,
+        "xgb": xgb_result,
         "naive": naive_result,
         "ensemble": ensemble_result,
     }
