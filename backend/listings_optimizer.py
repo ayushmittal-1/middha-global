@@ -29,12 +29,40 @@ import httpx
 
 from agent import client  # Reuse the existing Groq client instance.
 
-# Override the model rather than reusing agent.MODEL. The listing rewrite
-# leans on JSON mode + strict guideline-following, which needs the flagship
-# tier; agent.py's default model may have drifted or been deprecated by
-# Groq. Keep this feature independent so it stays working even if the
-# chat path's model config changes.
+# Model fallback chain for the listing rewriter.
+#
+# Live inventory verified 2026-08-22 against this account via GET
+# /openai/v1/models — the llama family (3.1/3.3-*) is gone, so the
+# chain sticks to gpt-oss + qwen + allam + compound-router, which are
+# the models actually available on this Groq key.
+#
+# Failure mode we're guarding against: Groq's `json_validate_failed`
+# (400) hits both gpt-oss-120b AND gpt-oss-20b under json_object mode.
+# That's a shared server-side validator bug in the gpt-oss family on
+# this account. To escape it, the chain jumps out of the family after
+# one gpt-oss attempt and tries a Qwen model (independent validator
+# path), then falls through to smaller/simpler models.
+#
+# Order rationale:
+#   1. openai/gpt-oss-120b — flagship, richest rewrites when it works
+#   2. qwen/qwen3.6-27b — different family, Qwen has solid json_object
+#      support and avoids the gpt-oss validator issue
+#   3. groq/compound — Groq's router picks the best-available model
+#      per request; useful last-resort because it dodges specific-
+#      model outages
+#   4. allam-2-7b — small, simple, most-forgiving JSON output
 MODEL = "openai/gpt-oss-120b"
+# allam-2-7b sits second because a live test showed it as the model
+# actually completing the rewrite when gpt-oss-120b returns an empty
+# response (a Groq server-side bug we can't work around from here).
+# qwen/qwen3.6-27b was removed — its <think>...</think> reasoning mode
+# consumes ~2 seconds per attempt without producing a JSON block.
+_MODEL_FALLBACK_CHAIN = (
+    "openai/gpt-oss-120b",
+    "allam-2-7b",
+    "openai/gpt-oss-safeguard-20b",
+    "groq/compound",
+)
 
 # Vision model for image compliance checks. Groq's llama-4-scout is
 # vision-capable but locked behind their Dev tier — free-tier accounts
@@ -492,6 +520,136 @@ def _build_expansion_instruction(thin_fields: list[str]) -> str:
     )
 
 
+def _extract_json_block(text: str) -> dict:
+    """Pull the first top-level `{...}` JSON object out of an LLM
+    response. Handles both raw-JSON replies and replies wrapped in
+    ```json``` fences or preambles like "Here is your rewrite: {...}".
+    Raises json.JSONDecodeError if no parseable object is found.
+    """
+    if not text:
+        raise json.JSONDecodeError("empty response", "", 0)
+    # First try the whole thing (fast path when the model already returned raw JSON).
+    stripped = text.strip()
+    for candidate in (stripped, stripped.strip("`").removeprefix("json").strip()):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+    # Walk the string, balance braces, extract the first complete {...} block.
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    block = text[start:i + 1]
+                    try:
+                        return json.loads(block)
+                    except json.JSONDecodeError:
+                        break  # try starting from next `{`
+        start = text.find("{", start + 1)
+    raise json.JSONDecodeError("no JSON object found", text, 0)
+
+
+async def _rewrite_with_fallback(
+    messages: list[dict],
+) -> tuple[dict, str]:
+    """Call Groq's chat/completions and parse a JSON object out of the
+    text response, walking the _MODEL_FALLBACK_CHAIN on error.
+
+    Deliberately does NOT use Groq's `response_format={"type":
+    "json_object"}` — every model on this account currently fails
+    Groq's server-side JSON validator with 400 json_validate_failed
+    (even qwen and allam, which are outside the gpt-oss family).
+    Instead the system prompt tells the model to emit JSON directly,
+    and `_extract_json_block` recovers the object from whatever prose
+    or code fence the model wrapped around it. This is the widely-used
+    workaround when a provider's JSON mode is unreliable.
+
+    Returns (parsed_json, model_name_that_succeeded). Raises the last
+    exception when every model in the chain fails.
+    """
+    last_err: Exception | None = None
+    for model_name in _MODEL_FALLBACK_CHAIN:
+        try:
+            resp = await client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=4000,
+            )
+            raw = resp.choices[0].message.content or ""
+            try:
+                return _extract_json_block(raw), model_name
+            except json.JSONDecodeError as je:
+                # Model produced text with no parseable JSON block.
+                # Log a snippet + try the next model — different models
+                # respond differently to the same prompt.
+                log.warning(
+                    "rewrite_listing: model %s returned unparseable "
+                    "response (len=%d, snippet=%r) — trying next: %s",
+                    model_name, len(raw), raw[:200], je,
+                )
+                last_err = je
+                continue
+        except json.JSONDecodeError:
+            # Model returned non-JSON text despite json_object mode.
+            # Bubble up — this is a prompt/parsing issue, not a model
+            # capability issue, so trying the next model won't help.
+            raise
+        except Exception as e:
+            msg = str(e)
+            # Retryable: 400 (json_validate_failed / prompt issues that
+            # a different model might tolerate), 404 (model decommissioned
+            # — try the next), 429 (rate limit — burn the rest of the
+            # chain since they're independent quotas), 5xx (transient
+            # server). Non-retryable: 401/403 (auth) — that's the same
+            # api key against every model, so short-circuit.
+            retryable_markers = (
+                "json_validate_failed", "model_not_found",
+                "400", "404", "429", "500", "502", "503", "504",
+            )
+            auth_markers = ("401", "403", "invalid_api_key", "authentication")
+            if any(m in msg for m in auth_markers):
+                raise
+            if any(m in msg for m in retryable_markers):
+                log.warning(
+                    "rewrite_listing: model %s failed (%s) — trying next: %s",
+                    model_name, type(e).__name__, msg[:200],
+                )
+                last_err = e
+                continue
+            # Unknown error class — try next anyway rather than crashing
+            # a user-visible feature. Log at warning so it shows up.
+            log.warning(
+                "rewrite_listing: model %s failed with unclassified "
+                "error (%s) — trying next: %s",
+                model_name, type(e).__name__, msg[:200],
+            )
+            last_err = e
+            continue
+    # Exhausted the chain — surface the last error to the caller.
+    assert last_err is not None
+    raise last_err
+
+
 async def rewrite_listing(
     title: str,
     bullets: list[str],
@@ -544,47 +702,35 @@ async def rewrite_listing(
     )
     user_prompt = "\n".join(user_prompt_parts)
 
+    messages = [
+        {"role": "system", "content": _REWRITE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
     try:
-        resp = await client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": _REWRITE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.3,
-            # 4000 tokens: a full SA-parity rewrite (200-char title + 5 ×
-            # 350-char bullets + 1500-char description + 240-byte backend
-            # + notes) can hit ~2500-3000 tokens. Prior 2000 cap truncated
-            # the description on rich outputs.
-            max_tokens=4000,
-        )
-        raw = resp.choices[0].message.content or "{}"
-        rewrite = json.loads(raw)
+        rewrite, model_used = await _rewrite_with_fallback(messages)
+        if model_used != MODEL:
+            log.info("rewrite_listing: primary %s failed, %s succeeded",
+                     MODEL, model_used)
     except json.JSONDecodeError as e:
         log.warning("rewrite_listing: LLM returned invalid JSON: %s", e)
         return {"error": "Model returned malformed JSON — try again"}
     except Exception as e:
-        log.exception("rewrite_listing failed")
-        return {"error": str(e)}
+        log.exception("rewrite_listing failed across all fallback models")
+        return {"error": (
+            "AI rewriter is temporarily unavailable "
+            "(all Groq models returned errors). Try again in a minute."
+        )}
 
     richness = check_rewrite_richness(rewrite)
     if richness["needs_expansion"]:
         try:
             expansion = _build_expansion_instruction(richness["needs_expansion"])
-            resp2 = await client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": _REWRITE_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                    {"role": "assistant", "content": json.dumps(rewrite)},
-                    {"role": "user", "content": expansion},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.3,
-                max_tokens=4000,
-            )
-            expanded = json.loads(resp2.choices[0].message.content or "{}")
+            expanded, _ = await _rewrite_with_fallback([
+                {"role": "system", "content": _REWRITE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+                {"role": "assistant", "content": json.dumps(rewrite)},
+                {"role": "user", "content": expansion},
+            ])
             # Merge: prefer expanded fields ONLY if they're actually longer
             # than the first pass (a bad model can return shorter content
             # on the retry — don't regress).

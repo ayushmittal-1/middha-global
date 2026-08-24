@@ -698,12 +698,22 @@ async def forecasting_restock(user: dict = Depends(protect)):
             or 0
         )
 
-        # Stock value = (available + reserved + inbound + sent_to_fba) × unit landed cost.
+        # Stock value = every unit the seller has capital tied up in ×
+        # landed cost. Same disjoint-sub-bucket composition as stock_forward
+        # below — raw `reserved` overlaps with `fc_transfer` on paper, so
+        # sum the sub-buckets to be safe.
         cogs = cogs_by_sku.get(sku) or {}
         unit_cost = float(cogs.get("unit_cost") or 0)
         unit_ship = float(cogs.get("inbound_shipping_per_unit") or 0)
         landed_cost = unit_cost + unit_ship
-        stock_units = available + reserved + sent_to_fba + inbound_working
+        stock_units = (
+            available
+            + reserved_customer_order
+            + reserved_fc_processing
+            + fc_transfer
+            + sent_to_fba
+            + inbound_working
+        )
         stock_value = round(stock_units * landed_cost, 2) if landed_cost > 0 else 0.0
 
         # Missed profit estimate — count stockout-corrected days in the
@@ -726,7 +736,22 @@ async def forecasting_restock(user: dict = Depends(protect)):
         # cached values so we don't clobber a legitimate horizon-based
         # forecast with zeros.
         wv = weighted_by_sku.get(sku, 0.0)
-        stock_forward = available + reserved + sent_to_fba + inbound_working
+        # stock_forward = everything the seller has that will fulfill demand
+        # over the coming period. Composed from the split sub-buckets rather
+        # than raw `reserved` because Amazon's `reservedQuantity` is a
+        # composite that INCLUDES pendingTransshipment (== fc_transfer);
+        # adding raw `reserved + fc_transfer` would double-count those units
+        # if ingest ever changes to store the raw composite. Sub-buckets
+        # (customer_order + fc_processing + fc_transfer) are guaranteed
+        # disjoint, so summing them + the inbound legs is safe.
+        stock_forward = (
+            available
+            + reserved_customer_order
+            + reserved_fc_processing
+            + fc_transfer
+            + sent_to_fba
+            + inbound_working
+        )
         days_of_cover_val = reorder.get("days_of_cover")
         stockout_date_iso = reorder.get("stockout_date")
         reorder_by_date_air_iso = reorder.get("reorder_by_date_air")
@@ -828,6 +853,7 @@ async def forecasting_restock(user: dict = Depends(protect)):
             "reserved_fc_processing": reserved_fc_processing,
             "sent_to_fba": sent_to_fba,
             "inbound_working": inbound_working,
+            "fc_transfer": fc_transfer,
             "unfulfillable": unfulfillable,
             "awd_inbound": int(awd_inbound_by_sku.get(sku, 0)),
             "inbound": reorder.get("inbound", 0),
@@ -891,24 +917,26 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
     since = datetime.now(timezone.utc) - _td(days=90)
     raw_history = await get_sales_daily(sku=sku, since=since)
 
-    # Live model refresh: recompute the forecast on the current
-    # 30-day training window so the chart's p50/p90 reflects the model
-    # we're actually using. Also recompute the reorder-side numbers
-    # (days_of_cover, stockout_date, ship-by dates) off the same
-    # weighted velocity that drives the restock table's Orders/day,
-    # so this modal and the row underneath tell one consistent story.
+    # Live model refresh: recompute the forecast on the same 540-day
+    # window the nightly cache job uses, so the top-card method label
+    # and the accuracy card's "★ best" model agree. Using 30 days here
+    # stunts _forecast_one below MIN_HISTORY_DAYS and forces every SKU
+    # into naive regardless of what the picker actually chose.
     now_utc = datetime.now(timezone.utc)
-    train_since = now_utc - _td(days=30)
+    train_since = now_utc - _td(days=540)
     train_rows = await get_sales_daily(sku=sku, since=train_since)
     try:
         fresh = _forecast_one(train_rows, horizon=90, today=now_utc)
         live_forecast = fresh.get("forecast") or c.get("forecast")
-        live_method = fresh.get("method") or c.get("method")
         live_drivers = fresh.get("drivers") or c.get("drivers")
     except Exception:
         live_forecast = c.get("forecast")
-        live_method = c.get("method")
         live_drivers = c.get("drivers")
+    # Method label always comes from the cache — the picker chose that
+    # model based on a full 30-day backtest across prophet/naive/lgbm/
+    # ensemble. `_forecast_one` above only knows prophet/naive, so
+    # trusting its output would mislabel every LGBM or ensemble winner.
+    live_method = c.get("method")
 
     # Weighted velocity from the last 180 days of Aurora sales — same
     # blend the restock endpoint uses.
@@ -930,6 +958,8 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
         inv_row.get("fulfillable", reorder.get("available", reorder.get("on_hand", 0))) or 0
     )
     reserved = int(inv_row.get("reserved", reorder.get("reserved", 0)) or 0)
+    reserved_customer_order = int(inv_row.get("reserved_customer_order") or 0)
+    reserved_fc_processing = int(inv_row.get("reserved_fc_processing") or 0)
     sent_to_fba = int(inv_row.get("inbound_shipped", reorder.get("sent_to_fba", 0)) or 0)
     inbound_working = int(inv_row.get("inbound_working", reorder.get("inbound_working", 0)) or 0)
     unfulfillable = int(inv_row.get("unfulfillable", reorder.get("unfulfillable", 0)) or 0)
@@ -941,7 +971,20 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
         or reorder.get("on_hand", 0)
         or 0
     )
-    stock_forward = available + reserved + sent_to_fba + inbound_working
+    # stock_forward sums the disjoint sub-buckets of `reserved` explicitly
+    # rather than raw `reserved + fc_transfer` — Amazon's reservedQuantity
+    # is a composite of (customer_order + fc_processing + pendingTransshipment),
+    # and pendingTransshipment == fc_transfer. Using the split fields
+    # prevents double-counting if ingest ever starts storing the raw
+    # composite in `reserved`.
+    stock_forward = (
+        available
+        + reserved_customer_order
+        + reserved_fc_processing
+        + fc_transfer
+        + sent_to_fba
+        + inbound_working
+    )
     today_date = now_utc.date()
     if wv > 0 and stock_forward > 0:
         reorder["days_of_cover"] = round(stock_forward / wv, 1)
@@ -960,6 +1003,7 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
     reorder["reserved"] = reserved
     reorder["sent_to_fba"] = sent_to_fba
     reorder["inbound_working"] = inbound_working
+    reorder["fc_transfer"] = fc_transfer
     reorder["avg_daily_demand"] = round(wv, 2) if wv > 0 else reorder.get("avg_daily_demand", 0)
 
     # Densify the array on the frontend; here we just emit the (date,

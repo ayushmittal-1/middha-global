@@ -2011,6 +2011,7 @@
               <th class="num" title="Units set aside by Amazon — not sellable right now.&#10;&#10;Bifurcation shown as 'total (cust + fc)':&#10;  cust = pendingCustomerOrder → allocated to open orders that haven't shipped yet&#10;  fc   = fcProcessing → at an FC being moved/inspected&#10;&#10;(pendingTransshipment / units in transit between FCs is counted in On hand, not here.)">Reserved</th>
               <th class="num" title="Units Amazon has received into the network but not yet checked into the destination FC (inboundShippedQuantity)">Sent to FBA</th>
               <th class="num" title="Units on an inbound shipment plan you've created but not yet shipped (inboundWorkingQuantity)">Inbound working</th>
+              <th class="num" title="Units physically at Amazon but currently in transit between fulfillment centers (pendingTransshipment). Not sellable during the transfer but included in days-of-cover since they usually return to sellable within days.">FC transfer</th>
               <th class="num" title="Units on in-flight shipments to Amazon Warehousing & Distribution (AWD bulk storage). Not sellable until replenished to FBA — excluded from days-of-cover math.">AWD inbound</th>
               <th class="num" title="Damaged or customer-returned units currently unsellable">Unfulfillable</th>
               <!-- <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th> -->
@@ -3782,6 +3783,7 @@
           })()}</td>
           <td class="num">${fmtRestockNum(row.sent_to_fba ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.inbound_working ?? 0)}</td>
+          <td class="num">${fmtRestockNum(row.fc_transfer ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.awd_inbound ?? 0)}</td>
           <td class="num">${fmtRestockNum(row.unfulfillable ?? 0)}</td>
           <!-- <td class="num" title="${inboundTip}">${fmtRestockNum(row.inbound ?? 0)}</td> -->
@@ -5542,6 +5544,7 @@
           <div><span>Reserved</span><span>${reorder.reserved ?? 0}</span></div>
           <div><span>Sent to FBA</span><span>${reorder.sent_to_fba ?? 0}</span></div>
           <div><span>Inbound working</span><span>${reorder.inbound_working ?? 0}</span></div>
+          <div title="Units at Amazon currently being transferred between fulfillment centers. Not sellable during the move, but included in days-of-cover since they typically flip back to sellable within a few days."><span>FC transfer</span><span>${reorder.fc_transfer ?? 0}</span></div>
           <div><span>Unfulfillable</span><span>${reorder.unfulfillable ?? 0}</span></div>
           <div><span>Inbound (outstanding)</span><span>${reorder.inbound ?? 0}</span></div>
           <div><span>Days of cover</span><span>${reorder.days_of_cover ?? '—'}</span></div>
@@ -5567,14 +5570,18 @@
             let trainStart = bt.train_start || '?';
             let trainEnd = bt.train_end;
             const MODEL_LABELS = {
-              naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
+              naive: 'Naive (velocity)', prophet: 'Prophet', lgbm: 'LightGBM',
+              ensemble: 'Ensemble',
+              deepar: 'DeepAR', tft: 'TFT',
               xgb: 'XGBoost', catboost: 'CatBoost', chronos: 'Chronos',
             };
             let bestKey = null;
             if (compare) {
               const modelsObj = compare.models || {
                 naive: compare.naive, prophet: compare.prophet,
-                lgbm: compare.lgbm, xgb: compare.xgb,
+                lgbm: compare.lgbm, ensemble: compare.ensemble,
+                deepar: compare.deepar, tft: compare.tft,
+                xgb: compare.xgb,
                 catboost: compare.catboost, chronos: compare.chronos,
               };
               const entries = Object.entries(modelsObj)
@@ -5590,7 +5597,7 @@
             }
             const biasSign = m.bias > 0 ? 'over-predicting' : m.bias < 0 ? 'under-predicting' : 'unbiased';
             const mapeStr = m.mape_pct == null ? '—' : `${m.mape_pct}%`;
-            const methodSuffix = bestKey ? ' <span style="font-size:10px;color:#059669;">★ best of ' + Object.keys(compare.models || {naive:1,prophet:1,lgbm:1,xgb:1,catboost:1,chronos:1}).length + '</span>' : '';
+            const methodSuffix = bestKey ? ' <span style="font-size:10px;color:#059669;">★ best of ' + Object.keys(compare.models || {naive:1,prophet:1,lgbm:1,ensemble:1,deepar:1,tft:1,xgb:1,catboost:1,chronos:1}).length + '</span>' : '';
             return `
               <div class="sku-backtest" style="margin-top:12px;padding:10px;border:1px solid #e5e7eb;border-radius:6px;background:#f9fafb;">
                 <div style="font-weight:600;font-size:13px;margin-bottom:6px;">Prediction accuracy (holdout ${escapeHtml(holdoutStart)} → ${escapeHtml(holdoutEnd)})</div>
@@ -5617,9 +5624,12 @@
             // If a new model shows up in compare.models that isn't listed
             // here, it's rendered with default label + grey.
             const MODEL_META = {
-              naive:    { label: 'Naive',    color: '#8b5cf6' },
+              naive:    { label: 'Naive (velocity)', color: '#8b5cf6' },
               prophet:  { label: 'Prophet',  color: '#f59e0b' },
               lgbm:     { label: 'LightGBM', color: '#10b981' },
+              ensemble: { label: 'Ensemble', color: '#dc2626' },
+              deepar:   { label: 'DeepAR',   color: '#7c3aed' },
+              tft:      { label: 'TFT',      color: '#db2777' },
               xgb:      { label: 'XGBoost',  color: '#3b82f6' },
               catboost: { label: 'CatBoost', color: '#ec4899' },
               chronos:  { label: 'Chronos',  color: '#0ea5e9' },
@@ -5627,7 +5637,9 @@
             const modelsObj = compare.models || {
               // Back-compat with old backends that only return the flat keys.
               naive: compare.naive, prophet: compare.prophet,
-              lgbm: compare.lgbm, xgb: compare.xgb,
+              lgbm: compare.lgbm, ensemble: compare.ensemble,
+              deepar: compare.deepar, tft: compare.tft,
+              xgb: compare.xgb,
               catboost: compare.catboost, chronos: compare.chronos,
             };
             const rows = Object.entries(modelsObj)
@@ -5745,16 +5757,21 @@
         // Dynamic per-model chart overlays. Same MODEL_META palette as the
         // comparison card above, so table color and chart line color match.
         const CHART_MODEL_META = {
-          naive:    { label: 'Naive',    color: '#8b5cf6' },
+          naive:    { label: 'Naive (velocity)', color: '#8b5cf6' },
           prophet:  { label: 'Prophet',  color: '#f59e0b' },
           lgbm:     { label: 'LightGBM', color: '#10b981' },
+          ensemble: { label: 'Ensemble', color: '#dc2626' },
+          deepar:   { label: 'DeepAR',   color: '#7c3aed' },
+          tft:      { label: 'TFT',      color: '#db2777' },
           xgb:      { label: 'XGBoost',  color: '#3b82f6' },
           catboost: { label: 'CatBoost', color: '#ec4899' },
           chronos:  { label: 'Chronos',  color: '#0ea5e9' },
         };
         const chartModelsObj = compare && (compare.models || {
           naive: compare.naive, prophet: compare.prophet,
-          lgbm: compare.lgbm, xgb: compare.xgb,
+          lgbm: compare.lgbm, ensemble: compare.ensemble,
+          deepar: compare.deepar, tft: compare.tft,
+          xgb: compare.xgb,
           catboost: compare.catboost, chronos: compare.chronos,
         });
         const compareOverlays = chartModelsObj
