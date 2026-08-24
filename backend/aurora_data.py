@@ -587,15 +587,18 @@ async def enrich_product_fees_from_asin_siblings(
 def returned_qty_for_sku(physical: int, refunded: int) -> int:
     """Units to treat as returned for profitability.
 
-    Physical FBA return rows alone are not enough — Seller Central can still
-    show Payment complete with no refund (sticky/mis-attributed report rows).
-    Require a Finances refund; then take max(physical, refunded) so multi-LPN
-    returns aren't under-counted.
+    Count physical FBA returns and/or Finances refunds (returnless refunds
+    have refund qty with no customerReturns row). When both exist for the
+    same SKU, take max so multi-LPN physical returns aren't under-counted
+    and the 20% return-processing fee is not double-charged.
+
+    Do not require a refund to count a physical return — Seller Central's
+    FBA Customer Returns report (e.g. "Unit returned to inventory") is the
+    source of truth for returned units even when Finances refund sync has
+    not yet attached ``refunds[]`` to the order.
     """
     physical = int(physical or 0)
     refunded = int(refunded or 0)
-    if refunded <= 0:
-        return 0
     return max(physical, refunded)
 
 
@@ -606,11 +609,9 @@ async def fba_returns_by_sku(
 ) -> dict[str, dict]:
     """Per-SKU returned/refunded units for orders PURCHASED in [start, end].
 
-    Matches the Aurora Returned Orders tab for refunded sales:
+    Matches Amazon / Aurora Returned Orders activity:
+      - physical FBA returns (`customerReturns` / hasCustomerReturn)
       - Finances refunds (`refunds` / hasRefund), including returnless refunds
-      - physical FBA returns (`customerReturns`) only when a refund also exists
-        for that SKU (Seller Central "Payment complete" with no refund must
-        not count as returned — sticky / mis-attributed FBA report rows)
 
     Bound by `purchaseDate` (same sale-window as the rest of Profitability),
     not return/refund date. For an order that has BOTH a physical return and a
