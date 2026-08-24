@@ -4265,7 +4265,7 @@
       {
         id: 'storage',
         label: 'Storage',
-        title: 'FBA monthly storage — Seller Central Monthly Storage Fees report (per ASIN), or Finances FBAStorageFee per SKU when the report is unavailable. Never BLENDED.',
+        title: 'FBA monthly storage — Seller Central Monthly Storage Fees report (per ASIN) when published. For the current month before Amazon publishes that report, uses Finances FBAStorageFee posts in the date filter (Payments). Never BLENDED; $0 when neither source has data.',
         num: true,
         defaultVisible: false,
         cell: (r) => `<td class="num">${profitMoney(r.storage_fee)}</td>`,

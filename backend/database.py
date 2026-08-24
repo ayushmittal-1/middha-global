@@ -88,6 +88,11 @@ def _reimbursements_cache():
     return _db().reimbursementsCache
 
 
+def _finances_fee_cache():
+    """Complete Finances walks (Low Inv / window storage totals) for closed ranges."""
+    return _db().financesFeeCache
+
+
 def _product_settings():
     return _db().productSettings
 
@@ -133,6 +138,9 @@ async def init_db():
         [("userId", 1)], unique=True
     )
     await _reimbursements_cache().create_index(
+        [("userId", 1)], unique=True
+    )
+    await _finances_fee_cache().create_index(
         [("userId", 1)], unique=True
     )
     await _product_settings().create_index(
@@ -400,11 +408,13 @@ def _fresh_empty_checked_months(
 
 
 async def get_storage_cache(max_age_hours: int = 24) -> dict | None:
-    """Return cached per-SKU monthly storage fee map or None if stale/missing.
+    """Return cached per-SKU monthly storage fee map or None if missing.
 
-    ``months_covered`` is effective coverage for the current user only:
-    months with real fee rows, plus months empty-checked within 6h.
-    Phantom monthsCovered entries from older builds are ignored (and healed).
+    Closed ``month_of_charge`` rows are immutable once Amazon publishes them,
+    so fee months stay usable past ``max_age_hours``. Only the whole-doc
+    freshness gate applies when there are *no* fee months yet (forces a
+    retry). Empty-check stamps still expire after 6h so unpublished current
+    months keep retrying.
     """
     from amazon_sp import storage_months_with_fees
 
@@ -419,11 +429,13 @@ async def get_storage_cache(max_age_hours: int = 24) -> dict | None:
     if updated.tzinfo is None:
         updated = updated.replace(tzinfo=timezone.utc)
     age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
-    if age_hours > max_age_hours:
-        return None
 
     per_sku = doc.get("perSkuMonthly", {}) or {}
     fee_months = storage_months_with_fees(per_sku)
+    # No stored months yet and doc is stale → treat as miss so we re-fetch.
+    if not fee_months and age_hours > max_age_hours:
+        return None
+
     claimed = set(_normalize_month_keys(doc.get("monthsCovered", [])))
     empty_checked = _fresh_empty_checked_months(doc.get("emptyCheckedAt") or {})
     # Never treat a phantom monthsCovered entry as covered.
@@ -651,33 +663,124 @@ async def get_aged_surcharge_charges_cache(
     start_iso: str,
     end_iso: str,
     max_age_hours: int = 24,
+    months: list[str] | None = None,
 ) -> dict | None:
     """Cached actual AIS charged amounts for a profitability window.
 
-    Invalidates when the window changes or the doc is older than TTL —
-    different date ranges must not reuse each other's charge totals.
+    schemaVersion ≥ 4 stores many windows under ``windows`` so viewing August
+    no longer wipes a previously warmed March cache (the v3 single-slot doc
+    caused historical months to re-fetch, hit Reports 429, and show $0).
+
+    Also stores ``byMonth`` (Event Month → perSku). When the exact window
+    key misses, we merge byMonth for ``months`` so March 1–31 and slight
+    end-time variants still hit the same Seller Central CSV totals.
     """
     user_id = _user_oid()
     doc = await _aged_surcharge_charges_cache().find_one({"userId": user_id})
     if not doc:
         return None
-    # v3 = marketplace-TZ months + reuse validated by snapshot Event Month.
-    if int(doc.get("schemaVersion") or 1) < 3:
+
+    def _fresh(updated, *, denied: bool, ttl_hours: int) -> bool:
+        if not updated:
+            return False
+        if getattr(updated, "tzinfo", None) is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
+        if denied and age_hours > 1:
+            return False
+        return age_hours <= ttl_hours
+
+    def _ttl_for_end(end_iso_val: str) -> int:
+        ttl = max_age_hours
+        try:
+            end_dt = datetime.fromisoformat(str(end_iso_val).replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            if end_dt < datetime.now(timezone.utc) - timedelta(days=3):
+                ttl = max(ttl, 24 * 45)
+        except Exception:
+            pass
+        return ttl
+
+    schema = int(doc.get("schemaVersion") or 1)
+    window_key = _fee_window_cache_key(start_iso, end_iso)
+
+    if schema >= 4:
+        entry = (doc.get("windows") or {}).get(window_key)
+        if isinstance(entry, dict) and entry.get("startIso") == start_iso and entry.get("endIso") == end_iso:
+            ttl = _ttl_for_end(end_iso)
+            if _fresh(entry.get("updatedAt"), denied=bool(entry.get("accessDenied")), ttl_hours=ttl):
+                updated = entry["updatedAt"]
+                if getattr(updated, "tzinfo", None) is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                return {
+                    "per_sku": entry.get("perSku", {}) or {},
+                    "updated_at": updated.isoformat(),
+                    "access_denied": bool(entry.get("accessDenied")),
+                }
+
+        # Fallback: merge Event-Month buckets (survives window-key drift).
+        wanted = [m for m in (months or []) if re.match(r"^\d{4}-\d{2}$", str(m))]
+        by_month = doc.get("byMonth") or {}
+        if wanted and all(str(m) in by_month for m in wanted):
+            merged: dict = {}
+            newest = None
+            for m in wanted:
+                bucket = by_month.get(str(m)) or {}
+                updated = bucket.get("updatedAt")
+                ttl = max(max_age_hours, 24 * 45)
+                if not _fresh(updated, denied=bool(bucket.get("accessDenied")), ttl_hours=ttl):
+                    merged = {}
+                    break
+                if newest is None or (updated and updated > newest):
+                    newest = updated
+                for sku, row in (bucket.get("perSku") or {}).items():
+                    if not isinstance(row, dict):
+                        fee = float(row or 0)
+                        if fee <= 0:
+                            continue
+                        dest = merged.setdefault(
+                            sku, {"charged_total": 0.0, "qty_charged": 0, "asin": None},
+                        )
+                        dest["charged_total"] = float(dest["charged_total"]) + fee
+                        continue
+                    dest = merged.setdefault(
+                        sku,
+                        {
+                            "charged_total": 0.0,
+                            "qty_charged": 0,
+                            "asin": row.get("asin"),
+                        },
+                    )
+                    dest["charged_total"] = float(dest["charged_total"]) + float(
+                        row.get("charged_total") or 0
+                    )
+                    dest["qty_charged"] = int(dest.get("qty_charged") or 0) + int(
+                        row.get("qty_charged") or 0
+                    )
+                    if row.get("asin") and not dest.get("asin"):
+                        dest["asin"] = row["asin"]
+            if merged and newest is not None:
+                if getattr(newest, "tzinfo", None) is None:
+                    newest = newest.replace(tzinfo=timezone.utc)
+                return {
+                    "per_sku": merged,
+                    "updated_at": newest.isoformat(),
+                    "access_denied": False,
+                }
+        return None
+
+    # Legacy v3 single-slot doc — only hit when the window still matches.
+    if schema < 3:
         return None
     if doc.get("startIso") != start_iso or doc.get("endIso") != end_iso:
         return None
-    updated = doc.get("updatedAt")
-    if not updated:
+    ttl = _ttl_for_end(end_iso)
+    if not _fresh(doc.get("updatedAt"), denied=bool(doc.get("accessDenied")), ttl_hours=ttl):
         return None
-    if updated.tzinfo is None:
+    updated = doc["updatedAt"]
+    if getattr(updated, "tzinfo", None) is None:
         updated = updated.replace(tzinfo=timezone.utc)
-    age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
-    if age_hours > max_age_hours:
-        return None
-    # Poisoned 403 / empty denial — retry within 1h so a transient denial
-    # does not blank Storage/Aged/Removal for a full day.
-    if doc.get("accessDenied") and age_hours > 1:
-        return None
     return {
         "per_sku": doc.get("perSku", {}),
         "updated_at": updated.isoformat(),
@@ -685,24 +788,81 @@ async def get_aged_surcharge_charges_cache(
     }
 
 
+def _fee_window_cache_key(start_iso: str, end_iso: str) -> str:
+    """Mongo-safe key for a profitability window (no '.' / '$')."""
+    return (
+        str(start_iso).replace(".", "_").replace("$", "_")
+        + "__"
+        + str(end_iso).replace(".", "_").replace("$", "_")
+    )
+
+
+def _closed_window_ttl_hours(end_iso: str, max_age_hours: int = 24) -> int:
+    """Closed windows (end ≥ 3 days ago) keep fee facts for 45 days."""
+    ttl = max_age_hours
+    try:
+        end_dt = datetime.fromisoformat(str(end_iso).replace("Z", "+00:00"))
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        if end_dt < datetime.now(timezone.utc) - timedelta(days=3):
+            ttl = max(ttl, 24 * 45)
+    except Exception:
+        pass
+    return ttl
+
+
+def _is_closed_fee_window(end_iso: str, *, grace_days: int = 3) -> bool:
+    """True when the window ended long enough ago that late posts are rare."""
+    try:
+        end_dt = datetime.fromisoformat(str(end_iso).replace("Z", "+00:00"))
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        return end_dt < datetime.now(timezone.utc) - timedelta(days=grace_days)
+    except Exception:
+        return False
+
+
 async def put_aged_surcharge_charges_cache(
     per_sku: dict,
     start_iso: str,
     end_iso: str,
     access_denied: bool = False,
+    months: list[str] | None = None,
 ) -> None:
+    """Upsert one window's AIS charges without deleting other months' caches."""
     user_id = _user_oid()
+    now = datetime.now(timezone.utc)
+    window_key = _fee_window_cache_key(start_iso, end_iso)
+    entry = {
+        "perSku": per_sku,
+        "startIso": start_iso,
+        "endIso": end_iso,
+        "accessDenied": access_denied,
+        "updatedAt": now,
+    }
+    sets: dict = {
+        f"windows.{window_key}": entry,
+        "schemaVersion": 4,
+        "updatedAt": now,
+        "perSku": per_sku,
+        "startIso": start_iso,
+        "endIso": end_iso,
+        "accessDenied": access_denied,
+    }
+    # Also index by Event Month so slight window-key drift still resolves.
+    # Only for single-month windows — a multi-month merge must not be stored
+    # under each month (byMonth fallback would double-count on read).
+    if months and len([m for m in months if re.match(r"^\d{4}-\d{2}$", str(m))]) == 1:
+        key = str(next(m for m in months if re.match(r"^\d{4}-\d{2}$", str(m)))).strip()
+        sets[f"byMonth.{key}"] = {
+            "perSku": per_sku,
+            "accessDenied": access_denied,
+            "updatedAt": now,
+        }
     await _aged_surcharge_charges_cache().update_one(
         {"userId": user_id},
         {
-            "$set": {
-                "perSku": per_sku,
-                "startIso": start_iso,
-                "endIso": end_iso,
-                "accessDenied": access_denied,
-                "schemaVersion": 3,
-                "updatedAt": datetime.now(timezone.utc),
-            },
+            "$set": sets,
             "$setOnInsert": {"userId": user_id},
         },
         upsert=True,
@@ -716,28 +876,65 @@ async def get_removal_fees_cache(
 ) -> dict | None:
     """Cached Removal Order Detail fees for one profitability window.
 
-    Different start/end must not reuse each other — Amazon is only called for
-    the selected filter, and the cache is keyed to that exact window.
+    schemaVersion ≥ 6 stores many windows under ``windows`` so switching
+    months no longer wipes a previously fetched Removal report (same pattern
+    as aged charges). Closed windows keep a 45-day TTL.
     """
     user_id = _user_oid()
     doc = await _removal_fees_cache().find_one({"userId": user_id})
     if not doc:
         return None
-    if int(doc.get("schemaVersion") or 0) < 5:
+
+    def _fresh(updated, *, denied: bool, ttl_hours: int) -> bool:
+        if not updated:
+            return False
+        if getattr(updated, "tzinfo", None) is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
+        if denied and age_hours > 1:
+            return False
+        return age_hours <= ttl_hours
+
+    schema = int(doc.get("schemaVersion") or 0)
+    window_key = _fee_window_cache_key(start_iso, end_iso)
+    ttl = _closed_window_ttl_hours(end_iso, max_age_hours)
+
+    if schema >= 6:
+        entry = (doc.get("windows") or {}).get(window_key)
+        if not isinstance(entry, dict):
+            return None
+        if entry.get("startIso") != start_iso or entry.get("endIso") != end_iso:
+            return None
+        if not _fresh(
+            entry.get("updatedAt"),
+            denied=bool(entry.get("accessDenied")),
+            ttl_hours=ttl,
+        ):
+            return None
+        updated = entry["updatedAt"]
+        if getattr(updated, "tzinfo", None) is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        return {
+            "per_sku": entry.get("perSku", {}) or {},
+            "updated_at": updated.isoformat(),
+            "access_denied": bool(entry.get("accessDenied")),
+            "report_total": float(entry.get("reportTotal") or 0),
+        }
+
+    # Legacy v5 single-slot — only when the window still matches.
+    if schema < 5:
         return None
     if doc.get("startIso") != start_iso or doc.get("endIso") != end_iso:
         return None
-    updated = doc.get("updatedAt")
-    if not updated:
+    if not _fresh(
+        doc.get("updatedAt"),
+        denied=bool(doc.get("accessDenied")),
+        ttl_hours=ttl,
+    ):
         return None
-    if updated.tzinfo is None:
+    updated = doc["updatedAt"]
+    if getattr(updated, "tzinfo", None) is None:
         updated = updated.replace(tzinfo=timezone.utc)
-    age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
-    if age_hours > max_age_hours:
-        return None
-    # Transient 403 should not blank Removal for a full day.
-    if doc.get("accessDenied") and age_hours > 1:
-        return None
     return {
         "per_sku": doc.get("perSku", {}),
         "updated_at": updated.isoformat(),
@@ -752,24 +949,125 @@ async def put_removal_fees_cache(
     end_iso: str,
     access_denied: bool = False,
 ) -> None:
+    """Upsert one Removal window without deleting other months' caches."""
     user_id = _user_oid()
+    now = datetime.now(timezone.utc)
     report_total = 0.0
     for v in (per_sku or {}).values():
         if isinstance(v, dict):
             report_total += float(v.get("removal_fee") or 0)
         else:
             report_total += float(v or 0)
+    window_key = _fee_window_cache_key(start_iso, end_iso)
+    entry = {
+        "perSku": per_sku or {},
+        "startIso": start_iso,
+        "endIso": end_iso,
+        "accessDenied": access_denied,
+        "reportTotal": round(report_total, 2),
+        "updatedAt": now,
+    }
     await _removal_fees_cache().update_one(
         {"userId": user_id},
         {
             "$set": {
-                "perSku": per_sku,
+                f"windows.{window_key}": entry,
+                "schemaVersion": 6,
+                "updatedAt": now,
+                # Keep legacy fields for older readers / debugging.
+                "perSku": per_sku or {},
                 "startIso": start_iso,
                 "endIso": end_iso,
                 "accessDenied": access_denied,
                 "reportTotal": round(report_total, 2),
-                "schemaVersion": 5,
-                "updatedAt": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {"userId": user_id},
+        },
+        upsert=True,
+    )
+
+
+async def get_finances_fee_cache(
+    start_iso: str,
+    end_iso: str,
+    max_age_hours: int = 24,
+) -> dict | None:
+    """Cached complete Finances walk for a closed profitability window.
+
+    Only stores non-truncated walks. Open/current windows are never served
+    from this cache (late Low Inv posts still arrive). Incomplete stamps are
+    not treated as dollars.
+    """
+    if not _is_closed_fee_window(end_iso):
+        return None
+    user_id = _user_oid()
+    doc = await _finances_fee_cache().find_one({"userId": user_id})
+    if not doc:
+        return None
+    if int(doc.get("schemaVersion") or 0) < 1:
+        return None
+    window_key = _fee_window_cache_key(start_iso, end_iso)
+    entry = (doc.get("windows") or {}).get(window_key)
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("startIso") != start_iso or entry.get("endIso") != end_iso:
+        return None
+    if entry.get("incomplete"):
+        return None
+    updated = entry.get("updatedAt")
+    if not updated:
+        return None
+    if getattr(updated, "tzinfo", None) is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
+    ttl = _closed_window_ttl_hours(end_iso, max_age_hours)
+    if age_hours > ttl:
+        return None
+    return {
+        "by_sku": entry.get("bySku") or {},
+        "unattributed": entry.get("unattributed") or {},
+        "placement_window_total": float(entry.get("placementWindowTotal") or 0),
+        "storage_window_total": float(entry.get("storageWindowTotal") or 0),
+        "updated_at": updated.isoformat(),
+        "pages": int(entry.get("pages") or 0),
+    }
+
+
+async def put_finances_fee_cache(
+    *,
+    start_iso: str,
+    end_iso: str,
+    by_sku: dict,
+    unattributed: dict,
+    placement_window_total: float = 0.0,
+    storage_window_total: float = 0.0,
+    pages: int = 0,
+    incomplete: bool = False,
+) -> None:
+    """Persist a Finances walk. Incomplete/truncated walks are not stored as money."""
+    if incomplete or not _is_closed_fee_window(end_iso):
+        return
+    user_id = _user_oid()
+    now = datetime.now(timezone.utc)
+    window_key = _fee_window_cache_key(start_iso, end_iso)
+    entry = {
+        "startIso": start_iso,
+        "endIso": end_iso,
+        "bySku": by_sku or {},
+        "unattributed": unattributed or {},
+        "placementWindowTotal": round(float(placement_window_total or 0), 2),
+        "storageWindowTotal": round(float(storage_window_total or 0), 2),
+        "pages": int(pages or 0),
+        "incomplete": False,
+        "updatedAt": now,
+    }
+    await _finances_fee_cache().update_one(
+        {"userId": user_id},
+        {
+            "$set": {
+                f"windows.{window_key}": entry,
+                "schemaVersion": 1,
+                "updatedAt": now,
             },
             "$setOnInsert": {"userId": user_id},
         },
@@ -858,6 +1156,7 @@ async def clear_profitability_fee_caches(user_id: ObjectId | None = None) -> dic
         ("removal", _removal_fees_cache()),
         ("placement", _placement_fee_cache()),
         ("reimbursements", _reimbursements_cache()),
+        ("finances", _finances_fee_cache()),
     ):
         result = await coll.delete_many({"userId": oid})
         deleted[name] = int(result.deleted_count or 0)

@@ -922,17 +922,20 @@ def resolve_sku_referral_fba_fuel(
     if line_ref > 0:
         if _line_fulfillment_complete():
             fba, fuel = _line_fba_fuel()
-        elif pf_ok:
+            return line_ref, fba, fuel, "order_lines"
+        if pf_ok:
             fba, fuel = _pf_fba_fuel()
-        elif est_ok:
+            # Referral from lines (mixed prices); FBA/fuel from Products.
+            return line_ref, fba, fuel, "products_fees"
+        if est_ok:
             fba = round(float(est.get("fba", 0.0)) * units, 2)
             fuel = round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
-        elif line_ful > 0:
+            return line_ref, fba, fuel, "fees_api"
+        if line_ful > 0:
             # Last resort: only the lines that have fees (incomplete).
             fba, fuel = split_bundled_fulfillment_for_units(line_ful, units)
-        else:
-            fba, fuel = 0.0, 0.0
-        return line_ref, fba, fuel, "order_lines"
+            return line_ref, fba, fuel, "order_lines"
+        return line_ref, 0.0, 0.0, "order_lines"
 
     if pf_ok:
         listing_price = float(pf.get("listing_price") or 0)
@@ -1239,14 +1242,14 @@ async def compute_profitability_data(
     23:59:59Z."""
     from campaigns import get_ad_spend_for_range
     from database import (
-        get_aged_inventory_cache,
         get_aged_surcharge_charges_cache,
+        get_finances_fee_cache,
         get_placement_fee_cache,
         get_removal_fees_cache,
         get_reimbursements_cache,
         get_storage_cache,
-        put_aged_inventory_cache,
         put_aged_surcharge_charges_cache,
+        put_finances_fee_cache,
         put_placement_fee_cache,
         put_removal_fees_cache,
         put_reimbursements_cache,
@@ -1482,6 +1485,9 @@ async def compute_profitability_data(
     product_fee_fallback: dict[str, dict] = {}
     fin_by_sku: dict[str, dict] = {}
     unattributed_fees = amazon_sp._empty_fee_bucket()
+    # True when Finances timed out or hit max_pages with NextToken left —
+    # Low Inv / Finances-storage fallback must stay $0 (never paint partial).
+    finances_incomplete = False
     placement_avg_per_unit: dict[str, float] | None = None
     placement_avg_per_asin: dict[str, float] = {}
     placement_charges_by_sku: dict[str, float] = {}
@@ -1576,12 +1582,12 @@ async def compute_profitability_data(
                     storage_by_asin_month, fetched,
                 )
             found = list(found_months or [])
-            # Only empty-check when Amazon returned NO month rows at all.
-            # Neighbor-month responses (asked July, got June) must NOT mark
-            # July covered — otherwise Storage stays $0 for hours for every
-            # account. Short empty-check only for true empty reports.
+            # Empty-check ONLY when Amazon returned literally no rows.
+            # Neighbor-month responses (asked August, got June) must NOT mark
+            # August empty — the Monthly Storage Fees report publishes after
+            # month close and should retry on the next load.
             empty_months = (
-                list(missing_months) if not found else []
+                list(missing_months) if not found and not fetched else []
             )
             try:
                 merged = await merge_storage_cache(
@@ -1602,17 +1608,18 @@ async def compute_profitability_data(
             still_missing = [m for m in missing_months if m not in found]
             if still_missing:
                 warnings.append(
-                    f"Storage: no Monthly Storage Fees report rows yet for "
-                    f"{', '.join(still_missing)} — using Finances FBAStorageFee "
-                    "per SKU when SellerSKU is present (not BLENDED); report "
-                    "retry on next load."
+                    f"Storage: Monthly Storage Fees report has no "
+                    f"month_of_charge rows for {', '.join(still_missing)} yet "
+                    f"(normal for the current month before Amazon publishes it). "
+                    f"Using Finances FBAStorageFee posts in this date filter when "
+                    f"available; otherwise $0."
                 )
         except Exception as e:
             warnings.append(_sp_report_warning("Storage", e))
 
     async def _load_finances():
         nonlocal fin_by_sku, unattributed_fees, fin_placement_window_total
-        nonlocal fin_storage_window_total
+        nonlocal fin_storage_window_total, finances_incomplete
         # Finances fees (low inv, placement settlements) often post weeks
         # after the related sale/inbound event — look back 45 days before
         # the window for those. But refunds must be bounded to the actual
@@ -1624,6 +1631,40 @@ async def compute_profitability_data(
         # lookback).
         fin_posted_after = utc_instant_to_iso_z(start_dt - timedelta(days=45))
         refund_posted_after = utc_instant_to_iso_z(start_dt)
+
+        def _zero_partial_finances_fee_buckets() -> None:
+            """Drop Low Inv + Finances storage so partial walks never invent $."""
+            nonlocal fin_storage_window_total
+            for bucket in fin_by_sku.values():
+                if isinstance(bucket, dict):
+                    bucket["low_inventory"] = 0.0
+                    bucket["storage"] = 0.0
+            unattributed_fees["low_inventory"] = 0.0
+            unattributed_fees["storage"] = 0.0
+            fin_storage_window_total = 0.0
+
+        # Closed windows: reuse a prior complete Finances walk (Low Inv does
+        # not change once posted). Open/current months always re-walk.
+        try:
+            fin_cached = await get_finances_fee_cache(
+                charges_start_iso, charges_end_iso, max_age_hours=24,
+            )
+            if fin_cached:
+                fin_by_sku = fin_cached.get("by_sku") or {}
+                unattributed_fees = (
+                    fin_cached.get("unattributed") or amazon_sp._empty_fee_bucket()
+                )
+                fin_placement_window_total = float(
+                    fin_cached.get("placement_window_total") or 0
+                )
+                fin_storage_window_total = float(
+                    fin_cached.get("storage_window_total") or 0
+                )
+                finances_incomplete = False
+                return
+        except Exception:
+            pass
+
         try:
             # Cap wall time — busy accounts can page Finances for many minutes
             # and used to leave "still loading: finances" forever, which also
@@ -1646,12 +1687,41 @@ async def compute_profitability_data(
             unattributed_fees = fin.get("unattributed") or unattributed_fees
             fin_placement_window_total = float(fin.get("placement_window_total") or 0)
             fin_storage_window_total = float(fin.get("storage_window_total") or 0)
+            if fin.get("truncated"):
+                finances_incomplete = True
+                _zero_partial_finances_fee_buckets()
+                warnings.append(
+                    "Finances API stopped early (page cap on a busy account). "
+                    "Low Inv and Finances storage fallback show $0 — reload later "
+                    "for a complete walk. Inbound placement still uses its "
+                    "exact-window Finances path when needed."
+                )
+            else:
+                try:
+                    await put_finances_fee_cache(
+                        start_iso=charges_start_iso,
+                        end_iso=charges_end_iso,
+                        by_sku=fin_by_sku,
+                        unattributed=unattributed_fees,
+                        placement_window_total=fin_placement_window_total,
+                        storage_window_total=fin_storage_window_total,
+                        pages=int(fin.get("pages") or 0),
+                        incomplete=False,
+                    )
+                except Exception:
+                    pass
         except asyncio.TimeoutError:
+            finances_incomplete = True
+            fin_by_sku = {}
+            unattributed_fees = amazon_sp._empty_fee_bucket()
+            fin_placement_window_total = 0.0
+            fin_storage_window_total = 0.0
             warnings.append(
                 "Finances API timed out after 70s (too many event pages). "
-                "Low-inv / some settlements may be incomplete — reload later."
+                "Low Inv shows $0 — reload later."
             )
         except Exception as e:
+            finances_incomplete = True
             warnings.append(_sp_report_warning("Finances", e))
 
     async def _load_returns():
@@ -1723,14 +1793,18 @@ async def compute_profitability_data(
                 else:
                     # Shared Finances walk uses start-45d + max_pages=40, so on
                     # busy accounts it never reaches the selected month's
-                    # placement posts (asglobal March needs ~70 pages in-window).
-                    # Do an exact-window walk so BLENDED totals aren't $0.
+                    # placement posts (eleet March needs ~70 pages in-window).
+                    # Do an exact-window walk so BLENDED totals aren't $0 —
+                    # and never trust a truncated shared walk's placement total.
                     try:
                         await finances_task
                     except Exception:
                         pass
                     exact_placement_total = 0.0
-                    if fin_placement_window_total <= 0:
+                    trust_shared_placement = (
+                        fin_placement_window_total > 0 and not finances_incomplete
+                    )
+                    if not trust_shared_placement:
                         try:
                             fin_exact = await amazon_sp.get_financial_events(
                                 posted_after=placement_posted_after,
@@ -1746,6 +1820,13 @@ async def compute_profitability_data(
                             placement_meta["finances_exact_window_pages"] = (
                                 fin_exact.get("pages")
                             )
+                            if fin_exact.get("truncated"):
+                                warnings.append(
+                                    "Inbound placement: exact-window Finances "
+                                    "walk still truncated — showing $0 rather "
+                                    "than a partial placement total."
+                                )
+                                exact_placement_total = 0.0
                         except Exception as e:
                             warnings.append(
                                 _sp_report_warning(
@@ -1754,7 +1835,7 @@ async def compute_profitability_data(
                             )
                     use_placement_total = (
                         fin_placement_window_total
-                        if fin_placement_window_total > 0
+                        if trust_shared_placement
                         else exact_placement_total
                     )
                     if use_placement_total > 0:
@@ -1773,7 +1854,7 @@ async def compute_profitability_data(
                     await finances_task
                 except Exception:
                     pass
-                if fin_placement_window_total > 0:
+                if fin_placement_window_total > 0 and not finances_incomplete:
                     placement_blended = True
                     placement_window_total = fin_placement_window_total
                     placement_meta["source"] = "finances_posted_window"
@@ -1788,7 +1869,7 @@ async def compute_profitability_data(
                 await finances_task
             except Exception:
                 pass
-            if fin_placement_window_total > 0:
+            if fin_placement_window_total > 0 and not finances_incomplete:
                 placement_blended = True
                 placement_window_total = fin_placement_window_total
                 placement_meta["source"] = "finances_posted_window"
@@ -1804,39 +1885,14 @@ async def compute_profitability_data(
         _lock_zero_placement("zero_no_window_charges")
 
     async def _load_aged():
-        """Load Aged Inv dollars for Profit.
+        """Load Aged Inv from Seller Central amount-charged only.
 
-        Fast path: warmed charges cache (Seller Central amount-charged).
-        Otherwise seed Aurora Inventory Planning estimates immediately (same
-        source Aurora UI shows) so Aged Inv is never stuck at $0, then warm
-        the charges report in a short try + background task. A hung SP-API
-        report must not leave this loader running for 10+ minutes.
+        Never seed Inventory Planning estimated-ais — those are forward
+        projections and paint wrong dollars on historical months (e.g. March
+        showing today's estimate). Until the charges cache/report is ready,
+        Aged Inv stays $0 while a background warm upgrades the next reload.
         """
         nonlocal aged_charges_by_sku, aged_charges_meta, aged_report_total, aged_charges_trusted
-
-        def _planning_fees_from(per_sku: dict | None) -> dict[str, float]:
-            out: dict[str, float] = {}
-            for psku, b in (per_sku or {}).items():
-                if not isinstance(b, dict):
-                    continue
-                fee = float(b.get("monthly_fee") or 0)
-                if fee > 0:
-                    out[psku] = fee
-            return out
-
-        def _apply_planning(planning: dict[str, float], *, pending: bool) -> None:
-            nonlocal aged_charges_by_sku, aged_charges_meta, aged_report_total, aged_charges_trusted
-            aged_charges_by_sku = dict(planning)
-            aged_charges_trusted = False
-            aged_charges_meta["source"] = (
-                "planning_estimate_pending_charges"
-                if pending
-                else "planning_estimate_fallback"
-            )
-            aged_report_total = round(
-                sum(float(v or 0) for v in aged_charges_by_sku.values()), 2,
-            )
-            aged_charges_meta["report_total"] = aged_report_total
 
         def _apply_charges(charges_per_sku: dict, *, source: str) -> None:
             nonlocal aged_charges_by_sku, aged_charges_meta, aged_report_total, aged_charges_trusted
@@ -1849,20 +1905,13 @@ async def compute_profitability_data(
             )
             aged_charges_meta["report_total"] = aged_report_total
 
-        async def _load_planning_map() -> dict[str, float]:
-            if use_db:
-                try:
-                    aged_from_aurora = await aurora_data.fba_aged_inventory_by_sku(
-                        require_user(),
-                    )
-                    if aged_from_aurora is not None:
-                        return _planning_fees_from(aged_from_aurora)
-                except Exception as e:
-                    warnings.append(_sp_report_warning("Aged inventory (Aurora)", e))
-            aged_cache_meta = await get_aged_inventory_cache(max_age_hours=24)
-            return _planning_fees_from(
-                (aged_cache_meta or {}).get("per_sku") if aged_cache_meta else None,
-            )
+        def _apply_zero(*, source: str) -> None:
+            nonlocal aged_charges_by_sku, aged_charges_meta, aged_report_total, aged_charges_trusted
+            aged_charges_by_sku = {}
+            aged_charges_trusted = False
+            aged_report_total = 0.0
+            aged_charges_meta["source"] = source
+            aged_charges_meta["report_total"] = 0.0
 
         async def _fetch_charges() -> dict:
             report_sem = await _get_report_sem()
@@ -1872,22 +1921,25 @@ async def compute_profitability_data(
                 )
 
         # ── 1) Warmed charges cache ──────────────────────────────────────
+        aged_months = list(storage_months_in_window)
         try:
             charges_cache = await get_aged_surcharge_charges_cache(
-                charges_start_iso, charges_end_iso, max_age_hours=24,
+                charges_start_iso,
+                charges_end_iso,
+                max_age_hours=24,
+                months=aged_months,
             )
             if charges_cache and not charges_cache.get("access_denied"):
                 _apply_charges(charges_cache.get("per_sku") or {}, source="charges_cache")
                 return
+            if charges_cache and charges_cache.get("access_denied"):
+                aged_charges_meta["access_denied"] = True
+                _apply_zero(source="access_denied")
+                return
         except Exception as e:
             warnings.append(_sp_report_warning("Aged inventory charges cache", e))
 
-        # ── 2) Seed Aurora planning NOW (never leave column at $0) ───────
-        planning_aged_by_sku = await _load_planning_map()
-        if planning_aged_by_sku:
-            _apply_planning(planning_aged_by_sku, pending=True)
-
-        # ── 3) Brief try for charges; keep warming in background ─────────
+        # ── 2) Brief try for charges; keep warming in background ─────────
         warm_key = (
             str(user.get("_id")) if isinstance(user, dict) else str(user),
             charges_start_iso,
@@ -1900,7 +1952,10 @@ async def compute_profitability_data(
                     _fetch_charges(), timeout=180.0,
                 )
                 await put_aged_surcharge_charges_cache(
-                    charges_per_sku, charges_start_iso, charges_end_iso,
+                    charges_per_sku,
+                    charges_start_iso,
+                    charges_end_iso,
+                    months=aged_months,
                 )
             except Exception:
                 pass
@@ -1918,12 +1973,19 @@ async def compute_profitability_data(
         try:
             await asyncio.wait_for(asyncio.shield(warm_task), timeout=12.0)
             charges_cache = await get_aged_surcharge_charges_cache(
-                charges_start_iso, charges_end_iso, max_age_hours=24,
+                charges_start_iso,
+                charges_end_iso,
+                max_age_hours=24,
+                months=aged_months,
             )
             if charges_cache and not charges_cache.get("access_denied"):
                 _apply_charges(
                     charges_cache.get("per_sku") or {}, source="charges_report",
                 )
+                return
+            if charges_cache and charges_cache.get("access_denied"):
+                aged_charges_meta["access_denied"] = True
+                _apply_zero(source="access_denied")
                 return
         except asyncio.TimeoutError:
             pass
@@ -1932,21 +1994,21 @@ async def compute_profitability_data(
             if _is_sp_access_denied(e):
                 aged_charges_meta["access_denied"] = True
                 await put_aged_surcharge_charges_cache(
-                    {}, charges_start_iso, charges_end_iso, access_denied=True,
+                    {},
+                    charges_start_iso,
+                    charges_end_iso,
+                    access_denied=True,
+                    months=aged_months,
                 )
+                _apply_zero(source="access_denied")
+                return
 
-        if planning_aged_by_sku:
-            _apply_planning(planning_aged_by_sku, pending=True)
-            warnings.append(
-                "Aged Inv: using Aurora Inventory Planning estimated-ais "
-                "(same as Aurora). Seller Central amount-charged is still "
-                "warming in the background — reload in ~1–2 min to upgrade."
-            )
-            return
-
-        aged_charges_by_sku = None
-        aged_charges_meta["source"] = "finances_fallback"
-        aged_charges_trusted = False
+        # No trusted amount-charged yet — show $0 (never invent estimated-ais).
+        _apply_zero(source="pending_charges")
+        warnings.append(
+            "Aged Inv: Seller Central amount-charged is still warming — "
+            "showing $0 for now. Reload in ~1–2 min once the charges report finishes."
+        )
 
     async def _load_removal():
         # Removal / Disposal: Seller Central Removal Order Detail only
@@ -2059,6 +2121,13 @@ async def compute_profitability_data(
             product_fee_fallback = await aurora_data.product_fee_estimates_by_sku(
                 require_user(), skus,
             )
+            # Eleet/amzn.gr: copy FBA from merchant sibling on same ASIN when
+            # the order SKU has referral but fees.fbaFee=$0 (or no product row).
+            product_fee_fallback = (
+                await aurora_data.enrich_product_fees_from_asin_siblings(
+                    require_user(), sku_data, product_fee_fallback,
+                )
+            )
             fee_skus = data_resolver.skus_needing_fees_api(
                 sku_data, product_fee_fallback,
             )
@@ -2128,21 +2197,21 @@ async def compute_profitability_data(
         "returns": _fire_bg(_load_returns()),
         "placement": _fire_bg(_load_placement()),
         "product fees": _fire_bg(_load_product_fees_and_batch()),
-        # Storage / aged / reimbursements report creates are slow; soft 5s
-        # left them at $0 on first paint even when Seller Central had rows.
+        # Storage / aged / removal / reimbursements report creates are slow;
+        # soft 5s left them at $0 on first paint even when Seller Central had rows.
         "storage": storage_task,
         "aged inventory": aged_task,
+        "removal": _fire_bg(_load_removal()),
         "reimbursements": _fire_bg(_load_reimbursements()),
     }
     soft_tasks: dict[str, asyncio.Task] = {
-        "removal": _fire_bg(_load_removal()),
         "ads": _fire_bg(_load_ads()),
     }
     # Two-tier wait:
-    # 1) Soft reports (removal / ads) get ~5s — keep running in bg.
-    # 2) Critical fee sources (incl. aged charges + storage) await longer
-    #    so first paint is usable when Amazon finishes in time; otherwise
-    #    the shared bg task + FE auto-reload hits the warmed cache.
+    # 1) Soft reports (ads) get ~5s — keep running in bg.
+    # 2) Critical fee sources (incl. aged charges + storage + removal) await
+    #    longer so first paint is usable when Amazon finishes in time;
+    #    otherwise the shared bg task + FE auto-reload hits the warmed cache.
     soft_deadline_s = 5.0
     critical_deadline_s = 90.0
     all_tasks = {**critical_tasks, **soft_tasks}
@@ -2164,7 +2233,10 @@ async def compute_profitability_data(
     if not aged_charges_trusted:
         try:
             charges_cache = await get_aged_surcharge_charges_cache(
-                charges_start_iso, charges_end_iso, max_age_hours=24,
+                charges_start_iso,
+                charges_end_iso,
+                max_age_hours=24,
+                months=list(storage_months_in_window),
             )
             if charges_cache and not charges_cache.get("access_denied"):
                 aged_charges_by_sku = _build_aged_charges(
@@ -2216,18 +2288,91 @@ async def compute_profitability_data(
     )
     # Storage is NEVER BLENDED (only placement / ads / removal / reimbursements
     # are). Primary: Monthly Storage Fees report → per-ASIN → split to sold SKUs.
-    # Fallback when report has no rows for the filter months: Finances
-    # FBAStorageFee attributed by SellerSKU (and unattributed residual on
-    # Totals). Same dollars as Payments → Transactions, per-SKU when Amazon
-    # sends a SKU — never a BLENDED column.
+    # Fallback when report has no rows for the filter months (common for the
+    # in-progress calendar month before Amazon publishes month_of_charge):
+    # Finances FBAStorageFee PostedDate in this exact window — same dollars as
+    # Payments → Transactions. Never invent neighbor-month report totals.
     storage_from_finances = False
-    if float(storage_report_total or 0) <= 0 and fin_storage_window_total > 0:
-        storage_from_finances = True
-        storage_report_total = round(float(fin_storage_window_total), 2)
-        storage_fees_by_asin = {}
-        storage_meta["source"] = "finances_per_sku"
-        storage_meta["window_total"] = storage_report_total
-    elif float(storage_report_total or 0) > 0:
+    if float(storage_report_total or 0) <= 0:
+        try:
+            await finances_task
+        except Exception:
+            pass
+        trust_shared_storage = (
+            fin_storage_window_total > 0 and not finances_incomplete
+        )
+        exact_storage_total = 0.0
+        exact_storage_by_sku: dict[str, dict] = {}
+        exact_storage_unattr: dict = {}
+        if not trust_shared_storage:
+            try:
+                fin_storage_exact = await amazon_sp.get_financial_events(
+                    posted_after=placement_posted_after,
+                    posted_before=placement_posted_before,
+                    paginate=True,
+                    max_pages=200,
+                    storage_posted_after=placement_posted_after,
+                    storage_posted_before=placement_posted_before,
+                )
+                if fin_storage_exact.get("truncated"):
+                    warnings.append(
+                        "Storage: exact-window Finances walk truncated — "
+                        "showing $0 rather than a partial FBAStorageFee total."
+                    )
+                else:
+                    exact_storage_total = float(
+                        fin_storage_exact.get("storage_window_total") or 0
+                    )
+                    exact_storage_by_sku = fin_storage_exact.get("by_sku") or {}
+                    exact_storage_unattr = fin_storage_exact.get("unattributed") or {}
+                    storage_meta["finances_exact_window_pages"] = (
+                        fin_storage_exact.get("pages")
+                    )
+            except Exception as e:
+                warnings.append(
+                    _sp_report_warning("Storage (Finances window)", e)
+                )
+        use_storage_total = (
+            fin_storage_window_total
+            if trust_shared_storage
+            else exact_storage_total
+        )
+        if use_storage_total > 0:
+            storage_from_finances = True
+            storage_report_total = round(float(use_storage_total), 2)
+            storage_fees_by_asin = {}
+            storage_meta["source"] = "finances_per_sku"
+            storage_meta["window_total"] = storage_report_total
+            # Prefer exact-window SKU buckets when the shared Finances walk
+            # was incomplete; otherwise keep the shared per-SKU map.
+            if not trust_shared_storage and exact_storage_by_sku:
+                for sku, bucket in exact_storage_by_sku.items():
+                    if not isinstance(bucket, dict):
+                        continue
+                    amt = float(bucket.get("storage") or 0)
+                    if amt <= 0:
+                        continue
+                    entry = fin_by_sku.setdefault(
+                        sku, amazon_sp._empty_fee_bucket(),
+                    )
+                    entry["storage"] = round(amt, 2)
+                unattr_storage = float(
+                    (exact_storage_unattr or {}).get("storage") or 0
+                )
+                unattributed_fees["storage"] = unattr_storage
+            warnings.append(
+                "Storage: Monthly Storage Fees report not published for this "
+                "month_of_charge yet — using Finances FBAStorageFee posts in "
+                "this date filter (Payments → Transactions)."
+            )
+        else:
+            storage_meta["source"] = (
+                "unavailable_finances_incomplete"
+                if finances_incomplete
+                else "unavailable"
+            )
+            storage_meta["window_total"] = 0.0
+    else:
         storage_meta["source"] = "storage_report"
         storage_meta["window_total"] = round(float(storage_report_total), 2)
 
@@ -2379,38 +2524,24 @@ async def compute_profitability_data(
         ret = _lookup_returns_for_sku(returns_by_sku, sku)
         refunded_referral = float((ret or {}).get("refunded_referral") or 0.0)
         return_processing_fee = round(0.20 * refunded_referral, 2)
-        low_inventory_fee = round(
-            (fin_sku.get("low_inventory", 0.0)
-             + unattr_per_unit["low_inventory"] * bill_units), 2)
+        if finances_incomplete:
+            low_inventory_fee = 0.0
+        else:
+            low_inventory_fee = round(
+                (fin_sku.get("low_inventory", 0.0)
+                 + unattr_per_unit["low_inventory"] * bill_units), 2)
 
         # Inbound placement: dated window charges (or Finances window total)
         # go on Totals as BLENDED. Rows stay $0. Never fee_rate × units sold.
         inbound_placement_fee = 0.0
 
-        # Aged inventory: actual amount-charged from Seller Central's Aged
-        # Inventory Surcharge report (GET_FBA_FULFILLMENT_LONGTERM_STORAGE_
-        # FEE_CHARGES_DATA), matched by seller SKU only. Do NOT fall back to
-        # ASIN — that double-counts when merchant + amzn.gr.* SKUs share an
-        # ASIN. Do NOT use planning-report estimated-ais × months_in_window
-        # (those are forward projections, not billed amounts).
+        # Aged inventory: Seller Central amount-charged only. Never planning
+        # estimated-ais and never Finances invent when the charges report is
+        # still warming — show $0 until trusted.
         if aged_charges_trusted and aged_charges_by_sku is not None:
-            # Trust the SC report: $0 when SKU has no amount-charged rows.
             aged_inventory_fee = round(_lookup_sku_amount(aged_charges_by_sku, sku), 2)
-        elif aged_charges_by_sku is not None:
-            charged = _lookup_sku_amount(aged_charges_by_sku, sku)
-            if charged > 0:
-                aged_inventory_fee = round(charged, 2)
-            else:
-                aged_inventory_fee = round(
-                    float(fin_sku.get("aged_inventory", 0.0) or 0), 2,
-                )
         else:
-            # Charges report unavailable (403 / error) — Finances attributed
-            # only; never spread the unattributed pool (inflates SKUs that
-            # never incurred AIS).
-            aged_inventory_fee = round(
-                float(fin_sku.get("aged_inventory", 0.0) or 0), 2,
-            )
+            aged_inventory_fee = 0.0
 
         # Removal / Disposal: always BLENDED from Removal Order Detail.
         # Per-SKU rows stay $0; Totals carries the request-date report sum.
@@ -2501,12 +2632,20 @@ async def compute_profitability_data(
     # so the Storage KPI matches the CSV total. Same path applies the
     # Finances FBAStorageFee blended total when the report is empty.
     allocated_storage = round(float(totals.get("storage_fee") or 0), 2)
-    storage_unallocated = round(
-        max(0.0, float(storage_report_total or 0) - allocated_storage), 2,
-    )
+    target_storage = round(float(storage_report_total or 0), 2)
+    storage_unallocated = round(max(0.0, target_storage - allocated_storage), 2)
     if storage_unallocated > 0:
         totals["storage_fee"] = round(allocated_storage + storage_unallocated, 2)
         totals["net"] -= storage_unallocated
+    elif (
+        storage_meta.get("source") == "storage_report"
+        and target_storage >= 0
+        and allocated_storage > target_storage + 0.009
+    ):
+        # Over-allocated vs Monthly Storage Fees CSV — clamp to report total.
+        totals["net"] += round(allocated_storage - target_storage, 2)
+        totals["storage_fee"] = target_storage
+        storage_unallocated = 0.0
 
     # Aged Inv: SKUs with amount-charged but no sales in the window still
     # appear on Seller Central — add residual so Totals match the CSV.
@@ -2517,15 +2656,21 @@ async def compute_profitability_data(
             if str(asku).lower() not in sold_skus_l:
                 aged_unallocated += float(fee or 0)
         aged_unallocated = round(aged_unallocated, 2)
-        # Also catch penny drift between row sum and report total
+        # Also catch any remaining gap so Totals always equals the CSV
+        # amount-charged sum (not only penny drift ≤ $0.05).
         allocated_aged = round(float(totals.get("aged_inventory_fee") or 0), 2)
         target_aged = round(float(aged_report_total or 0), 2)
         gap = round(target_aged - allocated_aged - aged_unallocated, 2)
-        if abs(gap) >= 0.01 and abs(gap) <= 0.05:
+        if abs(gap) >= 0.01:
             aged_unallocated = round(aged_unallocated + gap, 2)
         if aged_unallocated > 0:
             totals["aged_inventory_fee"] = round(allocated_aged + aged_unallocated, 2)
             totals["net"] -= aged_unallocated
+        elif aged_unallocated < 0 and target_aged >= 0:
+            # Over-allocated vs report — clamp Totals to the report CSV sum.
+            totals["net"] += round(allocated_aged - target_aged, 2)
+            totals["aged_inventory_fee"] = target_aged
+            aged_unallocated = 0.0
 
     # Removal: BLENDED account total from Removal Order Detail (request-date).
     removal_unallocated = 0.0
@@ -2663,9 +2808,10 @@ async def compute_profitability_data(
         "Reimbursements use GET_FBA_REIMBURSEMENTS_DATA (Seller Central "
         "Reimbursements report): BLENDED account income of amount-total by "
         f"approval-date. Months in filter: {', '.join(reimbursement_months) or 'none'}.",
-        "Return processing and low-inventory fees come from the Finances API "
-        "(45-day lookback before the window start) — recent orders may not have "
-        "them yet.",
+        "Return Proc uses Aurora FBA returns + Finances refunds on orders "
+        "purchased in the window (20% of line referral on returned units). "
+        "Low Inv uses Finances SKU attribution when the Finances walk completes; "
+        "otherwise it shows $0 (never a partial invent).",
         "Ads are allocated uniformly per unit — per-SKU PPC attribution requires productAd joins.",
     ])
     if storage_report_total > 0:
@@ -2729,20 +2875,24 @@ async def compute_profitability_data(
     if aged_charges_meta.get("access_denied"):
         caveats.append(
             "Aged Inv: the Aged Inventory Surcharge charges report is blocked "
-            "(403) for this SP-API app — using Inventory Planning estimated-ais "
-            "or Finances SKU amounts as fallback."
+            "(403) for this SP-API app — showing $0 (no estimated-ais invent)."
         )
-    elif aged_charges_meta.get("source") == "planning_estimate_fallback":
+    elif aged_charges_meta.get("source") == "pending_charges":
         caveats.append(
-            "Aged Inv: charges report failed (FATAL/unavailable); showing "
-            "Inventory Planning estimated-ais monthly totals by SKU. Re-check "
-            "against Seller Central's Aged Inventory Surcharge report once the "
-            "charges report succeeds."
+            "Aged Inv: Seller Central amount-charged is still warming — "
+            "showing $0 until the charges report is ready (reload in ~1–2 min)."
         )
-    elif aged_charges_meta.get("source") == "finances_fallback":
+    elif aged_charges_meta.get("source") in (
+        "unavailable", "finances_fallback", "planning_estimate_fallback",
+        "planning_estimate_pending_charges",
+    ):
         caveats.append(
-            "Aged Inv: charges report unavailable and no planning estimates; "
-            "using Finances API SKU-attributed aged-inventory amounts only."
+            "Aged Inv: charges report unavailable for this window — showing $0."
+        )
+    if finances_incomplete:
+        caveats.append(
+            "Low Inv: Finances walk was incomplete (timeout or page cap) — "
+            "showing $0 rather than a partial total. Reload later."
         )
     placement_total = totals_out.get("inbound_placement_fee", 0)
     if placement_total == 0 and not placement_blended:

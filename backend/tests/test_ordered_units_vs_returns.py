@@ -127,10 +127,11 @@ def test_returns_subtract_actual_refunded_line_not_sku_average():
     assert abs(sku_data["SKU-A"]["fba_total"] - 147.90) < 0.01
 
 
-def test_physical_return_without_refund_does_not_count():
-    """SC Payment-complete / no refund must not count as returned."""
+def test_physical_or_refund_counts_as_returned():
+    """FBA physical returns count even when Finances refunds are not synced yet."""
     from aurora_data import returned_qty_for_sku
 
-    assert returned_qty_for_sku(physical=1, refunded=0) == 0
+    assert returned_qty_for_sku(physical=1, refunded=0) == 1
     assert returned_qty_for_sku(physical=3, refunded=1) == 3
     assert returned_qty_for_sku(physical=0, refunded=2) == 2
+    assert returned_qty_for_sku(physical=0, refunded=0) == 0
