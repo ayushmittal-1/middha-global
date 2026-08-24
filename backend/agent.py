@@ -1243,11 +1243,13 @@ async def compute_profitability_data(
     from campaigns import get_ad_spend_for_range
     from database import (
         get_aged_surcharge_charges_cache,
+        get_finances_fee_cache,
         get_placement_fee_cache,
         get_removal_fees_cache,
         get_reimbursements_cache,
         get_storage_cache,
         put_aged_surcharge_charges_cache,
+        put_finances_fee_cache,
         put_placement_fee_cache,
         put_removal_fees_cache,
         put_reimbursements_cache,
@@ -1641,6 +1643,28 @@ async def compute_profitability_data(
             unattributed_fees["storage"] = 0.0
             fin_storage_window_total = 0.0
 
+        # Closed windows: reuse a prior complete Finances walk (Low Inv does
+        # not change once posted). Open/current months always re-walk.
+        try:
+            fin_cached = await get_finances_fee_cache(
+                charges_start_iso, charges_end_iso, max_age_hours=24,
+            )
+            if fin_cached:
+                fin_by_sku = fin_cached.get("by_sku") or {}
+                unattributed_fees = (
+                    fin_cached.get("unattributed") or amazon_sp._empty_fee_bucket()
+                )
+                fin_placement_window_total = float(
+                    fin_cached.get("placement_window_total") or 0
+                )
+                fin_storage_window_total = float(
+                    fin_cached.get("storage_window_total") or 0
+                )
+                finances_incomplete = False
+                return
+        except Exception:
+            pass
+
         try:
             # Cap wall time — busy accounts can page Finances for many minutes
             # and used to leave "still loading: finances" forever, which also
@@ -1672,6 +1696,20 @@ async def compute_profitability_data(
                     "for a complete walk. Inbound placement still uses its "
                     "exact-window Finances path when needed."
                 )
+            else:
+                try:
+                    await put_finances_fee_cache(
+                        start_iso=charges_start_iso,
+                        end_iso=charges_end_iso,
+                        by_sku=fin_by_sku,
+                        unattributed=unattributed_fees,
+                        placement_window_total=fin_placement_window_total,
+                        storage_window_total=fin_storage_window_total,
+                        pages=int(fin.get("pages") or 0),
+                        incomplete=False,
+                    )
+                except Exception:
+                    pass
         except asyncio.TimeoutError:
             finances_incomplete = True
             fin_by_sku = {}
