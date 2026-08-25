@@ -45,6 +45,7 @@ SP_AD_GROUP_CT = "application/vnd.spAdGroup.v3+json"
 SP_KEYWORD_CT = "application/vnd.spKeyword.v3+json"
 SP_NEGATIVE_KEYWORD_CT = "application/vnd.spNegativeKeyword.v3+json"
 SP_PRODUCT_AD_CT = "application/vnd.spProductAd.v3+json"
+SP_TARGET_CT = "application/vnd.spTargetingClause.v3+json"
 
 
 def _user_region(user: dict) -> str:
@@ -60,8 +61,57 @@ def _ads_base(user: dict) -> str:
 
 
 def _ads_profile_id(user: dict) -> str:
+    # A per-request override wins when set — see `pick_ads_profile_id_for_currency`
+    # which chooses the USD/US profile before campaign creation so ads
+    # don't end up billed in CAD just because the Canadian profile was
+    # first in the user's amazonAdsProfileIds list.
+    override = user.get("_preferred_ads_profile_id")
+    if override:
+        return str(override)
     profiles = user.get("amazonAdsProfileIds") or []
     return str(profiles[0]) if profiles else ""
+
+
+async def pick_ads_profile_id_for_currency(
+    user: dict, prefer_currency: str = "USD",
+) -> str:
+    """Return the profileId for the user's profile with the requested
+    currency (e.g. USD → amazon.com US marketplace). Falls back to
+    whatever `_ads_profile_id` would pick when no match is found.
+
+    Caches the result on the user dict for the rest of the request so
+    the /v2/profiles fetch only happens once per campaign creation.
+    Callers should set `user['_preferred_ads_profile_id']` themselves
+    if they want the pick to affect downstream _post_json calls.
+    """
+    profiles = user.get("amazonAdsProfileIds") or []
+    if len(profiles) <= 1:
+        # Nothing to disambiguate — return whatever we have.
+        return _ads_profile_id(user)
+    try:
+        listing = await get_profiles()
+    except Exception as e:
+        print(f"[pick_ads_profile_id_for_currency] /v2/profiles fetch failed: {e} "
+              f"— falling back to first profile in user list")
+        return _ads_profile_id(user)
+    prefer = prefer_currency.upper()
+    saved = {str(p) for p in profiles}
+    match: str | None = None
+    for prof in listing:
+        pid = str(prof.get("profileId") or "")
+        if pid not in saved:
+            continue
+        cur = str(prof.get("currencyCode") or "").upper()
+        if cur == prefer:
+            match = pid
+            break
+    if not match:
+        print(f"[pick_ads_profile_id_for_currency] no {prefer} profile found "
+              f"among {saved} — falling back to first")
+        return _ads_profile_id(user)
+    print(f"[pick_ads_profile_id_for_currency] selected profileId={match} "
+          f"(currency={prefer})")
+    return match
 
 
 # ── OAuth helpers ────────────────────────────────────────────────────────────
@@ -486,13 +536,21 @@ async def create_sp_campaign(
     budget: float,
     start_date: str,
     state: str = "ENABLED",
+    targeting_type: str = "AUTO",
 ) -> dict:
-    """Create a Sponsored Products campaign."""
+    """Create a Sponsored Products campaign.
+
+    Default targeting is AUTO so the campaign self-discovers keywords
+    and product-target ASINs — the seller doesn't have to seed keywords
+    for the chat-tool flow. Pass targeting_type="MANUAL" from the caller
+    if you specifically want the manual keyword-list flow (need to also
+    call `add_keywords` and skip `create_auto_targets` in that case).
+    """
     payload = {
         "campaigns": [
             {
                 "name": name,
-                "targetingType": "MANUAL",
+                "targetingType": targeting_type,
                 "state": state,
                 "dynamicBidding": {"strategy": "LEGACY_FOR_SALES"},
                 "budget": {"budgetType": "DAILY", "budget": budget},
@@ -544,6 +602,42 @@ async def add_keywords(
         ]
     }
     return await _post_json("keywords", "/sp/keywords", SP_KEYWORD_CT, payload)
+
+
+async def create_auto_targets(
+    campaign_id: str,
+    ad_group_id: str,
+    bid: float = 0.75,
+) -> dict:
+    """Create the four auto-targeting expressions required for an AUTO
+    Sponsored Products campaign to serve: close-match, loose-match,
+    substitutes, and complements.
+
+    Amazon does NOT auto-create these when the ad group is created —
+    an AUTO campaign without any auto-targeting clauses will accept
+    the campaign/adgroup/productAd creates but simply never serve
+    impressions. Calling this once per new AUTO ad group is required.
+
+    All four use the same default bid; users can retune per-expression
+    later from Seller Central or via a follow-up call to /sp/targets.
+    """
+    expressions = ("close-match", "loose-match", "substitutes", "complements")
+    payload = {
+        "targetingClauses": [
+            {
+                "campaignId": campaign_id,
+                "adGroupId": ad_group_id,
+                "state": "ENABLED",
+                "expressionType": "AUTO",
+                "expression": [{"type": expr}],
+                "bid": bid,
+            }
+            for expr in expressions
+        ]
+    }
+    return await _post_json(
+        "auto-targets", "/sp/targets", SP_TARGET_CT, payload,
+    )
 
 
 async def add_negative_keywords(

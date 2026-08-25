@@ -472,15 +472,26 @@ def _extract_id(resp: dict, section_key: str, id_field: str) -> str:
 async def create_campaign(payload: dict) -> str:
     """Create a real Sponsored Products campaign via Amazon Ads API.
 
-    Flow: campaign -> ad group -> product ad (SKU/ASIN) -> keywords -> negatives.
+    Defaults to an AUTO-targeting campaign (Amazon self-discovers
+    keywords + product targets). Flow:
+      pick USD profile -> campaign (AUTO) -> ad group -> product ad
+      -> auto-targeting expressions -> optional negative keywords.
+
+    Supplied `keywords` are ignored for AUTO campaigns — the four auto
+    expressions (close-match, loose-match, substitutes, complements)
+    replace the manual keyword list. Pass targeting_type="MANUAL" in
+    the payload to opt into the legacy keyword-driven flow instead.
     """
     from datetime import datetime
+    from auth import require_user
     from amazon_ads import (
         create_sp_campaign,
         create_ad_group,
         create_product_ad,
+        create_auto_targets,
         add_keywords,
         add_negative_keywords,
+        pick_ads_profile_id_for_currency,
     )
 
     name = payload.get("campaign_name", "Untitled")
@@ -489,17 +500,35 @@ async def create_campaign(payload: dict) -> str:
     negative_kws = payload.get("negative_keywords", [])
     sku = payload.get("sku") or None
     asin = payload.get("asin") or None
+    targeting_type = (payload.get("targeting_type") or "AUTO").upper()
     start_date = datetime.utcnow().strftime("%Y-%m-%d")
 
     print(
         f"[create_campaign] START name={name!r} budget={budget} "
-        f"keywords={len(keywords)} negatives={len(negative_kws)} "
-        f"sku={sku!r} asin={asin!r}"
+        f"targeting={targeting_type} keywords={len(keywords)} "
+        f"negatives={len(negative_kws)} sku={sku!r} asin={asin!r}"
     )
+
+    # Pin the USD profile for the whole flow so campaigns don't get
+    # billed in CAD (or any other non-USD currency) just because the
+    # first entry in the user's amazonAdsProfileIds happens to be
+    # non-US. _preferred_ads_profile_id is read by amazon_ads._ads_profile_id
+    # and takes precedence over the profile list.
+    try:
+        user = require_user()
+        usd_profile = await pick_ads_profile_id_for_currency(user, "USD")
+        if usd_profile:
+            user["_preferred_ads_profile_id"] = usd_profile
+            print(f"[create_campaign] using USD profile {usd_profile}")
+    except Exception as e:
+        print(f"[create_campaign] USD profile selection failed ({e}) — "
+              f"proceeding with default profile")
 
     try:
         print(f"[create_campaign] -> creating SP campaign {name!r}...")
-        camp_resp = await create_sp_campaign(name, budget, start_date)
+        camp_resp = await create_sp_campaign(
+            name, budget, start_date, targeting_type=targeting_type,
+        )
         campaign_id = _extract_id(camp_resp, "campaigns", "campaignId")
         if not campaign_id:
             print(f"[create_campaign] FAILED — no campaign id in response: {camp_resp}")
@@ -537,7 +566,35 @@ async def create_campaign(payload: dict) -> str:
             print("[create_campaign] -- no SKU/ASIN provided, skipping product ad")
             results.append("No SKU/ASIN provided — campaign will NOT serve until a product ad is added.")
 
-        if keywords:
+        if targeting_type == "AUTO":
+            # An AUTO campaign without any targeting-clause objects will
+            # be created successfully but never serve. Amazon requires
+            # the seller (or us) to explicitly add the four auto
+            # expressions — see create_auto_targets docstring.
+            print(f"[create_campaign] -> creating auto-targeting expressions...")
+            try:
+                await create_auto_targets(campaign_id, ad_group_id)
+                print(f"[create_campaign] <- auto targets created "
+                      f"(close-match, loose-match, substitutes, complements)")
+                results.append(
+                    "Added 4 auto-targeting expressions "
+                    "(close-match, loose-match, substitutes, complements)."
+                )
+            except Exception as e:
+                print(f"[create_campaign] !! auto targets failed: {e}")
+                results.append(
+                    f"Warning: auto-targeting setup failed ({e}). "
+                    "The AUTO campaign was created but will not serve until "
+                    "targeting expressions are added from Seller Central."
+                )
+            if keywords:
+                results.append(
+                    f"Note: {len(keywords)} supplied keyword(s) were ignored "
+                    "because this is an AUTO campaign (Amazon discovers "
+                    "keywords automatically). Change to MANUAL targeting "
+                    "if you want keyword-level control."
+                )
+        elif keywords:
             print(f"[create_campaign] -> adding {len(keywords)} keyword(s)...")
             await add_keywords(campaign_id, ad_group_id, keywords)
             print(f"[create_campaign] <- keywords added")
