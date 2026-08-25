@@ -1600,9 +1600,12 @@ DEFAULT_PRODUCT_SETTINGS: dict = {
     "shipping_to_fba_days": None,     # None → falls back to global AIR_TRANSIT_DAYS
     "fba_buffer_days": 0,
     "target_stock_days": None,        # None → falls back to global target_cover_days
-    # Forecast tab — SellerBoard-style defaults so recent demand dominates.
-    # Users can override per-SKU; leaving all weights at 0 falls back to Prophet.
-    "velocity_weights": {"d3": 0.5, "d7": 0.3, "d30": 0.2, "d60": 0.0, "d180": 0.0},
+    # Forecast tab — SellerBoard-style defaults biased toward recent
+    # demand. Windows are (7, 14, 30, 60, 90) days; weights are
+    # normalized before use so absolute magnitudes don't matter, only
+    # ratios. Users can override per-SKU from the Actions modal;
+    # leaving all at 0 falls back to Prophet.
+    "velocity_weights": {"d7": 0.4, "d14": 0.3, "d30": 0.2, "d60": 0.1, "d90": 0.0},
     # Shipping to FBA tab (packing template — pure storage)
     "packing": None,
     # Purchase order tab (supplier — pure storage)
@@ -1628,13 +1631,7 @@ async def get_product_settings_for_user(user_id: ObjectId, sku: str) -> dict:
         {"userId": user_id, "sku": (sku or "").strip()},
         {"_id": 0, "userId": 0},
     )
-    merged = _merge_settings(doc)
-    # Weights are platform-locked for now — always return the default so
-    # every SKU (including ones with old per-SKU overrides in Mongo)
-    # renders the same numbers in the Forecast tab and drives the same
-    # weighted velocity downstream.
-    merged["velocity_weights"] = dict(DEFAULT_PRODUCT_SETTINGS["velocity_weights"])
-    return merged
+    return _merge_settings(doc)
 
 
 async def get_product_settings(sku: str) -> dict:
@@ -1653,10 +1650,7 @@ async def all_product_settings_for_user(user_id: ObjectId) -> dict[str, dict]:
         sku = (r.get("sku") or "").strip()
         if not sku:
             continue
-        merged = _merge_settings(r)
-        # Same platform-locked weights override as the per-SKU getter.
-        merged["velocity_weights"] = dict(DEFAULT_PRODUCT_SETTINGS["velocity_weights"])
-        out[sku] = merged
+        out[sku] = _merge_settings(r)
     return out
 
 

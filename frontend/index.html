@@ -2016,7 +2016,7 @@
               <th class="num" title="Damaged or customer-returned units currently unsellable">Unfulfillable</th>
               <!-- <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th> -->
               <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next arrival</th>
-              <th class="num" title="Weighted sales velocity — 0.5×v3d + 0.3×v7d + 0.2×v30d (out-of-stock days excluded)">Orders Velocity</th>
+              <th class="num" title="Weighted sales velocity across the 7/14/30/60/90-day windows (out-of-stock days excluded). Default weights are recent-biased (0.4×v7d + 0.3×v14d + 0.2×v30d + 0.1×v60d + 0×v90d); override per-SKU in Actions → Forecast tab.">Orders Velocity</th>
               <th class="num" title="Average units sold per day over the selected window (units sold ÷ window size; Aurora orders, cancelled/pending excluded)"><span id="restock-orders-header">Orders/day (30d)</span></th>
               <!-- <th class="num" title="Total units sold in the selected window (Aurora orders, cancelled/pending excluded)"><span id="restock-units-header">Units (30d)</span></th> -->
               <th class="num">30-day forecast</th>
@@ -5300,21 +5300,23 @@
           </div>
         `;
       } else if (tab === 'forecast') {
-        // Fixed weights for now — SellerBoard-style, same for every SKU.
-        // Stored per-SKU overrides are ignored so nobody sees a different
-        // number for the same product; inputs are read-only until we ship
-        // a proper "customize weights" flow.
-        const DEFAULT_VELOCITY_WEIGHTS = { d3: 0.5, d7: 0.3, d30: 0.2, d60: 0, d180: 0 };
+        // Per-SKU editable velocity weights. Windows are (7,14,30,60,90)
+        // days; weights are normalized backend-side so absolute magnitudes
+        // don't matter, only the ratio between windows. Any saved
+        // per-SKU override in Mongo is used; falls back to the platform
+        // default (recent-biased) below when nothing's saved.
+        const DEFAULT_VELOCITY_WEIGHTS = { d7: 0.4, d14: 0.3, d30: 0.2, d60: 0.1, d90: 0 };
+        const savedWeights = s.velocity_weights || {};
         const rows = settingsState.windows.map(w => {
           const wKey = 'd' + w.period_days;
-          const value = DEFAULT_VELOCITY_WEIGHTS[wKey] ?? 0;
+          const value = savedWeights[wKey] ?? DEFAULT_VELOCITY_WEIGHTS[wKey] ?? 0;
           return `
             <tr>
               <td>${w.period_days}</td>
               <td>${w.days_in_stock}</td>
               <td>${w.units_sold.toLocaleString()}</td>
               <td>${w.velocity.toFixed(2)}</td>
-              <td><input type="number" data-weight="${wKey}" value="${value}" readonly disabled title="Weights are locked to the platform default"></td>
+              <td><input type="number" min="0" step="0.05" data-weight="${wKey}" value="${value}" title="Weight for the ${w.period_days}-day window. Higher = more influence on the blended velocity."></td>
             </tr>`;
         }).join('');
         settingsBody.innerHTML = `
@@ -5437,10 +5439,17 @@
           else s[key] = el.value;
         });
       } else if (tab === 'forecast') {
-        // Weights are locked to the platform default and read-only in the
-        // UI — skip persisting anything so previously saved per-SKU
-        // overrides get cleared on the next save-through as well.
-        s.velocity_weights = null;
+        // Capture whatever the user typed into each period's Weight input
+        // and persist per-SKU. Empty/invalid inputs default to 0. The
+        // backend normalizes and ignores keys not in the current window
+        // set (VELOCITY_WINDOWS), so extra keys are harmless.
+        const weights = {};
+        settingsBody.querySelectorAll('input[data-weight]').forEach(inp => {
+          const key = inp.dataset.weight;
+          const v = parseFloat(inp.value);
+          weights[key] = Number.isFinite(v) && v >= 0 ? v : 0;
+        });
+        s.velocity_weights = weights;
       } else if (tab === 'shipping') {
         const p = { ...(s.packing || {}) };
         settingsBody.querySelectorAll('[data-packing]').forEach(el => {
