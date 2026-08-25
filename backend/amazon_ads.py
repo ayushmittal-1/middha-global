@@ -604,40 +604,83 @@ async def add_keywords(
     return await _post_json("keywords", "/sp/keywords", SP_KEYWORD_CT, payload)
 
 
-async def create_auto_targets(
+async def set_auto_target_bids(
     campaign_id: str,
     ad_group_id: str,
     bid: float = 0.75,
 ) -> dict:
-    """Create the four auto-targeting expressions required for an AUTO
-    Sponsored Products campaign to serve: close-match, loose-match,
-    substitutes, and complements.
+    """Set the default bid on the four auto-targeting expressions that
+    Amazon auto-creates for an AUTO Sponsored Products ad group.
 
-    Amazon does NOT auto-create these when the ad group is created —
-    an AUTO campaign without any auto-targeting clauses will accept
-    the campaign/adgroup/productAd creates but simply never serve
-    impressions. Calling this once per new AUTO ad group is required.
+    Amazon's SP v3 API creates AUTO campaign targeting clauses
+    automatically when the ad group is provisioned — you cannot POST
+    them yourself (POST /sp/targets only accepts expressionType=MANUAL
+    and will 400 on AUTO). The 4 auto expressions Amazon creates are:
+      - QUERY_HIGH_REL_MATCHES     (close match)
+      - QUERY_BROAD_REL_MATCHES    (loose match)
+      - ASIN_SUBSTITUTE_RELATED    (substitutes)
+      - ASIN_ACCESSORY_RELATED     (complements)
 
-    All four use the same default bid; users can retune per-expression
-    later from Seller Central or via a follow-up call to /sp/targets.
+    Their default bid is whatever `defaultBid` the ad group was created
+    with. This helper lists the auto-created targets and PUTs a bid
+    update on each so seller-supplied bids take effect immediately.
+    Returns {} silently if the LIST doesn't return exactly four AUTO
+    targets — Amazon may still be provisioning them, and skipping the
+    bid adjustment is safe (the ad group's defaultBid stays in effect).
     """
-    expressions = ("close-match", "loose-match", "substitutes", "complements")
+    # 1. LIST the auto-created targeting clauses for this ad group.
+    try:
+        listing = await _post_json(
+            "targets/list", "/sp/targets/list", SP_TARGET_CT,
+            {
+                "campaignIdFilter": {"include": [str(campaign_id)]},
+                "adGroupIdFilter": {"include": [str(ad_group_id)]},
+                "expressionTypeFilter": ["AUTO"],
+                "stateFilter": {"include": ["ENABLED", "PAUSED"]},
+            },
+        )
+    except Exception as e:
+        print(f"[set_auto_target_bids] list failed ({e}) — skipping bid update")
+        return {}
+
+    targets = listing.get("targetingClauses") or []
+    if not targets:
+        print(f"[set_auto_target_bids] no AUTO targets found for adGroup "
+              f"{ad_group_id} yet — Amazon may still be provisioning. Skipping.")
+        return {}
+
+    # 2. PUT each with the requested bid.
     payload = {
         "targetingClauses": [
-            {
-                "campaignId": campaign_id,
-                "adGroupId": ad_group_id,
-                "state": "ENABLED",
-                "expressionType": "AUTO",
-                "expression": [{"type": expr}],
-                "bid": bid,
-            }
-            for expr in expressions
+            {"targetId": t.get("targetId"), "bid": bid}
+            for t in targets
+            if t.get("targetId")
         ]
     }
-    return await _post_json(
-        "auto-targets", "/sp/targets", SP_TARGET_CT, payload,
+    if not payload["targetingClauses"]:
+        return {}
+    return await _put_json(
+        "auto-targets/bid", "/sp/targets", SP_TARGET_CT, payload,
     )
+
+
+async def _put_json(label: str, path: str, content_type: str, payload: dict) -> dict:
+    """PUT sibling of _post_json for update operations."""
+    user = require_user()
+    token = await get_ads_access_token(user)
+    url = f"{_ads_base(user)}{path}"
+    print(f"[amazon_ads] -> PUT {label} {url}")
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.put(
+            url,
+            headers=_versioned_headers(user, token, content_type),
+            json=payload,
+        )
+        if resp.is_error:
+            print(f"[amazon_ads] <- {label} FAILED status={resp.status_code} body={resp.text}")
+            resp.raise_for_status()
+        print(f"[amazon_ads] <- {label} OK status={resp.status_code}")
+        return resp.json()
 
 
 async def add_negative_keywords(

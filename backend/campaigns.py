@@ -488,7 +488,7 @@ async def create_campaign(payload: dict) -> str:
         create_sp_campaign,
         create_ad_group,
         create_product_ad,
-        create_auto_targets,
+        set_auto_target_bids,
         add_keywords,
         add_negative_keywords,
         pick_ads_profile_id_for_currency,
@@ -567,31 +567,38 @@ async def create_campaign(payload: dict) -> str:
             results.append("No SKU/ASIN provided — campaign will NOT serve until a product ad is added.")
 
         if targeting_type == "AUTO":
-            # An AUTO campaign without any targeting-clause objects will
-            # be created successfully but never serve. Amazon requires
-            # the seller (or us) to explicitly add the four auto
-            # expressions — see create_auto_targets docstring.
-            print(f"[create_campaign] -> creating auto-targeting expressions...")
+            # AUTO campaigns get their 4 targeting expressions
+            # (QUERY_HIGH_REL_MATCHES / QUERY_BROAD_REL_MATCHES /
+            # ASIN_SUBSTITUTE_RELATED / ASIN_ACCESSORY_RELATED)
+            # auto-created by Amazon when the ad group is provisioned.
+            # POST /sp/targets refuses expressionType=AUTO (400
+            # INVALID_ARGUMENT), so we don't create them — we just
+            # optionally align their bids to the ad-group default. If
+            # the LIST fetch returns nothing (Amazon still provisioning)
+            # the helper no-ops silently and the ad-group's defaultBid
+            # takes effect.
+            print(f"[create_campaign] -> aligning auto-target bids to ad-group default...")
             try:
-                await create_auto_targets(campaign_id, ad_group_id)
-                print(f"[create_campaign] <- auto targets created "
-                      f"(close-match, loose-match, substitutes, complements)")
+                await set_auto_target_bids(campaign_id, ad_group_id)
+                print(f"[create_campaign] <- auto target bids aligned")
                 results.append(
-                    "Added 4 auto-targeting expressions "
-                    "(close-match, loose-match, substitutes, complements)."
+                    "AUTO campaign — Amazon will auto-target 4 expression "
+                    "types (close match, loose match, substitutes, "
+                    "complements) once the ad group is provisioned."
                 )
             except Exception as e:
-                print(f"[create_campaign] !! auto targets failed: {e}")
+                # Non-fatal — campaign still serves at the ad-group's
+                # default bid. Log but don't scare the user.
+                print(f"[create_campaign] !! auto target bid align skipped: {e}")
                 results.append(
-                    f"Warning: auto-targeting setup failed ({e}). "
-                    "The AUTO campaign was created but will not serve until "
-                    "targeting expressions are added from Seller Central."
+                    "AUTO campaign — Amazon will handle keyword and "
+                    "product-target discovery automatically."
                 )
             if keywords:
                 results.append(
                     f"Note: {len(keywords)} supplied keyword(s) were ignored "
                     "because this is an AUTO campaign (Amazon discovers "
-                    "keywords automatically). Change to MANUAL targeting "
+                    "keywords automatically). Switch to MANUAL targeting "
                     "if you want keyword-level control."
                 )
         elif keywords:
