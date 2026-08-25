@@ -1453,6 +1453,30 @@ _AGED_ADJUSTMENT_HINTS = (
 )
 
 
+def _api_window_within_fee_window(
+    api_after: str | None,
+    api_before: str | None,
+    fee_after: str | None,
+    fee_before: str | None,
+) -> bool:
+    """True when ListFinancialEvents PostedAfter/Before already ⊆ fee window.
+
+    Exact-window placement walks set API bounds equal to placement bounds;
+    ServiceFee rows often omit PostedDate but Amazon already filtered them
+    (eleet Jan SC report = $0.37). Lookback walks (API starts earlier) must
+    still require per-event dates — undated rows there inflated Jan to $323.21.
+    """
+    if not fee_after and not fee_before:
+        return True
+    if fee_after and (not api_after or str(api_after) < str(fee_after)):
+        return False
+    if fee_before and not api_before:
+        return False
+    if fee_before and api_before and str(api_before) > str(fee_before):
+        return False
+    return True
+
+
 def _classify_fee_type(fee_type: str) -> str | None:
     ft = (fee_type or "").lower()
     for bucket, hints in _FEE_TYPE_BUCKETS:
@@ -1678,17 +1702,39 @@ async def get_financial_events(
                         continue
                 # Inbound placement: only count posts inside the profitability
                 # filter (PostedDate), not the wider 45-day Finances lookback.
+                # Undated ServiceFee rows are OK only when the API query window
+                # is already ⊆ the placement window (exact-window walk). On
+                # lookback walks they must be skipped (eleet Jan inflated to
+                # $323.21; SC report Total charge = $0.37).
                 if bucket == "inbound_placement":
-                    if placement_posted_after and posted and posted < placement_posted_after:
-                        continue
-                    if placement_posted_before and posted and posted >= placement_posted_before:
-                        continue
+                    if placement_posted_after or placement_posted_before:
+                        if posted:
+                            if placement_posted_after and posted < placement_posted_after:
+                                continue
+                            if placement_posted_before and posted >= placement_posted_before:
+                                continue
+                        elif not _api_window_within_fee_window(
+                            posted_after,
+                            posted_before,
+                            placement_posted_after,
+                            placement_posted_before,
+                        ):
+                            continue
                 # Monthly storage: same PostedDate window as placement.
                 if bucket == "storage":
-                    if storage_posted_after and posted and posted < storage_posted_after:
-                        continue
-                    if storage_posted_before and posted and posted >= storage_posted_before:
-                        continue
+                    if storage_posted_after or storage_posted_before:
+                        if posted:
+                            if storage_posted_after and posted < storage_posted_after:
+                                continue
+                            if storage_posted_before and posted >= storage_posted_before:
+                                continue
+                        elif not _api_window_within_fee_window(
+                            posted_after,
+                            posted_before,
+                            storage_posted_after,
+                            storage_posted_before,
+                        ):
+                            continue
                 target = by_sku[sku] if sku else unattributed
                 target[bucket] += abs(amt)
                 if bucket == "removal" and removal_order_id:
@@ -1698,10 +1744,19 @@ async def get_financial_events(
             adj_type = (evt.get("AdjustmentType") or "").lower()
             adj_posted = evt.get("PostedDate") or ""
             if any(h in adj_type for h in _PLACEMENT_ADJUSTMENT_HINTS):
-                if placement_posted_after and adj_posted and adj_posted < placement_posted_after:
-                    continue
-                if placement_posted_before and adj_posted and adj_posted >= placement_posted_before:
-                    continue
+                if placement_posted_after or placement_posted_before:
+                    if adj_posted:
+                        if placement_posted_after and adj_posted < placement_posted_after:
+                            continue
+                        if placement_posted_before and adj_posted >= placement_posted_before:
+                            continue
+                    elif not _api_window_within_fee_window(
+                        posted_after,
+                        posted_before,
+                        placement_posted_after,
+                        placement_posted_before,
+                    ):
+                        continue
                 # Prefer per-item amounts (may carry a SellerSKU); only fall
                 # back to the event-level total when no item amounts exist —
                 # counting both double-counts the same charge.

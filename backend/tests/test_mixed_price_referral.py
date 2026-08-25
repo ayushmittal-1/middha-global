@@ -148,6 +148,38 @@ def test_nov_b016_half_up_referral_218_50():
     assert round(sku_data[sku]["referral_total"], 2) == 218.50
 
 
+def test_pre_april_2026_fuel_is_zero():
+    """Amazon FBA fuel surcharge starts April 2026 — earlier months Fuel=$0."""
+    from agent import fuel_surcharge_applies_for_window, resolve_sku_referral_fba_fuel
+
+    assert fuel_surcharge_applies_for_window(
+        display_start="2026-01-01", display_end="2026-01-31",
+    ) is False
+    assert fuel_surcharge_applies_for_window(
+        display_start="2026-03-01", display_end="2026-03-31",
+    ) is False
+    assert fuel_surcharge_applies_for_window(
+        display_start="2026-04-01", display_end="2026-04-30",
+    ) is True
+
+    referral, fba, fuel, source = resolve_sku_referral_fba_fuel(
+        line_referral=159.74,
+        line_fba=3.01,
+        bill_units=210,
+        revenue=1065.62,
+        product_fees={
+            "referral_per_unit": 0.73,
+            "fba_per_unit": 2.91,
+            "fuel_per_unit": 0.10,
+            "fulfillment_per_unit": 3.01,
+            "listing_price": 4.89,
+        },
+        include_fuel=False,
+    )
+    assert fuel == 0.0
+    assert fba == 611.10
+
+
 def test_order_line_referral_preferred_over_single_price_estimate():
     line_ref = 159.74
     line_fba = 3.01 * 210
