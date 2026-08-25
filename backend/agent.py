@@ -45,12 +45,20 @@ SYSTEM_PROMPT = (
     "- **create_campaign**: Create a campaign with a product ad (only after user approves keywords, ASIN/SKU & details).\n\n"
     "## Campaign creation flow (STRICT — follow every step)\n"
     "1. Ask about the product or seed keyword.\n"
-    "2. Call get_keywords to fetch suggestions.\n"
-    "3. **ALWAYS list the fetched keywords in your response** so the user can see them. Never skip this step.\n"
-    "4. Ask the user which keywords to keep and whether to fetch negative keywords.\n"
-    "5. Collect campaign details (name, type, budget, country) if not already provided.\n"
-    "6. **ALWAYS ask the user for the product's seller SKU (merchant SKU).** This is a SELLER account, so the product ad MUST use the SKU — an ASIN will be rejected. A campaign cannot serve ads without a product ad, so you MUST collect the SKU before creating. Explain this if the user is unsure.\n"
-    "7. **NEVER call create_campaign until the user explicitly approves the keywords, the SKU, and the campaign details.** When you call create_campaign, pass the approved sku (not asin).\n\n"
+    "2. **Ask whether the user wants an AUTO or MANUAL campaign.** Explain: "
+    "AUTO = Amazon self-discovers keywords + product targets (easier, "
+    "good for launching / new sellers, no keyword approval needed); "
+    "MANUAL = user provides a curated keyword list and Amazon bids only "
+    "on those (more control, better for scaling proven keywords). "
+    "Default to AUTO if the user has no preference.\n"
+    "3. If **MANUAL**: call get_keywords to fetch suggestions, ALWAYS list "
+    "them in your response, and ask which to keep + whether to fetch "
+    "negatives.\n"
+    "   If **AUTO**: SKIP get_keywords entirely — Amazon discovers the "
+    "keywords itself. You may still ask for optional negative keywords.\n"
+    "4. Collect campaign details (name, type, budget, country) if not already provided.\n"
+    "5. **ALWAYS ask the user for the product's seller SKU (merchant SKU).** This is a SELLER account, so the product ad MUST use the SKU — an ASIN will be rejected. A campaign cannot serve ads without a product ad, so you MUST collect the SKU before creating. Explain this if the user is unsure.\n"
+    "6. **NEVER call create_campaign until the user explicitly approves the SKU and campaign details** (and the keyword list, if MANUAL). When you call create_campaign, pass the approved sku (not asin) and set targeting_type explicitly to \"AUTO\" or \"MANUAL\".\n\n"
     "## Performance analysis\n"
     "When users ask about campaign performance, health, or what to optimize, call analyze_campaign_performance.\n"
     "IMPORTANT: analyze_campaign_performance returns an ACCOUNT-WIDE summary — it does NOT filter by campaign name. "
@@ -172,6 +180,16 @@ TOOLS = [
                         "description": "Type: 'Sponsored Products', 'Sponsored Brands', or 'Sponsored Display'.",
                         "enum": ["Sponsored Products", "Sponsored Brands", "Sponsored Display"],
                     },
+                    "targeting_type": {
+                        "type": "string",
+                        "description": (
+                            "AUTO (default) = Amazon self-discovers "
+                            "keywords + product targets; supply no keywords. "
+                            "MANUAL = you provide a keyword list and Amazon "
+                            "bids only on those. Ask the user which they want."
+                        ),
+                        "enum": ["AUTO", "MANUAL"],
+                    },
                     "budget": {
                         "type": "number",
                         "description": "Daily budget in USD.",
@@ -183,7 +201,11 @@ TOOLS = [
                     "keywords": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of approved keywords for the campaign.",
+                        "description": (
+                            "Approved keyword list — REQUIRED for MANUAL "
+                            "campaigns, IGNORED for AUTO campaigns "
+                            "(Amazon discovers keywords itself for AUTO)."
+                        ),
                     },
                     "negative_keywords": {
                         "type": "array",
@@ -199,7 +221,7 @@ TOOLS = [
                         "description": "ASIN of the product (e.g. 'B08XXXXXXX'). Only valid for VENDOR accounts. Seller accounts must use sku instead.",
                     },
                 },
-                "required": ["campaign_name", "campaign_type", "budget", "country", "keywords"],
+                "required": ["campaign_name", "campaign_type", "budget", "country"],
             },
         },
     },
@@ -446,17 +468,19 @@ async def _create_campaign(
     campaign_type: str,
     budget: float,
     country: str,
-    keywords: list[str],
+    keywords: list[str] | None = None,
     negative_keywords: list[str] | None = None,
     sku: str | None = None,
     asin: str | None = None,
+    targeting_type: str = "AUTO",
 ) -> str:
     return await create_campaign({
         "campaign_name": campaign_name,
         "campaign_type": campaign_type,
         "budget": budget,
         "country": country,
-        "keywords": keywords,
+        "targeting_type": targeting_type,
+        "keywords": keywords or [],
         "negative_keywords": negative_keywords or [],
         "sku": sku,
         "asin": asin,
