@@ -6,7 +6,7 @@ import re
 import time
 from collections import defaultdict
 from collections.abc import AsyncGenerator
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from groq import AsyncGroq
@@ -834,6 +834,7 @@ def resolve_sku_referral_fba_fuel(
     revenue: float = 0.0,
     product_fees: dict | None = None,
     fee_estimate: dict | None = None,
+    include_fuel: bool = True,
 ) -> tuple[float, float, float, str]:
     """Pick referral / FBA / fuel for one SKU row.
 
@@ -842,6 +843,10 @@ def resolve_sku_referral_fba_fuel(
     or only partially populated (common on accounts synced before the fee
     map existed — e.g. Andexports ~1% of lines have fulfillmentFee).
     Splitting a sparse aggregate across all units understates FBA/fuel.
+
+    When ``include_fuel`` is False (profitability windows before Amazon's
+    April 2026 FBA fuel surcharge), never peel a 3.5% fuel component from
+    bundled fulfillment — show Fuel = $0 and keep fulfillment as FBA.
     """
     from amazon_sp import (
         split_bundled_fulfillment_for_units,
@@ -874,6 +879,14 @@ def resolve_sku_referral_fba_fuel(
         fba_unit = float(pf.get("fba_per_unit") or 0)
         fuel_unit = float(pf.get("fuel_per_unit") or 0)
         ful_unit = float(pf.get("fulfillment_per_unit") or 0)
+        if not include_fuel:
+            # Pre-surcharge months: ignore current fuel_per_unit and do not
+            # invent a 3.5% peel from a bundled fulfillment total.
+            if fba_unit > 0:
+                return round(fba_unit * units, 2), 0.0
+            if ful_unit > 0:
+                return round(ful_unit * units, 2), 0.0
+            return 0.0, 0.0
         # Products often store fees.fbaFee as the full $3.01 bundle with
         # fuel=0 — always split that into base+fuel before × units.
         if fuel_unit <= 0 and (ful_unit > 0 or fba_unit > 0):
@@ -907,6 +920,8 @@ def resolve_sku_referral_fba_fuel(
         return per >= 1.0
 
     def _line_fba_fuel() -> tuple[float, float]:
+        if not include_fuel:
+            return round(line_ful, 2), 0.0
         # Prefer catalog per-unit split when it matches the line total.
         if pf_ok and units > 0:
             fba, fuel = _pf_fba_fuel()
@@ -929,9 +944,15 @@ def resolve_sku_referral_fba_fuel(
             return line_ref, fba, fuel, "products_fees"
         if est_ok:
             fba = round(float(est.get("fba", 0.0)) * units, 2)
-            fuel = round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
+            fuel = (
+                round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
+                if include_fuel
+                else 0.0
+            )
             return line_ref, fba, fuel, "fees_api"
         if line_ful > 0:
+            if not include_fuel:
+                return line_ref, round(line_ful, 2), 0.0, "order_lines"
             # Last resort: only the lines that have fees (incomplete).
             fba, fuel = split_bundled_fulfillment_for_units(line_ful, units)
             return line_ref, fba, fuel, "order_lines"
@@ -959,11 +980,17 @@ def resolve_sku_referral_fba_fuel(
         return (
             round(float(est.get("referral", 0.0)) * units, 2),
             round(float(est.get("fba", 0.0)) * units, 2),
-            round(float(est.get("fuel_surcharge", 0.0)) * units, 2),
+            (
+                round(float(est.get("fuel_surcharge", 0.0)) * units, 2)
+                if include_fuel
+                else 0.0
+            ),
             "fees_api",
         )
 
     if line_ful > 0:
+        if not include_fuel:
+            return 0.0, round(line_ful, 2), 0.0, "order_lines"
         fba, fuel = (
             _line_fba_fuel()
             if _line_fulfillment_complete()
@@ -972,6 +999,35 @@ def resolve_sku_referral_fba_fuel(
         return 0.0, fba, fuel, "order_lines"
 
     return 0.0, 0.0, 0.0, "none"
+
+
+# Amazon FBA fuel & logistics surcharge (US/CA) started April 17, 2026.
+# Profitability months before April 2026 must show Fuel = $0 for all accounts.
+FUEL_SURCHARGE_START_DAY = date(2026, 4, 1)
+
+
+def fuel_surcharge_applies_for_window(
+    *,
+    display_start: str | None,
+    display_end: str | None,
+    start_dt: datetime | None = None,
+    end_dt: datetime | None = None,
+    marketplace_tz: str = "UTC",
+) -> bool:
+    """True when the profitability window can include Amazon's FBA fuel fee.
+
+    Months before April 2026 → False (Fuel column / totals stay $0).
+    April 2026 onward → True.
+    """
+    start_day, end_day = inclusive_ymd_bounds(
+        start_dt or datetime.now(timezone.utc),
+        end_dt or datetime.now(timezone.utc),
+        marketplace_tz or "UTC",
+        display_start,
+        display_end,
+    )
+    # Entire window ends before April 2026 → no fuel.
+    return end_day >= FUEL_SURCHARGE_START_DAY
 
 
 def _aggregate_sku_from_sp_api(
@@ -1654,9 +1710,13 @@ async def compute_profitability_data(
                 unattributed_fees = (
                     fin_cached.get("unattributed") or amazon_sp._empty_fee_bucket()
                 )
-                fin_placement_window_total = float(
-                    fin_cached.get("placement_window_total") or 0
-                )
+                # Placement is never taken from Finances cache/lookback —
+                # only Aurora dated charges (see _load_placement).
+                fin_placement_window_total = 0.0
+                for bucket in fin_by_sku.values():
+                    if isinstance(bucket, dict):
+                        bucket["inbound_placement"] = 0.0
+                unattributed_fees["inbound_placement"] = 0.0
                 fin_storage_window_total = float(
                     fin_cached.get("storage_window_total") or 0
                 )
@@ -1685,7 +1745,14 @@ async def compute_profitability_data(
             )
             fin_by_sku = fin.get("by_sku") or {}
             unattributed_fees = fin.get("unattributed") or unattributed_fees
-            fin_placement_window_total = float(fin.get("placement_window_total") or 0)
+            # Never surface ListFinancialEvents inbound_placement on
+            # profitability — that walk invented totals (eleet Jan $323.21).
+            # Placement Totals come only from Aurora dated charges.
+            fin_placement_window_total = 0.0
+            for bucket in fin_by_sku.values():
+                if isinstance(bucket, dict):
+                    bucket["inbound_placement"] = 0.0
+            unattributed_fees["inbound_placement"] = 0.0
             fin_storage_window_total = float(fin.get("storage_window_total") or 0)
             if fin.get("truncated"):
                 finances_incomplete = True
@@ -1703,7 +1770,11 @@ async def compute_profitability_data(
                         end_iso=charges_end_iso,
                         by_sku=fin_by_sku,
                         unattributed=unattributed_fees,
-                        placement_window_total=fin_placement_window_total,
+                        # Placement BLENDED uses Aurora charges or an
+                        # exact-window Finances walk — never this lookback
+                        # walk's placement total (can inflate via undated
+                        # events). Store 0 so cache readers don't reuse it.
+                        placement_window_total=0.0,
                         storage_window_total=fin_storage_window_total,
                         pages=int(fin.get("pages") or 0),
                         incomplete=False,
@@ -1747,11 +1818,15 @@ async def compute_profitability_data(
     finances_task = _fire_bg(_load_finances())
 
     async def _load_placement():
-        # Prefer Aurora's fbainboundplacementfees dated charges filtered by the
-        # profitability window (Transaction/Posted date — andexports July path).
-        # If none match, use live Finances PostedDate-window total. If that is
-        # also $0, lock Totals at $0. Never invent fee_rate × units sold from
-        # other months.
+        # Inbound Placement Totals = only real dated charges already synced
+        # into Aurora (`fbainboundplacementfees.charges` / events from the
+        # placement report or Finances-join sync). If nothing falls in the
+        # selected Transaction-date window → $0 BLENDED.
+        #
+        # Do NOT fall back to a live ListFinancialEvents walk here: that path
+        # mis-attributed undated ServiceFee/Adjustment rows and invented
+        # totals (eleet Jan $323.21 vs SC report $0.37). Prefer honest $0
+        # until the placement sync/report has rows for the window.
         nonlocal placement_charges_by_sku, placement_charges_by_asin
         nonlocal placement_blended, placement_window_total
         nonlocal placement_avg_per_unit, placement_avg_per_asin
@@ -1765,124 +1840,42 @@ async def compute_profitability_data(
             placement_meta["window_total"] = 0.0
             placement_meta["sku_count"] = 0
 
-        if use_db:
-            try:
-                (
-                    placement_charges_by_sku,
-                    placement_charges_by_asin,
-                    win_meta,
-                ) = await aurora_data.fba_inbound_placement_charges_for_window(
-                    require_user(), start_dt, end_dt, marketplace_tz=mp_tz,
-                    display_start=display_start, display_end=display_end,
-                )
-                matched_events = int(win_meta.get("matched_events") or 0)
-                placement_meta["matched_events"] = matched_events
-                placement_meta["event_count"] = win_meta.get("event_count")
-                placement_meta["charge_count"] = win_meta.get("charge_count")
-                placement_meta["totals_from"] = win_meta.get("totals_from")
-                placement_meta["window_start"] = win_meta.get("window_start")
-                placement_meta["window_end"] = win_meta.get("window_end")
-                if matched_events > 0:
-                    placement_blended = True
-                    placement_window_total = float(win_meta.get("window_total") or 0)
-                    placement_meta["source"] = "aurora_events_window"
-                    placement_meta["blended"] = True
-                    placement_meta["window_total"] = placement_window_total
-                    placement_meta["sku_count"] = 0
-                    return
-                else:
-                    # Shared Finances walk uses start-45d + max_pages=40, so on
-                    # busy accounts it never reaches the selected month's
-                    # placement posts (eleet March needs ~70 pages in-window).
-                    # Do an exact-window walk so BLENDED totals aren't $0 —
-                    # and never trust a truncated shared walk's placement total.
-                    try:
-                        await finances_task
-                    except Exception:
-                        pass
-                    exact_placement_total = 0.0
-                    trust_shared_placement = (
-                        fin_placement_window_total > 0 and not finances_incomplete
-                    )
-                    if not trust_shared_placement:
-                        try:
-                            fin_exact = await amazon_sp.get_financial_events(
-                                posted_after=placement_posted_after,
-                                posted_before=placement_posted_before,
-                                paginate=True,
-                                max_pages=200,
-                                placement_posted_after=placement_posted_after,
-                                placement_posted_before=placement_posted_before,
-                            )
-                            exact_placement_total = float(
-                                fin_exact.get("placement_window_total") or 0
-                            )
-                            placement_meta["finances_exact_window_pages"] = (
-                                fin_exact.get("pages")
-                            )
-                            if fin_exact.get("truncated"):
-                                warnings.append(
-                                    "Inbound placement: exact-window Finances "
-                                    "walk still truncated — showing $0 rather "
-                                    "than a partial placement total."
-                                )
-                                exact_placement_total = 0.0
-                        except Exception as e:
-                            warnings.append(
-                                _sp_report_warning(
-                                    "Inbound placement (Finances window)", e,
-                                )
-                            )
-                    use_placement_total = (
-                        fin_placement_window_total
-                        if trust_shared_placement
-                        else exact_placement_total
-                    )
-                    if use_placement_total > 0:
-                        placement_blended = True
-                        placement_window_total = use_placement_total
-                        placement_meta["source"] = "finances_posted_window"
-                        placement_meta["blended"] = True
-                        placement_meta["window_total"] = placement_window_total
-                        placement_meta["sku_count"] = 0
-                        return
-                    _lock_zero_placement("zero_no_window_charges")
-                    return
-            except Exception as e:
-                warnings.append(_sp_report_warning("Inbound placement (Aurora)", e))
-                try:
-                    await finances_task
-                except Exception:
-                    pass
-                if fin_placement_window_total > 0 and not finances_incomplete:
-                    placement_blended = True
-                    placement_window_total = fin_placement_window_total
-                    placement_meta["source"] = "finances_posted_window"
-                    placement_meta["blended"] = True
-                    placement_meta["window_total"] = placement_window_total
-                    placement_meta["sku_count"] = 0
-                    return
-                _lock_zero_placement("zero_no_window_charges")
-                return
-        else:
-            try:
-                await finances_task
-            except Exception:
-                pass
-            if fin_placement_window_total > 0 and not finances_incomplete:
+        if not use_db:
+            _lock_zero_placement("zero_no_aurora_db")
+            return
+
+        try:
+            (
+                placement_charges_by_sku,
+                placement_charges_by_asin,
+                win_meta,
+            ) = await aurora_data.fba_inbound_placement_charges_for_window(
+                require_user(), start_dt, end_dt, marketplace_tz=mp_tz,
+                display_start=display_start, display_end=display_end,
+            )
+            matched_events = int(win_meta.get("matched_events") or 0)
+            window_total = round(float(win_meta.get("window_total") or 0), 2)
+            placement_meta["matched_events"] = matched_events
+            placement_meta["event_count"] = win_meta.get("event_count")
+            placement_meta["charge_count"] = win_meta.get("charge_count")
+            placement_meta["totals_from"] = win_meta.get("totals_from")
+            placement_meta["window_start"] = win_meta.get("window_start")
+            placement_meta["window_end"] = win_meta.get("window_end")
+            # Real charge rows only — never invent from empty / zero windows.
+            if matched_events > 0 and window_total > 0:
                 placement_blended = True
-                placement_window_total = fin_placement_window_total
-                placement_meta["source"] = "finances_posted_window"
+                placement_window_total = window_total
+                placement_meta["source"] = "aurora_events_window"
                 placement_meta["blended"] = True
                 placement_meta["window_total"] = placement_window_total
                 placement_meta["sku_count"] = 0
-            else:
-                _lock_zero_placement("zero_no_window_charges")
                 return
-
-        if placement_blended:
+            _lock_zero_placement("zero_no_window_charges")
             return
-        _lock_zero_placement("zero_no_window_charges")
+        except Exception as e:
+            warnings.append(_sp_report_warning("Inbound placement (Aurora)", e))
+            _lock_zero_placement("zero_no_window_charges")
+            return
 
     async def _load_aged():
         """Load Aged Inv from Seller Central amount-charged only.
@@ -2412,6 +2405,13 @@ async def compute_profitability_data(
             storage_units_by_asin[_asin] += float(_d["units"])
 
     total_units_window = sum(d["units"] for d in sku_data.values())
+    fuel_applies = fuel_surcharge_applies_for_window(
+        display_start=display_start,
+        display_end=display_end,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        marketplace_tz=mp_tz,
+    )
     unattr_per_unit = {
         k: (unattributed_fees.get(k, 0.0) / total_units_window
             if total_units_window > 0 else 0.0)
@@ -2464,6 +2464,7 @@ async def compute_profitability_data(
             revenue=revenue,
             product_fees=pf,
             fee_estimate=est,
+            include_fuel=fuel_applies,
         )
         if fee_source == "products_fees" and not asin and pf and pf.get("asin"):
             asin = pf["asin"]
@@ -2531,8 +2532,9 @@ async def compute_profitability_data(
                 (fin_sku.get("low_inventory", 0.0)
                  + unattr_per_unit["low_inventory"] * bill_units), 2)
 
-        # Inbound placement: dated window charges (or Finances window total)
-        # go on Totals as BLENDED. Rows stay $0. Never fee_rate × units sold.
+        # Inbound placement: ONLY real Aurora dated charges for this window
+        # (placement report / Finances-join sync). Rows stay $0; Totals are
+        # BLENDED from that window sum — or $0 when sync has no rows.
         inbound_placement_fee = 0.0
 
         # Aged inventory: Seller Central amount-charged only. Never planning
@@ -2742,31 +2744,31 @@ async def compute_profitability_data(
         "(same rules as the Aurora dashboard), and subtract returned/refunded "
         "units so Referral, FBA, Fuel, and COGS use remaining quantity only.",
     ]
+    if not fuel_applies:
+        caveats.append(
+            "Fuel surcharge is $0 for this window — Amazon's FBA fuel & logistics "
+            "surcharge started April 2026; months before April show Fuel = $0."
+        )
     if placement_blended:
         src = placement_meta.get("source")
-        if src == "finances_posted_window":
-            caveats.append(
-                "Inbound placement is BLENDED from Amazon Finances for this date "
-                "filter — Totals match the placement-fee report Transaction date "
-                "(UTC calendar day of each charge). SKU rows show BLENDED."
-            )
-        elif src == "zero_no_window_charges":
+        if src in ("zero_no_window_charges", "zero_no_aurora_db"):
             ws = placement_meta.get("window_start")
             we = placement_meta.get("window_end")
             caveats.append(
-                "Inbound placement Totals is $0 — no Amazon placement charges "
-                f"were posted in {ws or display_start} → {we or display_end}. "
-                "Other months' rates are not applied."
+                "Inbound placement Totals is $0 — no synced Amazon placement "
+                f"charges (report / Finances-join) fall in "
+                f"{ws or display_start} → {we or display_end}. "
+                "We do not invent fees from live Finances mis-attribution."
             )
         else:
             caveats.append(
-                "Inbound placement is BLENDED to match Amazon (placement-fee report "
-                "Total charge sum for the Transaction date filter). SKU rows show "
-                "BLENDED; see Totals / Inbound Placement."
+                "Inbound placement is BLENDED from synced Amazon placement "
+                "charges (report / Finances-join) for the Transaction date "
+                "filter. SKU rows show BLENDED; see Totals / Inbound Placement."
             )
         if (
             float(placement_window_total or 0) <= 0
-            and src not in ("finances_posted_window", "zero_no_window_charges")
+            and src not in ("zero_no_window_charges", "zero_no_aurora_db")
         ):
             ws = placement_meta.get("window_start")
             we = placement_meta.get("window_end")
