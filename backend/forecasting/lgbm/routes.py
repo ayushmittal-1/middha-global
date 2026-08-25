@@ -20,7 +20,8 @@ import pandas as pd
 from fastapi import APIRouter, Depends
 
 from auth import protect
-from database import get_sales_daily
+from bson import ObjectId
+from database import get_sales_daily, _forecast_cache
 from forecasting.model import (
     _apply_recovery_bump,
     _build_series_imputed,
@@ -264,6 +265,44 @@ def _ensemble_backtest(
     }
 
 
+async def _cached_bt_result(user: dict, sku: str, model_key: str) -> dict:
+    """Pull a single model's cached backtest slice from forecast_cache.
+
+    The nightly picker writes bt.all = {prophet: {...}, deepar: {...},
+    ...} onto every cache row. For heavy models (deepar, tft) we prefer
+    reading that slice over retraining inline — training a deep model
+    per drawer open would cost the user minutes of latency for the same
+    metrics the nightly job already computed against the identical
+    30-day holdout.
+
+    Returns the shape _score_forecast returns ({method, days, metrics,
+    drivers}) so the caller and the FE treat it identically to a live
+    backtest. Missing cache row / missing model key -> zeroed placeholder
+    so the FE just doesn't render the row (the filter at index.html:5610
+    drops entries with no metrics).
+    """
+    try:
+        user_id = ObjectId(str(user.get("_id")))
+    except Exception:
+        return {"method": f"{model_key}_no_user", "days": [], "metrics": None}
+    row = await _forecast_cache().find_one(
+        {"userId": user_id, "sku": sku},
+        {"backtest": 1},
+    )
+    if not row:
+        return {"method": f"{model_key}_no_cache", "days": [], "metrics": None}
+    bt = (row.get("backtest") or {}).get("all") or {}
+    slice_ = bt.get(model_key)
+    if not slice_ or not slice_.get("metrics"):
+        return {"method": f"{model_key}_missing", "days": [], "metrics": None}
+    return {
+        "method": slice_.get("method") or model_key,
+        "days": slice_.get("days") or [],
+        "metrics": slice_.get("metrics"),
+        "drivers": None,
+    }
+
+
 def _score_forecast(result: dict, holdout_by_day: dict[str, int]) -> dict:
     bt_days = []
     for r in result.get("forecast") or []:
@@ -346,12 +385,25 @@ async def compare_models(sku: str, user: dict = Depends(protect)):
             "error": str(e),
         }
 
+    # DeepAR + TFT read straight from forecast_cache.bt.all rather than
+    # being trained inline — deep-model training is 1-5 min per model
+    # per user, which would make every drawer open 5-10 min. The nightly
+    # picker (when DEEPTS_ENABLED=1) already trained them against the
+    # exact same 30-day holdout and cached the metrics in bt.all, so
+    # we can surface those results in the compare panel at zero
+    # additional API cost.
+    deepar_result = await _cached_bt_result(user, sku, "deepar")
+    tft_result = await _cached_bt_result(user, sku, "tft")
+
     # Ensemble candidate — per-day mean of positive p50s across every
     # base backtest. Matches the production picker's ensemble so the
     # drawer's Model comparison panel shows the same competitive row
-    # the picker actually chose from.
+    # the picker actually chose from. DeepAR/TFT can join the ensemble
+    # too when their cached backtest days are available.
     ensemble_result = _ensemble_backtest(
-        [prophet_result, naive_result, lgbm_result, xgb_result], holdout_by_day,
+        [prophet_result, naive_result, lgbm_result, xgb_result,
+         deepar_result, tft_result],
+        holdout_by_day,
     )
 
     return {
@@ -364,6 +416,8 @@ async def compare_models(sku: str, user: dict = Depends(protect)):
         "prophet": prophet_result,
         "lgbm": lgbm_result,
         "xgb": xgb_result,
+        "deepar": deepar_result,
+        "tft": tft_result,
         "naive": naive_result,
         "ensemble": ensemble_result,
     }
