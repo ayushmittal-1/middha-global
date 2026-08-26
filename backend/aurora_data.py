@@ -20,6 +20,14 @@ from bson import ObjectId
 from auth import _db
 from amazon_sp import MARKETPLACE_NAMES, resolve_marketplace
 from amazon_sp import parse_fee_detail_lines, split_bundled_fulfillment_total
+from currency_fx import (
+    UsdFx,
+    identity_fx,
+    infer_line_currency,
+    infer_marketplace_id,
+    infer_order_date,
+    money_field_currency,
+)
 
 # Match auroraBackend dashboardMetrics — cancelled/unfulfillable orders are not sales.
 # `Pending` is also excluded: those orders aren't confirmed yet and Amazon can flip
@@ -106,9 +114,6 @@ def sum_money(values: Iterable) -> float:
     return float(total.quantize(_PENNY, rounding=ROUND_HALF_UP))
 
 
-_MONEY_FIELDS = ("itemSubtotal", "itemPrice", "promotionDiscount")
-
-
 def filter_orders_by_marketplace(
     order_docs: list[dict], marketplace_id: Optional[str],
 ) -> list[dict]:
@@ -127,8 +132,8 @@ def filter_orders_by_marketplace(
         return list(order_docs or [])
     kept: list[dict] = []
     for doc in order_docs or []:
-        mid = doc.get("marketplaceId") or doc.get("MarketplaceId") or ""
-        if isinstance(mid, str) and mid.strip() == target:
+        mid = infer_marketplace_id(doc)
+        if mid == target:
             kept.append(doc)
     return kept
 
@@ -143,18 +148,18 @@ def detect_order_currencies(order_docs: list[dict]) -> set[str]:
     so a partial fixture doesn't produce a false-positive '' currency."""
     codes: set[str] = set()
     for doc in order_docs or []:
-        if is_excluded_order_status(doc.get("orderStatus")):
+        if is_excluded_order_status(doc.get("orderStatus") or doc.get("OrderStatus")):
             continue
-        # Some Aurora order docs carry a top-level orderTotal.currencyCode.
-        top = (doc.get("orderTotal") or {}).get("currencyCode")
-        if isinstance(top, str) and top.strip():
-            codes.add(top.strip().upper())
-        for it in doc.get("orderItems") or []:
-            for field in _MONEY_FIELDS:
-                block = it.get(field) or {}
-                code = block.get("currencyCode")
-                if isinstance(code, str) and code.strip():
-                    codes.add(code.strip().upper())
+        items = doc.get("orderItems") or doc.get("OrderItems") or []
+        if items:
+            for it in items:
+                code = infer_line_currency(doc, it, default="")
+                if code:
+                    codes.add(code)
+        else:
+            code = infer_line_currency(doc, None, default="")
+            if code:
+                codes.add(code)
     return codes
 
 
@@ -286,21 +291,27 @@ def recompute_referral_totals(
     order_docs: list[dict],
     sku_data: dict[str, dict],
     rate_by_sku: dict[str, float] | None = None,
+    fx: UsdFx | None = None,
 ) -> None:
     """Overwrite ``referral_total`` using per-line ``round(revenue × rate, 2)``.
 
     Stored ``orderItems.referralFee`` often used ``referral$/listing$`` as the
     rate (Fees API rounding), which drifts on other sale prices. Pass snapped
     category rates from ``snap_referral_rate`` (default 15%).
+
+    Line revenue is converted to USD first so a CAD sale is not charged
+    15% of the CAD face value as if it were dollars.
     """
     rates = rate_by_sku or {}
     rates_lower = {str(k).lower(): float(v) for k, v in rates.items()}
+    table = fx if fx is not None else identity_fx()
     for d in sku_data.values():
         d["referral_total"] = 0.0
 
     for doc in order_docs or []:
         if is_excluded_order_status(doc.get("orderStatus")):
             continue
+        on = infer_order_date(doc)
         for it in doc.get("orderItems") or []:
             sku = it.get("sellerSku")
             if not sku or sku not in sku_data:
@@ -308,6 +319,7 @@ def recompute_referral_totals(
             amount = line_item_sales_amount(it)
             if amount <= 0:
                 continue
+            amount = table.to_usd(amount, infer_line_currency(doc, it), on)
             qty = line_item_quantity(it) or 1
             rate = rates.get(sku)
             if rate is None:
@@ -320,17 +332,23 @@ def recompute_referral_totals(
 def aggregate_sku_metrics_from_orders(
     order_docs: list[dict],
     referral_rate: float = _DEFAULT_REFERRAL_RATE,
+    fx: UsdFx | None = None,
 ) -> tuple[dict[str, dict], list[dict], int]:
     """Build per-SKU units/revenue/fees from Aurora order line items.
 
     Returns (sku_data, na_price_rows, orders_count).
 
-    Referral is ``round(line_revenue × rate, 2)`` per line (default 15%), not
-    the stored ``referralFee`` (which can use a drifted listing ratio). Call
-    ``recompute_referral_totals`` after product fees load to snap the rate per
-    SKU. Fulfillment still uses stored line ``fulfillmentFee``.
+    All money is converted to USD before summing so CAD/MXN Amazon.ca / .mx
+    lines are not added to USD as if they were the same unit.
+
+    Referral is ``round(usd_line_revenue × rate, 2)`` per line (default 15%),
+    not the stored ``referralFee`` (which can use a drifted listing ratio, or
+    15% of a CAD face value labelled USD). Call ``recompute_referral_totals``
+    after product fees load to snap the rate per SKU. Fulfillment uses stored
+    line ``fulfillmentFee``, converted when that field is not already USD.
     """
     rate = float(referral_rate or _DEFAULT_REFERRAL_RATE)
+    table = fx if fx is not None else identity_fx()
     sku_data: dict[str, dict] = defaultdict(
         lambda: {
             "units": 0,
@@ -348,6 +366,7 @@ def aggregate_sku_metrics_from_orders(
             continue
         eligible_orders += 1
         oid = doc.get("amazonOrderId") or ""
+        on = infer_order_date(doc)
         for it in doc.get("orderItems") or []:
             sku = it.get("sellerSku")
             if not sku:
@@ -361,12 +380,17 @@ def aggregate_sku_metrics_from_orders(
                 if qty > 0:
                     na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
                 continue
+            line_ccy = infer_line_currency(doc, it)
+            usd_rev = table.to_usd(amount, line_ccy, on)
+            fba_block = it.get("fulfillmentFee") or {}
+            fba_ccy = money_field_currency(fba_block, line_ccy)
+            usd_fba = table.to_usd(_money_amount(fba_block), fba_ccy, on)
             sku_data[sku]["units"] += qty
-            sku_data[sku]["revenue"] += amount
+            sku_data[sku]["revenue"] += usd_rev
             sku_data[sku]["referral_total"] += line_referral_fee(
-                amount, rate, qty or 1,
+                usd_rev, rate, qty or 1,
             )
-            sku_data[sku]["fba_total"] += _money_amount(it.get("fulfillmentFee"))
+            sku_data[sku]["fba_total"] += usd_fba
             if not sku_data[sku]["asin"] and it.get("asin"):
                 sku_data[sku]["asin"] = it["asin"]
 
@@ -606,6 +630,7 @@ async def fba_returns_by_sku(
     user: dict,
     start: datetime,
     end: datetime,
+    fx: UsdFx | None = None,
 ) -> dict[str, dict]:
     """Per-SKU returned/refunded units for orders PURCHASED in [start, end].
 
@@ -644,12 +669,18 @@ async def fba_returns_by_sku(
             "orderItems": 1,
             "customerReturns": 1,
             "refunds": 1,
+            "purchaseDate": 1,
+            "salesChannel": 1,
+            "marketplaceId": 1,
+            "orderTotal": 1,
         },
     )
 
     out: dict[str, dict] = {}
+    table = fx if fx is not None else identity_fx()
     async for order in cursor:
         items = list(order.get("orderItems") or [])
+        on = infer_order_date(order)
         # Sum quantityOrdered across split lines for the same SKU — capping
         # returns at a single line's qty under-counts multi-line orders.
         ordered_by_sku: dict[str, float] = {}
@@ -662,17 +693,27 @@ async def fba_returns_by_sku(
             sku_key = html.unescape(str(it.get("sellerSku") or "")).strip()
             if not sku_key:
                 continue
+            line_ccy = infer_line_currency(order, it)
+            usd_rev = table.to_usd(line_item_sales_amount(it), line_ccy, on)
+            ref_block = it.get("referralFee") or {}
+            usd_ref = table.to_usd(
+                float(ref_block.get("amount") or 0),
+                money_field_currency(ref_block, line_ccy),
+                on,
+            )
+            fba_block = it.get("fulfillmentFee") or {}
+            usd_fba = table.to_usd(
+                _money_amount(fba_block),
+                money_field_currency(fba_block, line_ccy),
+                on,
+            )
             ordered_by_sku[sku_key] = ordered_by_sku.get(sku_key, 0.0) + float(
                 line_item_quantity(it)
             )
-            referral_by_sku[sku_key] = referral_by_sku.get(sku_key, 0.0) + float(
-                (it.get("referralFee") or {}).get("amount") or 0
-            )
-            revenue_by_sku[sku_key] = revenue_by_sku.get(sku_key, 0.0) + float(
-                line_item_sales_amount(it)
-            )
-            fulfillment_by_sku[sku_key] = fulfillment_by_sku.get(sku_key, 0.0) + float(
-                (it.get("fulfillmentFee") or {}).get("amount") or 0
+            referral_by_sku[sku_key] = referral_by_sku.get(sku_key, 0.0) + usd_ref
+            revenue_by_sku[sku_key] = revenue_by_sku.get(sku_key, 0.0) + usd_rev
+            fulfillment_by_sku[sku_key] = (
+                fulfillment_by_sku.get(sku_key, 0.0) + usd_fba
             )
             if it.get("asin") and sku_key not in asin_from_items:
                 asin_from_items[sku_key] = str(it["asin"])

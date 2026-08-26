@@ -1,10 +1,9 @@
 """Mixed-currency detection for profitability totals.
 
-Review issue #1 (partial mitigation): the profitability calc path sums raw
-floats across currencies. Full FX conversion is out of scope for this
-change, but the response must at least declare when multiple currencies
-were seen so the frontend can refuse to display a meaningless blended
-total. These tests lock in the pure helpers that do the detection."""
+Source currencies are still detected so the API can report CAD/MXN/etc.
+Conversion to USD happens in `currency_fx` / aggregation (see
+test_usd_fx_profitability.py). Detection must not invent a blank code.
+"""
 
 import os
 
@@ -95,6 +94,18 @@ def test_top_level_order_total_currency_is_seen():
     ]
     # Codes normalise to upper-case.
     assert detect_order_currencies(orders) == {"JPY"}
+
+
+def test_sales_channel_amazon_ca_counts_as_cad():
+    orders = [
+        {
+            "amazonOrderId": "A-1",
+            "orderStatus": "Shipped",
+            "salesChannel": "Amazon.ca",
+            "orderItems": [{"itemSubtotal": {"amount": 10.0}}],
+        }
+    ]
+    assert detect_order_currencies(orders) == {"CAD"}
 
 
 def test_empty_orders_returns_empty_set():
