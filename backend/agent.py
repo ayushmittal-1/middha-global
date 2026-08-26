@@ -20,6 +20,12 @@ import aurora_data
 from aurora_data import aurora_db_enabled
 import data_resolver
 from auth import require_user
+from currency_fx import (
+    identity_fx,
+    infer_line_currency,
+    infer_order_date,
+    load_usd_fx,
+)
 from marketplace_timezone import (
     inclusive_ymd_bounds,
     parse_date_range_for_query,
@@ -1059,8 +1065,10 @@ def _aggregate_sku_from_sp_api(
     items_results: list[tuple[str, dict]],
     fetch_errors: list[str],
     na_price_rows: list[dict],
+    fx=None,
 ) -> tuple[dict[str, dict], int]:
     """Build per-SKU units/revenue; skip Canceled / Cancelled / Unfulfillable orders."""
+    table = fx if fx is not None else identity_fx()
     excluded_ids = {
         oid
         for o in orders
@@ -1072,6 +1080,9 @@ def _aggregate_sku_from_sp_api(
         for o in orders
         if o.get("AmazonOrderId") and o.get("AmazonOrderId") not in excluded_ids
     )
+    order_by_id = {
+        o.get("AmazonOrderId"): o for o in orders if o.get("AmazonOrderId")
+    }
     sku_data: dict[str, dict] = defaultdict(
         lambda: {"units": 0, "revenue": 0.0, "asin": None},
     )
@@ -1081,6 +1092,8 @@ def _aggregate_sku_from_sp_api(
         if "_error" in items_resp:
             fetch_errors.append(f"{oid}: {items_resp['_error']}")
             continue
+        parent = order_by_id.get(oid) or {}
+        on = infer_order_date(parent)
         for it in items_resp.get("payload", {}).get("OrderItems", []):
             sku = it.get("SellerSKU")
             if not sku:
@@ -1095,8 +1108,9 @@ def _aggregate_sku_from_sp_api(
                 if qty > 0:
                     na_price_rows.append({"order_id": oid, "sku": sku, "qty": qty})
                 continue
+            usd_rev = table.to_usd(amount, infer_line_currency(parent, it), on)
             sku_data[sku]["units"] += qty
-            sku_data[sku]["revenue"] += amount
+            sku_data[sku]["revenue"] += usd_rev
             if not sku_data[sku]["asin"] and it.get("ASIN"):
                 sku_data[sku]["asin"] = it["ASIN"]
     return sku_data, orders_count
@@ -1242,17 +1256,13 @@ def build_incompleteness_report(task_status: dict[str, bool]) -> dict:
 
 
 def _sp_api_order_currencies(orders: list[dict]) -> set[str]:
-    """SP-API-shape sibling of aurora_data.detect_order_currencies.
-
-    SP-API GetOrders returns OrderTotal.CurrencyCode at the top of each
-    order — cheaper than scanning line items and consistent with what
-    Seller Central shows for that order."""
+    """SP-API-shape sibling of aurora_data.detect_order_currencies."""
     codes: set[str] = set()
     for o in orders or []:
-        code = (o.get("OrderTotal") or {}).get("CurrencyCode")
-        if isinstance(code, str) and code.strip():
-            codes.add(code.strip().upper())
-    return codes
+        if aurora_data.is_excluded_order_status(o.get("OrderStatus")):
+            continue
+        codes.add(infer_line_currency(o, None, default=""))
+    return {c for c in codes if c}
 
 
 async def _get_report_sem() -> asyncio.Semaphore:
@@ -1436,16 +1446,14 @@ async def compute_profitability_data(
     na_price_rows: list[dict] = []
     fetch_errors: list[str] = []
     orders_count = 0
-    # Review issue #1: the calc path assumes a single currency per response
-    # but the app supports 10 marketplaces / 7+ currencies. Two guards:
-    # (a) when `marketplace_id` is passed, filter to that marketplace before
-    #     aggregating — guarantees a single-currency response;
-    # (b) when it isn't, still scan loaded orders for distinct currency
-    #     codes and, if >1 appears, emit a loud warning + top-level
-    #     `mixed_currency` flag so frontends can refuse to display a
-    #     mathematically-meaningless blended total.
+    # Mixed-marketplace windows (US + CA + MX) used to sum CAD/MXN into USD
+    # as raw floats. Convert every line to USD before aggregating so
+    # revenue / referral / FBA / fuel are single-currency. `marketplace_id`
+    # still scopes to one market when the seller wants that view.
     detected_currencies: set[str] = set()
     sku_data: dict[str, dict] = {}
+    fx_table = identity_fx()
+    db_orders: list[dict] = []
 
     if use_db:
         db_orders = await aurora_data.fetch_orders_with_items(
@@ -1486,19 +1494,21 @@ async def compute_profitability_data(
                 }
             order_ids = [o.get("AmazonOrderId") for o in orders if o.get("AmazonOrderId")]
             items_results = await _fetch_order_items_paced(order_ids)
-            sku_data, orders_count = _aggregate_sku_from_sp_api(
-                orders, items_results, fetch_errors, na_price_rows,
-            )
             detected_currencies = _sp_api_order_currencies(orders)
+            fx_table = await load_usd_fx(detected_currencies, start_dt, end_dt)
+            sku_data, orders_count = _aggregate_sku_from_sp_api(
+                orders, items_results, fetch_errors, na_price_rows, fx=fx_table,
+            )
         else:
             db_orders, item_errors = await data_resolver.supplement_order_items_from_sp_api(
                 db_orders,
             )
             fetch_errors.extend(item_errors)
-            sku_data, na_price_rows, orders_count = (
-                aurora_data.aggregate_sku_metrics_from_orders(db_orders)
-            )
             detected_currencies = aurora_data.detect_order_currencies(db_orders)
+            fx_table = await load_usd_fx(detected_currencies, start_dt, end_dt)
+            sku_data, na_price_rows, orders_count = (
+                aurora_data.aggregate_sku_metrics_from_orders(db_orders, fx=fx_table)
+            )
     else:
         try:
             orders_resp = await amazon_sp.get_orders(
@@ -1528,25 +1538,38 @@ async def compute_profitability_data(
 
         order_ids = [o.get("AmazonOrderId") for o in orders if o.get("AmazonOrderId")]
         items_results = await _fetch_order_items_paced(order_ids)
-        sku_data, orders_count = _aggregate_sku_from_sp_api(
-            orders, items_results, fetch_errors, na_price_rows,
-        )
         detected_currencies = _sp_api_order_currencies(orders)
+        fx_table = await load_usd_fx(detected_currencies, start_dt, end_dt)
+        sku_data, orders_count = _aggregate_sku_from_sp_api(
+            orders, items_results, fetch_errors, na_price_rows, fx=fx_table,
+        )
 
     skus = sorted(sku_data.keys())
 
     # ── Storage / finances / placement / aged — not in Aurora DB; SP-API ───
     warnings: list[str] = []
-    if len(detected_currencies) > 1:
-        # See declaration comment: the module currently sums raw floats
-        # across currencies. Surface it loudly so the FE can refuse to
-        # display the blended total.
+    source_non_usd = sorted(
+        c for c in detected_currencies if c and c != "USD"
+    )
+    converted_to_usd = bool(source_non_usd) and not fx_table.missing
+    mixed_unconverted = bool(fx_table.missing)
+    if converted_to_usd:
+        bits = []
+        for code, meta in (fx_table.summary(source_non_usd) or {}).items():
+            rate = meta.get("usd_per_unit")
+            as_of = meta.get("as_of") or "fallback"
+            bits.append(f"{code}→USD {rate} ({as_of})")
         warnings.append(
-            "Mixed currencies in this window: "
-            + ", ".join(sorted(detected_currencies))
-            + ". Totals below are the raw sum without FX conversion and are "
-            "not comparable. Filter by a single marketplace to get a "
-            "meaningful figure."
+            "Converted to USD before totaling: "
+            + (", ".join(bits) if bits else ", ".join(source_non_usd))
+            + ". Revenue, referral, FBA, and fuel are in USD."
+        )
+    elif mixed_unconverted:
+        warnings.append(
+            "Could not convert "
+            + ", ".join(sorted(fx_table.missing))
+            + " to USD — those amounts are still mixed into the totals. "
+            "Filter by a single marketplace for a clean figure."
         )
     if partial_warning:
         warnings.append(
@@ -1832,7 +1855,7 @@ async def compute_profitability_data(
             return
         try:
             returns_by_sku = await aurora_data.fba_returns_by_sku(
-                require_user(), start_dt, end_dt,
+                require_user(), start_dt, end_dt, fx=fx_table,
             )
         except Exception as e:
             warnings.append(_sp_report_warning("Customer returns (Aurora)", e))
@@ -2415,7 +2438,9 @@ async def compute_profitability_data(
                 )
             else:
                 rate_by_sku[_sku] = aurora_data._DEFAULT_REFERRAL_RATE
-        aurora_data.recompute_referral_totals(db_orders, sku_data, rate_by_sku)
+        aurora_data.recompute_referral_totals(
+            db_orders, sku_data, rate_by_sku, fx=fx_table,
+        )
 
     # Net out returned/refunded units before fee × units math and storage /
     # ad allocation. Return Proc still uses full returned_units below.
@@ -2981,7 +3006,10 @@ async def compute_profitability_data(
         "caveats": caveats,
         "warnings": warnings,
         "detected_currencies": sorted(detected_currencies),
-        "mixed_currency": len(detected_currencies) > 1,
+        "mixed_currency": bool(mixed_unconverted),
+        "converted_to_usd": bool(converted_to_usd),
+        "display_currency": "USD",
+        "fx": fx_table.summary(detected_currencies),
         "marketplace_id": marketplace_id or None,
         "complete": partial_status["complete"],
         "partial_sections": partial_status["partial_sections"],

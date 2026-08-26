@@ -49,11 +49,15 @@ def test_profitability_defaults_to_primary_marketplace(frontend_html):
 
 
 def test_mixed_currency_banner_is_rendered(frontend_html):
-    """When the backend returns mixed_currency=true, the FE must
-    render a loud warning — not just silently show the blended
-    figure with a free-text warning row buried in the list."""
+    """When conversion cannot finish, mixed_currency still surfaces a banner."""
     assert "data.mixed_currency" in frontend_html
     assert "Mixed currencies" in frontend_html
+
+
+def test_converted_to_usd_banner_is_rendered(frontend_html):
+    """CAD/MXN (etc.) sales converted to USD must be labelled, not silent."""
+    assert "data.converted_to_usd" in frontend_html
+    assert "Converted to USD" in frontend_html
 
 
 # ── Issue #4: partial-status contract is read + surfaced ──────────────────

@@ -4727,10 +4727,16 @@
         // reading only `warnings` and ignoring `mixed_currency` /
         // `complete` / `partial_sections`, so users saw a plausibly-
         // precise total with no indication it was blended or incomplete.
+        if (data.converted_to_usd) {
+          const codes = (data.detected_currencies || []).filter(c => c && c !== 'USD').join(', ') || 'non-USD';
+          caveats.push(
+            `<span class="profit-warning"><strong>Converted to USD</strong> — ${escapeHtml(codes)} sales were converted to USD before totaling. Revenue, referral, FBA, and fuel are in USD.</span>`
+          );
+        }
         if (data.mixed_currency) {
           const codes = (data.detected_currencies || []).join(', ') || 'multiple';
           caveats.push(
-            `<span class="profit-warning"><strong>Mixed currencies (${escapeHtml(codes)})</strong> — totals below are a raw sum without FX conversion and are not comparable. Pick a single marketplace above.</span>`
+            `<span class="profit-warning"><strong>Mixed currencies (${escapeHtml(codes)})</strong> — some amounts could not be converted to USD. Totals below may still mix currencies. Pick a single marketplace above.</span>`
           );
         }
         if (data.complete === false && (data.partial_sections || []).length) {
@@ -4743,6 +4749,9 @@
           // Skip the "still loading" free-text — it's now shown as the
           // structured partial-data banner above (avoid duplicate row).
           if (data.complete === false && /Still loading in background/i.test(String(w || ''))) {
+            continue;
+          }
+          if (data.converted_to_usd && /Converted to USD/i.test(String(w || ''))) {
             continue;
           }
           caveats.push(`<span class="profit-warning">${escapeHtml(w)}</span>`);
@@ -4817,7 +4826,7 @@
             <td class="num">${money(l.gross_line)}</td>
             <td class="num" style="color:${l.promo_discount > 0 ? '#c62828' : '#999'};">${l.promo_discount > 0 ? '−' + money(l.promo_discount) : '—'}</td>
             <td class="num"><strong>${money(l.net_line)}</strong></td>
-            <td class="num"><strong>${money(l.unit_price)}</strong></td>
+            <td class="num"><strong>${money(l.unit_price)}</strong>${l.native_currency && l.native_currency !== 'USD' ? ` <span style="color:#6b7280;font-size:10px;">(${escapeHtml(l.native_currency)} ${Number(l.native_net_line || 0).toFixed(2)})</span>` : ''}</td>
             <td style="font-size:11px;color:#6b7280;">${escapeHtml(l.ship_to || '—')}</td>
           </tr>`).join('');
         bodyEl.innerHTML = summary + (data.lines.length ? `

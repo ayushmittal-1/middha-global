@@ -234,7 +234,7 @@ def test_sparse_order_fulfillment_uses_product_fees():
             "listing_price": 4.89,
         },
     )
-    assert source == "order_lines"
+    assert source == "products_fees"
     assert referral == 159.74
     assert fba == 611.10
     assert fuel == 21.00

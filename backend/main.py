@@ -1420,9 +1420,10 @@ async def profitability(
     the FE date pickers) or `?days_back=N` (legacy, still used by the LLM
     tool). If both are given, start/end wins.
 
-    `marketplaceId` (optional) scopes the response to a single marketplace
-    so multi-marketplace sellers get single-currency totals instead of a
-    silently-blended figure (review issue #1).
+    `marketplaceId` (optional) scopes the response to a single marketplace.
+    Multi-marketplace windows convert CAD/MXN/etc. to USD before totaling
+    so mixed Amazon.com + Amazon.ca sales (common when marketplaceId is
+    missing on synced orders) are not summed as raw floats.
 
     Day boundaries use the seller's marketplace timezone (same as Aurora Orders)."""
     return await compute_profitability_data(
@@ -1478,14 +1479,34 @@ async def profitability_sku_prices(
             "item_price_line": {"$ifNull": ["$orderItems.itemPrice.amount", 0]},
             "item_subtotal_line": {"$ifNull": ["$orderItems.itemSubtotal.amount", 0]},
             "promotion_discount": {"$ifNull": ["$orderItems.promotionDiscount.amount", 0]},
-            "currency": {"$ifNull": ["$orderItems.itemPrice.currencyCode", "USD"]},
+            "currency": {"$ifNull": ["$orderItems.itemPrice.currencyCode", "$orderTotal.currencyCode"]},
+            "sales_channel": "$salesChannel",
             "asin": "$orderItems.asin",
             "city": "$shippingAddress.city",
             "state": "$shippingAddress.stateOrRegion",
         }},
         {"$sort": {"purchase_date": -1}},
     ]
+    from currency_fx import infer_line_currency, infer_order_date, load_usd_fx
+
     docs = await _db().orders.aggregate(pipeline).to_list(length=None)
+    currencies = {
+        str(d.get("currency") or "").strip().upper()
+        for d in docs
+        if str(d.get("currency") or "").strip()
+    }
+    for d in docs:
+        ch = str(d.get("sales_channel") or "").strip()
+        if ch:
+            currencies.add(
+                infer_line_currency(
+                    {"salesChannel": ch, "orderTotal": {"currencyCode": d.get("currency")}},
+                    {"itemPrice": {"currencyCode": d.get("currency")}},
+                    default="",
+                )
+            )
+    currencies.discard("")
+    fx = await load_usd_fx(currencies, start_dt, end_dt)
 
     rows = []
     for d in docs:
@@ -1495,17 +1516,30 @@ async def profitability_sku_prices(
         promo = float(d.get("promotion_discount") or 0)
         gross_line = subtotal if subtotal > 0 else item_price
         net_line = max(0.0, gross_line - promo)
-        unit_price = net_line / qty if qty > 0 else 0.0
+        native_ccy = (
+            str(d.get("currency") or "").strip().upper()
+            or infer_line_currency(
+                {"salesChannel": d.get("sales_channel")},
+                None,
+            )
+        )
+        on = infer_order_date({"purchaseDate": d.get("purchase_date")})
+        usd_gross = fx.to_usd(gross_line, native_ccy, on)
+        usd_promo = fx.to_usd(promo, native_ccy, on)
+        usd_net = fx.to_usd(net_line, native_ccy, on)
+        unit_price = usd_net / qty if qty > 0 else 0.0
         rows.append({
             "amazon_order_id": d.get("amazon_order_id"),
             "order_status": d.get("order_status"),
             "purchase_date": d["purchase_date"].isoformat() if d.get("purchase_date") else None,
             "qty": qty,
-            "gross_line": round(gross_line, 2),
-            "promo_discount": round(promo, 2),
-            "net_line": round(net_line, 2),
+            "gross_line": round(usd_gross, 2),
+            "promo_discount": round(usd_promo, 2),
+            "net_line": round(usd_net, 2),
             "unit_price": round(unit_price, 2),
-            "currency": d.get("currency") or "USD",
+            "currency": "USD",
+            "native_currency": native_ccy,
+            "native_net_line": round(net_line, 2),
             "asin": d.get("asin"),
             "ship_to": ", ".join(
                 x for x in [d.get("city"), d.get("state")] if x
@@ -1525,6 +1559,7 @@ async def profitability_sku_prices(
         "avg_price": round(total_net_revenue / total_units, 2) if total_units else 0.0,
         "min_price": round(min(prices), 2) if prices else 0.0,
         "max_price": round(max(prices), 2) if prices else 0.0,
+        "display_currency": "USD",
         "lines": rows,
     }
 
