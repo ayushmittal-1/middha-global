@@ -595,10 +595,16 @@ async def forecasting_restock(user: dict = Depends(protect)):
     # `date >= cutoff_90d` doesn't blow up on the naive/aware mismatch.
     cutoff_90d_naive = (now_utc - timedelta(days=90)).replace(tzinfo=None)
     for sku_key, sku_rows in sales_by_sku.items():
-        windows = compute_velocity_windows(
-            sku_rows, now_utc, windows=(3, 7, 30, 60, 180),
-        )
-        wv = weighted_velocity(windows, default_weights)
+        # Use each SKU's persisted velocity_weights if the seller has
+        # customized them in the Actions modal → Forecast tab; otherwise
+        # fall back to the platform default. Windows come from
+        # VELOCITY_WINDOWS (currently 7/14/30/60/90) — no more
+        # hard-coded (3, 7, 30, 60, 180) list that would silently
+        # regress to the old window set even after model.py updated.
+        sku_settings = settings_by_sku.get(sku_key) or {}
+        sku_weights = sku_settings.get("velocity_weights") or default_weights
+        windows = compute_velocity_windows(sku_rows, now_utc)
+        wv = weighted_velocity(windows, sku_weights)
         weighted_by_sku[sku_key] = float(wv) if wv is not None else 0.0
         for w in windows:
             pd_val = int(w.get("period_days") or 0)
@@ -615,10 +621,8 @@ async def forecasting_restock(user: dict = Depends(protect)):
         sku_returns_daily = returns_by_sku_daily.get(sku_key)
         if sku_returns_daily:
             net_rows = apply_returns_to_daily_rows(sku_rows, sku_returns_daily)
-            net_windows = compute_velocity_windows(
-                net_rows, now_utc, windows=(3, 7, 30, 60, 180),
-            )
-            wv_net = weighted_velocity(net_windows, default_weights)
+            net_windows = compute_velocity_windows(net_rows, now_utc)
+            wv_net = weighted_velocity(net_windows, sku_weights)
             weighted_net_by_sku[sku_key] = float(wv_net) if wv_net is not None else 0.0
             gross_units_by_pd = {int(w["period_days"]): int(w["units_sold"]) for w in windows}
             for w in net_windows:
@@ -939,14 +943,15 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
     live_method = c.get("method")
 
     # Weighted velocity from the last 180 days of Aurora sales — same
-    # blend the restock endpoint uses.
+    # blend the restock endpoint uses, per-SKU weights honored.
     wv_rows = await get_sales_daily(sku=sku, since=now_utc - _td(days=180))
-    windows = compute_velocity_windows(
-        wv_rows, now_utc, windows=(3, 7, 30, 60, 180),
+    windows = compute_velocity_windows(wv_rows, now_utc)
+    sku_settings = await get_product_settings(sku)
+    sku_weights = (
+        sku_settings.get("velocity_weights")
+        or DEFAULT_PRODUCT_SETTINGS["velocity_weights"]
     )
-    wv_raw = weighted_velocity(
-        windows, DEFAULT_PRODUCT_SETTINGS["velocity_weights"],
-    )
+    wv_raw = weighted_velocity(windows, sku_weights)
     wv = float(wv_raw) if wv_raw is not None else 0.0
 
     # Override cached reorder numbers with the weighted-velocity view
