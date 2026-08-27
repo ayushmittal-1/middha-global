@@ -5496,11 +5496,30 @@
         });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         closeSettingsModal();
-        // Reload the restock table so the new comment / weighted-velocity
-        // impact shows up. The user still needs to hit "Refresh forecasts"
-        // for the forecast math to re-run — the settings edit alone doesn't
-        // rebuild the cache.
-        if (typeof loadRestock === 'function') loadRestock();
+        // Update just the 6 velocity-driven columns in place — the
+        // micro-endpoint skips every bulk fetch and returns in
+        // <200ms. Only requeue the full-table reload when the SKU
+        // isn't in the current cache (unlikely but a safe fallback).
+        try {
+          const rr = await fetch(
+            `/forecasting/restock/velocity/${encodeURIComponent(settingsState.sku)}`,
+            { headers: authHeaders() },
+          );
+          if (rr.ok) {
+            const patch = await rr.json();
+            const idx = restockCache.findIndex(r => r.sku === settingsState.sku);
+            if (idx !== -1) {
+              Object.assign(restockCache[idx], patch);
+              renderRestockRows();
+            } else if (typeof loadRestock === 'function') {
+              loadRestock();
+            }
+          } else if (typeof loadRestock === 'function') {
+            loadRestock();
+          }
+        } catch {
+          if (typeof loadRestock === 'function') loadRestock();
+        }
       } catch (e) {
         alert(`Failed to save settings: ${e.message}`);
       } finally {
