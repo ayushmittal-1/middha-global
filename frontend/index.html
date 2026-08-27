@@ -615,6 +615,21 @@
     .urgency-green  { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
     .urgency-grey   { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }
 
+    /* Best-model + accuracy pill for the restock table. Colour bands
+       intentionally match the drawer's Prediction accuracy card so
+       sellers see the same green/amber/red at a glance across views. */
+    .best-model-cell {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .best-model-ok  { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+    .best-model-mid { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; }
+    .best-model-low { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+
     /* Not-buyable rows — dim to signal Amazon has blocked / suppressed
        the listing so the seller doesn't mistake stale suggested-qty for
        an actionable restock recommendation. */
@@ -2017,6 +2032,7 @@
               <!-- <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th> -->
               <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next arrival</th>
               <th class="num" title="Weighted sales velocity across the 7/14/30/60/90-day windows (out-of-stock days excluded). Default weights are recent-biased (0.4×v7d + 0.3×v14d + 0.2×v30d + 0.1×v60d + 0×v90d); override per-SKU in Actions → Forecast tab.">Orders Velocity</th>
+              <th title="Winning forecast model (from the nightly picker's 30-day holdout backtest) and its accuracy_pct. Any of prophet / naive / lgbm / xgb / ensemble / deepar / tft may win depending on the SKU's demand pattern.">Best model</th>
               <th class="num" title="Average units sold per day over the selected window (units sold ÷ window size; Aurora orders, cancelled/pending excluded)"><span id="restock-orders-header">Orders/day (30d)</span></th>
               <!-- <th class="num" title="Total units sold in the selected window (Aurora orders, cancelled/pending excluded)"><span id="restock-units-header">Units (30d)</span></th> -->
               <th class="num">30-day forecast</th>
@@ -3789,6 +3805,20 @@
           <!-- <td class="num" title="${inboundTip}">${fmtRestockNum(row.inbound ?? 0)}</td> -->
           <td title="${inboundTip}">${nextArrivalCell}</td>
           <td class="num">${fmtRestockNum(row.weighted_velocity ?? 0, 2)}</td>
+          <td>${(() => {
+            const MODEL_LABELS = {
+              naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
+              xgb: 'XGBoost', ensemble: 'Ensemble',
+              deepar: 'DeepAR', tft: 'TFT',
+            };
+            const name = row.best_model_name;
+            const acc = row.best_model_accuracy_pct;
+            if (!name && acc == null) return '<span style="color:#888;">—</span>';
+            const label = MODEL_LABELS[name] || name || '—';
+            const accStr = acc == null ? '—' : `${acc}%`;
+            const cls = acc == null ? 'low' : (acc >= 75 ? 'ok' : acc >= 40 ? 'mid' : 'low');
+            return `<span class="best-model-cell best-model-${cls}"><strong>${escapeHtml(label)}</strong> ${accStr}</span>`;
+          })()}</td>
           <td class="num">${fmtRestockNum((row[ordersField] ?? 0) / ordersWindow, 2)}</td>
           <!-- <td class="num restock-units-cell">${fmtRestockNum(row.units_30d ?? 0)}</td> -->
           <td class="num">${fmtRestockNum(row.next_30_day_forecast ?? 0, 1)}</td>
@@ -5340,11 +5370,51 @@
             Weighted velocity (units per day): <strong id="weighted-velocity-display">—</strong>
             <div class="field-hint" style="color:#3730a3;">Out-of-stock days are ignored when calculating sales velocity. Weights are normalized — leave all at 0 to fall back to the Prophet forecast.</div>
           </div>
+          <div style="margin-top:14px;padding:10px;border:1px dashed #cbd5e1;border-radius:8px;background:#f8fafc;">
+            <div style="font-weight:600;margin-bottom:4px;">Tester tools</div>
+            <div class="field-hint" style="margin-bottom:8px;">Fan the current weight row above to every SKU in your catalog. Useful for sweeping a global weight config and eyeballing the fleet-wide accuracy in the "Best model" column.</div>
+            <button type="button" id="bulk-apply-weights-btn" class="secondary">Apply weights to all SKUs</button>
+            <span id="bulk-apply-weights-status" style="margin-left:10px;color:#3730a3;font-size:12px;"></span>
+          </div>
         `;
         settingsBody.querySelectorAll('input[data-weight]').forEach(inp => {
           inp.addEventListener('input', updateWeightedVelocity);
         });
         updateWeightedVelocity();
+        const bulkBtn = document.getElementById('bulk-apply-weights-btn');
+        const bulkStatus = document.getElementById('bulk-apply-weights-status');
+        bulkBtn?.addEventListener('click', async () => {
+          // Snapshot whatever's currently in the Weight inputs; the
+          // user shouldn't have to hit Apply first before Apply-to-all.
+          const weights = {};
+          settingsBody.querySelectorAll('input[data-weight]').forEach(inp => {
+            const k = inp.dataset.weight;
+            const v = parseFloat(inp.value);
+            weights[k] = Number.isFinite(v) && v >= 0 ? v : 0;
+          });
+          if (!Object.values(weights).some(v => v > 0)) {
+            bulkStatus.textContent = 'At least one weight must be > 0.';
+            return;
+          }
+          bulkBtn.disabled = true;
+          bulkStatus.textContent = 'Applying to every SKU…';
+          try {
+            const r = await fetch('/product-settings/bulk-weights', {
+              method: 'POST',
+              headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+              body: JSON.stringify({ velocity_weights: weights }),
+            });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const body = await r.json();
+            bulkStatus.textContent = `Applied to ${body.updated} SKU(s). Reloading table…`;
+            if (typeof loadRestock === 'function') await loadRestock();
+            bulkStatus.textContent = `Applied to ${body.updated} SKU(s). Table refreshed.`;
+          } catch (e) {
+            bulkStatus.textContent = `Failed: ${e.message}`;
+          } finally {
+            bulkBtn.disabled = false;
+          }
+        });
       } else if (tab === 'shipping') {
         const p = s.packing || {};
         settingsBody.innerHTML = `

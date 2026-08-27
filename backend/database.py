@@ -1672,6 +1672,41 @@ async def upsert_product_settings(sku: str, patch: dict) -> dict:
     return await get_product_settings_for_user(user_id, sku)
 
 
+async def bulk_apply_velocity_weights(weights: dict) -> int:
+    """Fan a single velocity_weights config out to EVERY SKU the user
+    has in forecast_cache. Testers use this to eyeball how a global
+    weight change affects the whole catalog's accuracy without editing
+    each SKU one at a time.
+
+    Only touches the velocity_weights field — other per-SKU settings
+    (comment, packing, supplier, manufacturing_time_days, etc.) are
+    preserved. Returns the count of SKU rows written.
+    """
+    user_id = _user_oid()
+    # Source of SKUs: forecast_cache, so brand-new SKUs without a
+    # forecast row are skipped (they'd get their own row on the next
+    # nightly refresh anyway).
+    cursor = _forecast_cache().find({"userId": user_id}, {"sku": 1, "_id": 0})
+    skus = [d["sku"] async for d in cursor if d.get("sku")]
+    if not skus:
+        return 0
+    now = datetime.now(timezone.utc)
+    ops = []
+    from pymongo import UpdateOne
+    for sku in skus:
+        ops.append(UpdateOne(
+            {"userId": user_id, "sku": sku},
+            {
+                "$set": {"velocity_weights": weights, "updatedAt": now},
+                "$setOnInsert": {"userId": user_id, "sku": sku},
+            },
+            upsert=True,
+        ))
+    if ops:
+        await _product_settings().bulk_write(ops, ordered=False)
+    return len(ops)
+
+
 # ── Purchase orders (drives the "Ordered" column) ────────────────────────
 
 async def list_purchase_orders(status: str | None = None) -> list[dict]:

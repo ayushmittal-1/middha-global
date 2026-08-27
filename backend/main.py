@@ -859,11 +859,24 @@ async def forecasting_restock(
             returns_view["reorder_by_date_air"] = reorder_by_date_air_iso
             returns_view["reorder_by_date_ocean"] = reorder_by_date_ocean_iso
 
+        # Winning model + its backtest accuracy for the "Best model"
+        # column. Sourced from the picker's cached backtest slice so
+        # it stays consistent with the drawer's "Prediction accuracy"
+        # card. Best model can be prophet / naive / lgbm / xgb /
+        # ensemble / deepar / tft depending on which won the last
+        # nightly picker.
+        _bt = c.get("backtest") or {}
+        _bt_metrics = _bt.get("metrics") or {}
+        best_model_name = _bt.get("method") or c.get("method")
+        best_model_accuracy_pct = _bt_metrics.get("accuracy_pct")
+
         rows.append({
             "sku": sku,
             "asin": c.get("asin"),
             "fnsku": inv_row.get("fnsku"),
             "method": c.get("method"),
+            "best_model_name": best_model_name,
+            "best_model_accuracy_pct": best_model_accuracy_pct,
             "is_buyable": is_buyable,
             "status": inv_row.get("status"),
             "listing_status": inv_row.get("listing_status"),
@@ -1325,6 +1338,23 @@ async def put_product_settings_endpoint(
 ):
     settings = await upsert_product_settings(sku, patch)
     return {"sku": sku, "settings": settings}
+
+
+@app.post("/product-settings/bulk-weights")
+async def bulk_apply_velocity_weights_endpoint(
+    body: dict, user: dict = Depends(protect),
+):
+    """Fan one velocity_weights config across every SKU in the user's
+    forecast_cache. Used by the Actions modal Forecast tab's "Apply to
+    all SKUs" button so testers can eyeball fleet-wide accuracy under
+    a candidate weight profile without editing each SKU by hand.
+    """
+    from database import bulk_apply_velocity_weights
+    weights = body.get("velocity_weights") or {}
+    if not isinstance(weights, dict) or not weights:
+        raise HTTPException(status_code=400, detail="velocity_weights required")
+    count = await bulk_apply_velocity_weights(weights)
+    return {"updated": count, "velocity_weights": weights}
 
 
 # ── Purchase orders (drives the "Ordered" column) ────────────────────────
