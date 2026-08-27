@@ -1340,6 +1340,35 @@ async def put_product_settings_endpoint(
     return {"sku": sku, "settings": settings}
 
 
+@app.post("/forecasting/weight-sweep")
+async def forecasting_weight_sweep_run(user: dict = Depends(protect)):
+    """Score 5 candidate velocity_weights configs against a 30-day
+    holdout for every SKU in the caller's forecast_cache. Persists the
+    run to `weightSweepResults` and returns the aggregates.
+
+    Sweep runs synchronously (~5-15s on a 45-SKU catalog). Fine to
+    invoke from a curl and read the response; also stored so the
+    latest run is retrievable via GET /forecasting/weight-sweep.
+    """
+    from bson import ObjectId as _OID
+    from weight_sweep import run_weight_sweep
+    return await run_weight_sweep(_OID(str(user["_id"])))
+
+
+@app.get("/forecasting/weight-sweep")
+async def forecasting_weight_sweep_latest(user: dict = Depends(protect)):
+    """Return the most recent weight-sweep run for the caller, or
+    {"error": ...} if they've never triggered one. Useful for pulling
+    the last sweep's results without re-running the sweep."""
+    from bson import ObjectId as _OID
+    from weight_sweep import latest_weight_sweep
+    doc = await latest_weight_sweep(_OID(str(user["_id"])))
+    if not doc:
+        return {"error": "No weight sweep has been run for this user yet. "
+                          "POST to /forecasting/weight-sweep to trigger one."}
+    return doc
+
+
 @app.post("/product-settings/bulk-weights")
 async def bulk_apply_velocity_weights_endpoint(
     body: dict, user: dict = Depends(protect),
