@@ -582,9 +582,9 @@ def parse_fee_detail_lines(detail_list: list) -> dict:
             has_explicit_fuel = bundled_fuel > 0
         has_base_fba = True
     elif fba > 0 and fuel == 0 and has_base_fba and not has_explicit_fuel:
-        fuel = round(round(fba, 2) * 0.035, 2)
-        # Keep base+fuel consistent with Amazon cent display when we invented fuel.
-        fba = round(float(fba), 2)
+        # Live FBAPerUnitFulfillmentFee is often today's bundle ($5.61 =
+        # $5.42 base + 3.5% fuel). Peel instead of stacking 3.5% on top.
+        fba, fuel = split_bundled_fulfillment_total(fba)
 
     total = referral + fba + fuel + variable_closing
     return {

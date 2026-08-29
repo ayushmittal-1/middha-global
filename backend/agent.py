@@ -1270,15 +1270,38 @@ def apply_sale_price_fba(
     }
     catalog_fba = float(catalog_fba_per_unit or 0)
     catalog_fuel = float(catalog_fuel_per_unit or 0)
+
+    def _unit_fba(price: float, band: str) -> float:
+        fba_u = rates.get(price)
+        fuel_u = fuels.get(price, 0.0)
+        if fba_u is None:
+            fba_u = band_fba.get(band)
+            fuel_u = band_fuel.get(band, 0.0) if fba_u is not None else 0.0
+        if fba_u is None:
+            return catalog_fba
+        fba_u = float(fba_u)
+        fuel_u = float(fuel_u or 0)
+        if include_fuel:
+            return fba_u
+        # Pre-April: a live quote of the *same* size-tier is today's
+        # bundle (catalog $5.42 + 3.5% = $5.61). Do not treat that as a
+        # new FBA band ($3.32 vs $2.43 is a real $10/$50 jump).
+        bundled = round(fba_u + fuel_u, 2) if fuel_u > 0 else fba_u
+        if catalog_fba > 0:
+            expected_bundle = round(catalog_fba * 1.035, 2)
+            if abs(bundled - expected_bundle) <= 0.03 or abs(fba_u - expected_bundle) <= 0.03:
+                return catalog_fba
+        if fuel_u > 0:
+            base, _ = amazon_sp.split_bundled_fulfillment_total(bundled)
+            return base
+        return fba_u
+
     fba = 0.0
     fuel = 0.0
     accounted = 0
     for price, u in by_price.items():
         band = usd_fba_price_band(price)
-        fba_u = rates.get(price)
-        if fba_u is None:
-            fba_u = band_fba.get(band, catalog_fba)
-        fba += float(fba_u) * u
+        fba += float(_unit_fba(price, band)) * u
         accounted += u
         if include_fuel:
             fuel_u = fuels.get(price)
@@ -1361,7 +1384,7 @@ async def fetch_fba_rates_by_sale_price(
     """
     pf_all = product_fees or {}
     pf_lower = {str(k).lower(): v for k, v in pf_all.items()}
-    sku_need: list[tuple[str, str, str, str, float, bool]] = []
+    sku_need: list[tuple[str, str, str, str, float, bool, str]] = []
     unique: dict[tuple[str, float, bool], None] = {}
 
     for sku, d in (sku_data or {}).items():
@@ -1375,6 +1398,7 @@ async def fetch_fba_rates_by_sale_price(
         if not asin:
             continue
         listing = float(pf.get("listing_price") or 0)
+        listing_fba = usd_fba_price_band(listing) if listing > 0 else ""
         is_fba = False if pf.get("is_fba") is False else True
         by_quote: dict[tuple[str, str], dict[float, int]] = {}
         for raw_price, u in by_price.items():
@@ -1393,7 +1417,9 @@ async def fetch_fba_rates_by_sale_price(
             rep = _qty_weighted_usd_price(price_qty)
             if rep <= 0:
                 continue
-            sku_need.append((sku, asin, fba_band, ref_tier, rep, is_fba))
+            sku_need.append(
+                (sku, asin, fba_band, ref_tier, rep, is_fba, listing_fba)
+            )
             unique[(asin, rep, is_fba)] = None
 
     if not unique:
@@ -1426,13 +1452,19 @@ async def fetch_fba_rates_by_sale_price(
                 est_by_key[(asin, usd_price, is_fba)] = pair
 
     out: dict[str, dict[str, tuple[float, float, float]]] = {}
-    for sku, asin, fba_band, ref_tier, usd_price, is_fba in sku_need:
+    for sku, asin, fba_band, ref_tier, usd_price, is_fba, listing_fba in sku_need:
         pair = est_by_key.get((asin, usd_price, is_fba))
         if not pair:
             continue
         dest = out.setdefault(sku, {})
-        dest[fba_band] = pair
+        # Referral quote is always stored on the referral tier.
         dest[ref_tier] = pair
+        # FBA is only replaced when the unit is in a different $10/$50
+        # band than listing. A $19.99 vs $30 listing still needs an 8/15/17%
+        # referral quote, but FBA is the same size-tier — writing that live
+        # $5.61 bundle onto ``10_50`` undid February fuel peel for every SKU.
+        if not listing_fba or fba_band != listing_fba:
+            dest[fba_band] = pair
     return out
 
 
@@ -2969,53 +3001,55 @@ async def compute_profitability_data(
                 None,
             )
         if sale_rates:
-            band_keys = {"lt10", "10_50", "gt50", "le10", "le15", "le20", "gt20"}
+            fba_band_keys = {"lt10", "10_50", "gt50"}
+            ref_tier_keys = {"le10", "le15", "le20", "gt20"}
             fba_per_band = {
                 str(k): pair[0]
                 for k, pair in sale_rates.items()
-                if str(k) in band_keys
+                if str(k) in fba_band_keys
             }
             fuel_per_band = {
                 str(k): pair[1]
                 for k, pair in sale_rates.items()
-                if str(k) in band_keys
+                if str(k) in fba_band_keys
             }
             fba_per_price = {
                 round(float(k), 2): pair[0]
                 for k, pair in sale_rates.items()
-                if str(k) not in band_keys
+                if str(k) not in fba_band_keys and str(k) not in ref_tier_keys
             }
             fuel_per_price = {
                 round(float(k), 2): pair[1]
                 for k, pair in sale_rates.items()
-                if str(k) not in band_keys
+                if str(k) not in fba_band_keys and str(k) not in ref_tier_keys
             }
-            rebuilt = apply_sale_price_fba(
-                bill_units=bill_units,
-                units_by_usd_price=d.get("units_by_usd_price"),
-                fba_per_usd_price=fba_per_price,
-                catalog_fba_per_unit=(
-                    (fba_total / bill_units) if bill_units else 0.0
-                ),
-                include_fuel=fuel_applies,
-                fuel_per_usd_price=fuel_per_price,
-                catalog_fuel_per_unit=(
-                    (fuel_total / bill_units) if bill_units else 0.0
-                ),
-                fba_per_band=fba_per_band,
-                fuel_per_band=fuel_per_band,
-            )
-            if rebuilt is not None:
-                fba_total, fuel_total = rebuilt
+            if fba_per_band or fba_per_price:
+                rebuilt = apply_sale_price_fba(
+                    bill_units=bill_units,
+                    units_by_usd_price=d.get("units_by_usd_price"),
+                    fba_per_usd_price=fba_per_price,
+                    catalog_fba_per_unit=(
+                        (fba_total / bill_units) if bill_units else 0.0
+                    ),
+                    include_fuel=fuel_applies,
+                    fuel_per_usd_price=fuel_per_price,
+                    catalog_fuel_per_unit=(
+                        (fuel_total / bill_units) if bill_units else 0.0
+                    ),
+                    fba_per_band=fba_per_band,
+                    fuel_per_band=fuel_per_band,
+                )
+                if rebuilt is not None:
+                    fba_total, fuel_total = rebuilt
             referral_per_band = {
                 str(k): float(pair[2] if len(pair) > 2 else 0)
                 for k, pair in sale_rates.items()
-                if str(k) in band_keys
+                if str(k) in ref_tier_keys or str(k) in fba_band_keys
             }
             referral_per_price = {
                 round(float(k), 2): float(pair[2] if len(pair) > 2 else 0)
                 for k, pair in sale_rates.items()
-                if str(k) not in band_keys
+                if str(k) not in fba_band_keys and str(k) not in ref_tier_keys
             }
             cat_rate = aurora_data.snap_referral_rate(
                 (pf or {}).get("listing_price"),

@@ -291,6 +291,76 @@ def test_eleet_january_referral_uses_8pct_under_10():
     assert rebuilt != round_money(96.48 * 0.15)
 
 
+def test_february_fba_peels_live_bundle_after_sale_price_quote():
+    """B07Z3TD8XG Feb: listing FBA $5.61 includes fuel; Fuel column is $0.
+
+    13 net units at $19.99/$25.94 (same $10–$50 band as listing $30).
+    Live Fees API still returns $5.61. Must not show $5.61 × 13 = $72.93.
+    """
+    from agent import apply_sale_price_fba
+    from amazon_sp import split_bundled_fulfillment_total
+
+    assert split_bundled_fulfillment_total(5.61) == (5.42, 0.19)
+    rebuilt = apply_sale_price_fba(
+        bill_units=13,
+        units_by_usd_price={19.99: 12, 25.94: 1},
+        fba_per_usd_price={},
+        catalog_fba_per_unit=5.42,
+        include_fuel=False,
+        fba_per_band={"10_50": 5.61},
+        fuel_per_band={"10_50": 0.19},
+    )
+    assert rebuilt == (70.46, 0.0)
+    assert rebuilt[0] != round(5.61 * 13, 2)
+
+
+def test_same_fba_band_does_not_store_live_fba_quote():
+    """Listing $30 vs sale $19.99: referral tier changes, FBA band does not.
+
+    Live $5.61 must not be stored on ``10_50`` or every SKU in that band
+    gets February fuel stuffed back into FBA.
+    """
+    import asyncio
+    import amazon_sp
+    from agent import fetch_fba_rates_by_sale_price
+
+    async def fake_batch(items, **kwargs):
+        return {
+            "B07Z3TD8XG": {
+                "fba": 5.61,
+                "fuel_surcharge": 0.19,
+                "referral": 3.00,
+            }
+        }
+
+    original = amazon_sp.get_fees_estimates_batch
+    amazon_sp.get_fees_estimates_batch = fake_batch
+    try:
+        out = asyncio.run(
+            fetch_fba_rates_by_sale_price(
+                {
+                    "EP - Green Knob Set of 12": {
+                        "asin": "B07Z3TD8XG",
+                        "units_by_usd_price": {19.99: 13},
+                    }
+                },
+                {
+                    "EP - Green Knob Set of 12": {
+                        "listing_price": 30.0,
+                        "is_fba": True,
+                        "asin": "B07Z3TD8XG",
+                    }
+                },
+            )
+        )
+    finally:
+        amazon_sp.get_fees_estimates_batch = original
+
+    sku = "EP - Green Knob Set of 12"
+    assert "10_50" not in out[sku]
+    assert out[sku]["le20"][2] == 3.00
+
+
 def test_fetch_quotes_when_referral_tier_differs_same_fba_band():
     """Grocery-style: listing $19.99 and sale $12.99 are both $10–$50 FBA.
 
@@ -350,7 +420,9 @@ def test_fetch_fba_rates_only_for_off_listing_band():
     assert prices == [6.99, 12.93]
     assert out[SKU]["lt10"][0] == 3.38
     assert out[SKU]["le10"][2] == 0.56
-    assert out[SKU]["10_50"][0] == 4.20
+    # $12.93 is the same FBA band as listing $16.99 — referral quote only.
+    assert "10_50" not in out[SKU]
+    assert out[SKU]["le15"][2] == 1.94
 
 
 def test_fetch_fba_rates_runs_for_every_asin_in_the_window():
