@@ -28,14 +28,14 @@ log = logging.getLogger(__name__)
 
 _PENNY = Decimal("0.01")
 TARGET_CURRENCY = "USD"
-FRANKFURTER_URL = "https://api.frankfurter.app"
+FRANKFURTER_URL = "https://api.frankfurter.dev/v1"
 
 # Approximate USD per 1 unit — used when Frankfurter has no series
-# (AED/SAR/EGP) or the HTTP fetch fails. CAD ~ Jan 2026 ECB (0.71922).
+# (AED/SAR/EGP) or the HTTP fetch fails. MXN ~ Jan 2026 ECB (~0.0555).
 FALLBACK_USD_PER_UNIT: dict[str, float] = {
     "USD": 1.0,
     "CAD": 0.72,
-    "MXN": 0.049,
+    "MXN": 0.055,
     "EUR": 1.08,
     "GBP": 1.27,
     "AUD": 0.66,
@@ -78,6 +78,15 @@ SALES_CHANNEL_CURRENCY: dict[str, str] = {
     "amazon.co.jp": "JPY",
     "amazon.com.au": "AUD",
 }
+
+US_MARKETPLACE_ID = "ATVPDKIKX0DER"
+
+
+def is_us_marketplace(marketplace_id: str | None) -> bool:
+    """True for Amazon.com or a missing id (legacy All-Orders rows)."""
+    mid = (marketplace_id or "").strip()
+    return (not mid) or mid == US_MARKETPLACE_ID
+
 
 SALES_CHANNEL_MARKETPLACE: dict[str, str] = {
     "amazon.com": "ATVPDKIKX0DER",
@@ -195,6 +204,50 @@ def infer_marketplace_id(order: dict | None) -> str:
     return SALES_CHANNEL_MARKETPLACE.get(channel, "")
 
 
+def _iso_currency(value) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip().upper()
+    return ""
+
+
+def infer_channel_currency(order: dict | None) -> str:
+    """Amazon.ca / .mx / etc. → ISO code from salesChannel or marketplaceId."""
+    if not order:
+        return ""
+    channel = str(
+        order.get("salesChannel") or order.get("SalesChannel") or ""
+    ).strip().lower()
+    if channel in SALES_CHANNEL_CURRENCY:
+        return SALES_CHANNEL_CURRENCY[channel]
+    mid = infer_marketplace_id(order)
+    return MARKETPLACE_CURRENCY.get(mid, "")
+
+
+def _explicit_money_currency(order: dict | None, item: dict | None) -> str:
+    if item:
+        for field in (
+            "itemSubtotal", "itemPrice", "promotionDiscount",
+            "ItemPrice", "PromotionDiscount",
+        ):
+            block = item.get(field) or {}
+            if not isinstance(block, dict):
+                continue
+            code = _iso_currency(
+                block.get("currencyCode") or block.get("CurrencyCode")
+            )
+            if code:
+                return code
+    if order:
+        top = order.get("orderTotal") or order.get("OrderTotal") or {}
+        if isinstance(top, dict):
+            code = _iso_currency(
+                top.get("currencyCode") or top.get("CurrencyCode")
+            )
+            if code:
+                return code
+    return ""
+
+
 def infer_line_currency(
     order: dict | None,
     item: dict | None = None,
@@ -205,34 +258,33 @@ def infer_line_currency(
     ``default`` is USD for conversion (never empty). Pass ``default=""``
     when scanning for mixed currencies so a missing code is not counted
     as USD.
+
+    Prefer the Amazon sales channel when a money field is labelled USD on a
+    CAD/MXN marketplace. Order sync stamps US ``products.fees`` currency onto
+    referral/FBA even when ``itemPrice`` is pesos — treating that USD label as
+    truth added MXN 267 as $267 revenue/referral.
     """
     fallback = (default or "").strip().upper()
-    if item:
-        for field in (
-            "itemSubtotal", "itemPrice", "promotionDiscount",
-            "ItemPrice", "PromotionDiscount",
-        ):
-            block = item.get(field) or {}
-            if not isinstance(block, dict):
-                continue
-            code = block.get("currencyCode") or block.get("CurrencyCode")
-            if isinstance(code, str) and code.strip():
-                return code.strip().upper()
-    if order:
-        top = order.get("orderTotal") or order.get("OrderTotal") or {}
-        if isinstance(top, dict):
-            code = top.get("currencyCode") or top.get("CurrencyCode")
-            if isinstance(code, str) and code.strip():
-                return code.strip().upper()
-        channel = str(
-            order.get("salesChannel") or order.get("SalesChannel") or ""
-        ).strip().lower()
-        if channel in SALES_CHANNEL_CURRENCY:
-            return SALES_CHANNEL_CURRENCY[channel]
-        mid = infer_marketplace_id(order)
-        if mid in MARKETPLACE_CURRENCY:
-            return MARKETPLACE_CURRENCY[mid]
+    channel_ccy = infer_channel_currency(order)
+    money_ccy = _explicit_money_currency(order, item)
+    if money_ccy and channel_ccy and money_ccy != channel_ccy:
+        if money_ccy == TARGET_CURRENCY:
+            return channel_ccy
+        return money_ccy
+    if money_ccy:
+        return money_ccy
+    if channel_ccy:
+        return channel_ccy
     return fallback
+
+
+def referral_fee_currency(order: dict | None, item: dict | None = None) -> str:
+    """Referral is a % of line revenue — always the line's marketplace currency.
+
+    Stored ``referralFee.currencyCode`` is often USD from the US fee map even
+    when the 15% was taken of a CAD/MXN face value.
+    """
+    return infer_line_currency(order, item)
 
 
 def money_field_currency(block, fallback: str = TARGET_CURRENCY) -> str:
@@ -358,7 +410,7 @@ async def _fetch_frankfurter_range(
     params = {"from": cur, "to": TARGET_CURRENCY}
     daily: dict[date, float] = {}
     try:
-        async with httpx.AsyncClient(timeout=12) as client:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
             resp = await client.get(url, params=params)
             resp.raise_for_status()
             payload = resp.json() or {}

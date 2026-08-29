@@ -180,6 +180,123 @@ def test_pre_april_2026_fuel_is_zero():
     assert fba == 611.10
 
 
+def test_pre_april_peels_bundled_live_fba_fee():
+    """January must use base $2.43, not today's bundled $2.52 (base+fuel)."""
+    from amazon_sp import split_bundled_fulfillment_total
+
+    assert split_bundled_fulfillment_total(2.52) == (2.43, 0.09)
+    referral, fba, fuel, source = resolve_sku_referral_fba_fuel(
+        line_referral=78.03,
+        line_fba=round(2.52 * 60, 2),
+        bill_units=60,
+        revenue=520.0,
+        product_fees={
+            "referral_per_unit": 1.50,
+            "fba_per_unit": 2.43,
+            "fuel_per_unit": 0.09,
+            "fulfillment_per_unit": 2.52,
+            "listing_price": 9.99,
+        },
+        include_fuel=False,
+    )
+    assert fuel == 0.0
+    assert fba == 145.80  # 2.43 × 60, not 2.52 × 60 = 151.20
+
+    # Unpacked catalog (fbaFee stored as the live bundle, fuel=0) must peel too.
+    _, fba_unpacked, fuel_unpacked, _ = resolve_sku_referral_fba_fuel(
+        line_referral=0,
+        line_fba=0,
+        bill_units=60,
+        revenue=520.0,
+        product_fees={
+            "referral_per_unit": 1.50,
+            "fba_per_unit": 2.52,
+            "fuel_per_unit": 0.0,
+            "fulfillment_per_unit": 2.52,
+            "listing_price": 9.99,
+        },
+        include_fuel=False,
+    )
+    assert fuel_unpacked == 0.0
+    assert fba_unpacked == 145.80
+
+
+def test_mexico_unit_uses_us_price_band_fba_not_mxn():
+    """Mexico unit at ~$15 USD uses Amazon's $10–$50 US FBA ($3.32).
+
+    Listing $9.99 is the under-$10 band ($2.43). Converting Mexico Fees
+    API 33 MXN to USD ($1.82) was the $140.33 row; Seller Central is
+    $2.43 × 57 + $3.32 = $141.83 when 2 of 60 units are returned.
+    """
+    from agent import apply_foreign_marketplace_fba
+
+    referral, fba, fuel, source = resolve_sku_referral_fba_fuel(
+        line_referral=78.29,
+        line_fba=round(2.52 * 58, 2),
+        bill_units=58,
+        revenue=521.48,
+        product_fees={
+            "referral_per_unit": 1.50,
+            "fba_per_unit": 2.43,
+            "fuel_per_unit": 0.09,
+            "fulfillment_per_unit": 2.52,
+            "listing_price": 9.99,
+        },
+        include_fuel=False,
+    )
+    fba, fuel = apply_foreign_marketplace_fba(
+        fba,
+        fuel,
+        bill_units=58,
+        units_by_marketplace={
+            "ATVPDKIKX0DER": 57,
+            "A1AM78C64UM0Y8": 1,
+        },
+        foreign_fba_per_unit_usd={"A1AM78C64UM0Y8": 3.32},
+        include_fuel=False,
+    )
+    assert fuel == 0.0
+    assert fba == round(2.43 * 57 + 3.32, 2)
+    assert fba == 141.83
+
+
+def test_sale_price_fba_covers_us_and_foreign_off_band():
+    """Production path: per-line USD price, not only non-US marketplaces.
+
+    Eleet $6.99 US units were missed by marketplace-only refetch because
+    they are Amazon.com. Blink Mexico is the same $10–$50 band jump.
+    """
+    from agent import apply_sale_price_fba
+
+    eleet = apply_sale_price_fba(
+        bill_units=12,
+        units_by_usd_price={6.99: 10, 13.13: 2},
+        fba_per_usd_price={6.99: 3.38},
+        catalog_fba_per_unit=4.20,
+        include_fuel=False,
+    )
+    assert eleet == (42.20, 0.0)
+
+    blink = apply_sale_price_fba(
+        bill_units=58,
+        units_by_usd_price={8.75: 57, 14.69: 1},
+        fba_per_usd_price={14.69: 3.32},
+        catalog_fba_per_unit=2.43,
+        include_fuel=False,
+    )
+    assert blink == (141.83, 0.0)
+
+    blink_band = apply_sale_price_fba(
+        bill_units=58,
+        units_by_usd_price={8.75: 57, 14.69: 1},
+        fba_per_usd_price={},
+        catalog_fba_per_unit=2.43,
+        include_fuel=False,
+        fba_per_band={"10_50": 3.32},
+    )
+    assert blink_band == (141.83, 0.0)
+
+
 def test_order_line_referral_preferred_over_single_price_estimate():
     line_ref = 159.74
     line_fba = 3.01 * 210

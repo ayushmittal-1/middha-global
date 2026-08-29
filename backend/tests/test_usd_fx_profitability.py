@@ -18,7 +18,7 @@ from aurora_data import (
     recompute_referral_totals,
     round_money,
 )
-from currency_fx import UsdFx, infer_line_currency, infer_marketplace_id
+from currency_fx import UsdFx, infer_line_currency, infer_marketplace_id, is_us_marketplace, FRANKFURTER_URL
 
 
 SKU = "Green Lines 50 Pack Eleet"
@@ -96,6 +96,8 @@ def test_convert_cad_then_calculate_matches_fx():
     assert round(d["referral_total"], 2) == expected_ref == 14.38
     # FBA stored as USD even on CA orders — leave it, don't treat 4.35 as CAD.
     assert round(d["fba_total"], 2) == round_money(4.35 * 12)
+    assert d["units_by_usd_price"][6.99] == 10
+    assert d["units_by_usd_price"][cad_unit_usd] == 2
 
 
 def test_recompute_referral_uses_usd_not_cad_face_value():
@@ -117,6 +119,9 @@ def test_sales_channel_infers_canada_marketplace_when_id_missing():
         {"amazonOrderId": "MX", "salesChannel": "Amazon.com.mx"},
     ]
     assert infer_marketplace_id(orders[0]) == "ATVPDKIKX0DER"
+    assert is_us_marketplace("ATVPDKIKX0DER")
+    assert is_us_marketplace("")
+    assert not is_us_marketplace("A1AM78C64UM0Y8")
     assert infer_marketplace_id(orders[1]) == "A2EUQ1WTGCTBG2"
     kept = filter_orders_by_marketplace(orders, "ATVPDKIKX0DER")
     assert [o["amazonOrderId"] for o in kept] == ["US"]
@@ -127,6 +132,18 @@ def test_sales_channel_infers_canada_marketplace_when_id_missing():
 def test_infer_currency_from_amazon_ca_channel():
     assert infer_line_currency({"salesChannel": "Amazon.ca"}, None) == "CAD"
     assert infer_line_currency({"salesChannel": "Amazon.com"}, None) == "USD"
+
+
+def test_mx_channel_overrides_usd_stamp():
+    """US fee-map currency on an Amazon.com.mx line is still Mexican pesos."""
+    item = {"itemPrice": {"amount": 267.13, "currencyCode": "USD"}}
+    order = {"salesChannel": "Amazon.com.mx", "orderItems": [item]}
+    assert infer_line_currency(order, item) == "MXN"
+
+
+def test_frankfurter_uses_current_host():
+    """api.frankfurter.app 301s to .dev and httpx was not following redirects."""
+    assert "frankfurter.dev" in FRANKFURTER_URL
 
 
 def test_cad_fba_labelled_cad_is_converted():
@@ -144,3 +161,245 @@ def test_cad_fba_labelled_cad_is_converted():
     ]
     sku_data, _, _ = aggregate_sku_metrics_from_orders(orders, fx=_fx())
     assert round(sku_data[SKU]["fba_total"], 2) == round_money(6.10 * CAD_USD)
+
+
+def test_january_blink_mxn_not_added_as_dollars():
+    """B0037W5Y2W January: Amazon.com USD + Amazon.com.mx MXN 267.13.
+
+    Raw sum treated 267.13 pesos as $267.13. Convert MXN first. Referral
+    stored as 15% of pesos labelled USD must not stay $40.07.
+    """
+    blink = "ASG - Blink Game PO1"
+    asin = "B0037W5Y2W"
+    mxn_usd = 0.049
+    jan = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    fx = UsdFx(source="test")
+    fx.rates[("MXN", date(2026, 1, 10))] = mxn_usd
+
+    us = {
+        "amazonOrderId": "111-us",
+        "orderStatus": "Shipped",
+        "salesChannel": "Amazon.com",
+        "purchaseDate": jan,
+        "orderTotal": {"amount": 8.75, "currencyCode": "USD"},
+        "orderItems": [{
+            "sellerSku": blink,
+            "asin": asin,
+            "quantityOrdered": 1,
+            "itemPrice": {"amount": 8.75, "currencyCode": "USD"},
+            "itemSubtotal": {"amount": 8.75, "currencyCode": "USD"},
+            "referralFee": {"amount": 1.31, "currencyCode": "USD"},
+            "fulfillmentFee": {"amount": 2.52, "currencyCode": "USD"},
+        }],
+    }
+    mx = {
+        "amazonOrderId": "702-9519082-9158651",
+        "orderStatus": "Shipped",
+        "salesChannel": "Amazon.com.mx",
+        "purchaseDate": jan,
+        "orderTotal": {"amount": 267.13, "currencyCode": "MXN"},
+        "orderItems": [{
+            "sellerSku": blink,
+            "asin": asin,
+            "quantityOrdered": 1,
+            "itemPrice": {"amount": 267.13, "currencyCode": "MXN"},
+            "itemSubtotal": {"amount": 267.13, "currencyCode": "MXN"},
+            "referralFee": {"amount": 40.07, "currencyCode": "USD"},
+            "fulfillmentFee": {"amount": 2.52, "currencyCode": "USD"},
+        }],
+    }
+    sku_data, _, _ = aggregate_sku_metrics_from_orders([us, mx], fx=fx)
+    d = sku_data[blink]
+    mxn_usd_rev = round_money(267.13 * mxn_usd)
+    assert mxn_usd_rev == 13.09
+    assert round(d["revenue"], 2) == round_money(8.75 + mxn_usd_rev)
+    assert round(d["revenue"], 2) == 21.84
+    # Must not be 8.75 + 267.13
+    assert round(d["revenue"], 2) < 50
+    expected_ref = round_money(
+        line_referral_fee(8.75, 0.15, 1) + line_referral_fee(mxn_usd_rev, 0.15, 1)
+    )
+    assert round(d["referral_total"], 2) == expected_ref
+    assert round(d["referral_total"], 2) < 10
+    # US catalog FBA stays dollars on the MX line at aggregation time
+    # (2.52 + 2.52). Profitability later peels January fuel and replaces
+    # the Mexico unit with Mexico FBA.
+    assert round(d["fba_total"], 2) == 5.04
+    assert d["units_by_marketplace"]["ATVPDKIKX0DER"] == 1
+    assert d["units_by_marketplace"]["A1AM78C64UM0Y8"] == 1
+    assert d["units_by_usd_price"][8.75] == 1
+    assert d["units_by_usd_price"][mxn_usd_rev] == 1
+    assert d["marketplace_fee_quotes"]["A1AM78C64UM0Y8"]["amount"] == 267.13
+    assert d["marketplace_fee_quotes"]["A1AM78C64UM0Y8"]["currency"] == "MXN"
+
+
+def test_eleet_january_fba_uses_under_10_band_not_listing():
+    """B09JZL4J8S January: listing $16.99 FBA is $4.20, but 10 US units
+    sold at $6.99 (under $10 → $3.38). Canada ~$13 stays $4.20.
+
+    Catalog × 12 = $50.40 (the wrong UI row). Correct is
+    $3.38 × 10 + $4.20 × 2 = $42.20.
+    """
+    from agent import apply_sale_price_fba, usd_fba_price_band
+
+    assert usd_fba_price_band(6.99) == "lt10"
+    assert usd_fba_price_band(16.99) == "10_50"
+    assert usd_fba_price_band(12.93) == "10_50"
+
+    rebuilt = apply_sale_price_fba(
+        bill_units=12,
+        units_by_usd_price={6.99: 10, 12.93: 2},
+        fba_per_usd_price={6.99: 3.38},
+        catalog_fba_per_unit=4.20,
+        include_fuel=False,
+    )
+    assert rebuilt == (42.20, 0.0)
+    assert rebuilt[0] != round(4.20 * 12, 2)
+
+    # Same result via band so $6.99 and $7.49 share one under-$10 rate.
+    by_band = apply_sale_price_fba(
+        bill_units=12,
+        units_by_usd_price={6.99: 7, 7.49: 3, 12.93: 2},
+        fba_per_usd_price={},
+        catalog_fba_per_unit=4.20,
+        include_fuel=False,
+        fba_per_band={"lt10": 3.38},
+    )
+    assert by_band == (42.20, 0.0)
+
+
+def test_eleet_january_referral_uses_8pct_under_10():
+    """Listing $16.99 is 15% ($14.48 on $96.48). $6.99 units are 8%.
+
+    10 × $0.56 + 2 × 15% of ~$13.29 = $5.60 + $3.98 = $9.58
+    (user $9.56 is the same split; cents follow CAD FX / rounding).
+    """
+    from agent import apply_sale_price_referral
+    from aurora_data import line_referral_fee, round_money
+
+    under10 = round_money(6.99 * 0.08)
+    assert under10 == 0.56
+    rebuilt = apply_sale_price_referral(
+        bill_units=12,
+        units_by_usd_price={6.99: 10, 13.29: 2},
+        category_rate=0.15,
+        referral_per_band={"lt10": under10},
+    )
+    cad_ref = line_referral_fee(13.29 * 2, 0.15, 2)
+    assert rebuilt == round(0.56 * 10 + cad_ref, 2)
+    assert rebuilt == 9.58
+    assert rebuilt != round_money(96.48 * 0.15)
+
+
+def test_fetch_quotes_when_referral_tier_differs_same_fba_band():
+    """Grocery-style: listing $19.99 and sale $12.99 are both $10–$50 FBA.
+
+    Old skip (FBA band only) would keep 15%. Must still call Fees API.
+    """
+    from agent import needs_sale_price_fee_quote, referral_price_tier, usd_fba_price_band
+
+    assert usd_fba_price_band(12.99) == usd_fba_price_band(19.99) == "10_50"
+    assert referral_price_tier(12.99) != referral_price_tier(19.99)
+    assert needs_sale_price_fee_quote(12.99, 19.99)
+    assert needs_sale_price_fee_quote(6.99, 16.99)
+    assert not needs_sale_price_fee_quote(16.50, 16.99)
+
+
+def test_fetch_fba_rates_only_for_off_listing_band():
+    """Fees API is called for every off-listing FBA or referral tier."""
+    import asyncio
+    import amazon_sp
+    from agent import fetch_fba_rates_by_sale_price
+
+    calls = []
+
+    async def fake_batch(items, **kwargs):
+        out = {}
+        for entry in items:
+            asin = entry[0]
+            price = round(float(entry[1]), 2)
+            calls.append((asin, price))
+            if price < 10:
+                out[asin] = {"fba": 3.38, "fuel_surcharge": 0.12, "referral": 0.56}
+            else:
+                out[asin] = {"fba": 4.20, "fuel_surcharge": 0.15, "referral": 1.94}
+        return out
+
+    original = amazon_sp.get_fees_estimates_batch
+    amazon_sp.get_fees_estimates_batch = fake_batch
+    try:
+        sku_data = {
+            SKU: {
+                "asin": ASIN,
+                "units_by_usd_price": {6.99: 10, 12.93: 2},
+            }
+        }
+        product_fees = {
+            SKU: {
+                "listing_price": 16.99,
+                "fba_per_unit": 4.20,
+                "is_fba": True,
+                "asin": ASIN,
+            }
+        }
+        out = asyncio.run(fetch_fba_rates_by_sale_price(sku_data, product_fees))
+    finally:
+        amazon_sp.get_fees_estimates_batch = original
+
+    prices = sorted(p for _, p in calls)
+    assert prices == [6.99, 12.93]
+    assert out[SKU]["lt10"][0] == 3.38
+    assert out[SKU]["le10"][2] == 0.56
+    assert out[SKU]["10_50"][0] == 4.20
+
+
+def test_fetch_fba_rates_runs_for_every_asin_in_the_window():
+    """No per-ASIN special case — Blink and Eleet in the same month both adjust."""
+    import asyncio
+    import amazon_sp
+    from agent import fetch_fba_rates_by_sale_price
+
+    blink_sku = "ASG - Blink Game PO1"
+    blink_asin = "B0037W5Y2W"
+
+    async def fake_batch(items, **kwargs):
+        out = {}
+        for entry in items:
+            asin = entry[0]
+            price = round(float(entry[1]), 2)
+            if asin == ASIN:
+                if price < 10:
+                    out[asin] = {"fba": 3.38, "fuel_surcharge": 0.12, "referral": 0.56}
+                else:
+                    out[asin] = {"fba": 4.20, "fuel_surcharge": 0.15, "referral": 1.94}
+            elif asin == blink_asin:
+                out[asin] = {"fba": 3.32, "fuel_surcharge": 0.12, "referral": 2.20}
+                assert 10 <= price < 50
+        return out
+
+    original = amazon_sp.get_fees_estimates_batch
+    amazon_sp.get_fees_estimates_batch = fake_batch
+    try:
+        sku_data = {
+            SKU: {
+                "asin": ASIN,
+                "units_by_usd_price": {6.99: 10, 12.93: 2},
+            },
+            blink_sku: {
+                "asin": blink_asin,
+                "units_by_usd_price": {8.75: 57, 14.69: 1},
+            },
+        }
+        product_fees = {
+            SKU: {"listing_price": 16.99, "is_fba": True, "asin": ASIN},
+            blink_sku: {"listing_price": 9.99, "is_fba": True, "asin": blink_asin},
+        }
+        out = asyncio.run(fetch_fba_rates_by_sale_price(sku_data, product_fees))
+    finally:
+        amazon_sp.get_fees_estimates_batch = original
+
+    assert out[SKU]["lt10"][0] == 3.38
+    assert out[blink_sku]["10_50"][0] == 3.32
+
+
+
