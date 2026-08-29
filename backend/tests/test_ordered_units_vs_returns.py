@@ -125,6 +125,13 @@ def test_returns_subtract_actual_refunded_line_not_sku_average():
     assert abs(sku_data["SKU-A"]["revenue"] - 388.26) > 0.01
     assert abs(sku_data["SKU-A"]["referral_total"] - 58.14) < 0.01
     assert abs(sku_data["SKU-A"]["fba_total"] - 147.90) < 0.01
+    # Applying the same returns map again must not subtract twice
+    # (that produced Blink Jan $519.75 / $78.03 / $146.16 instead of
+    # $537.71 / $80.73 / $151.20).
+    _apply_returns_to_sku_data(sku_data, returns, {"SKU-A": 0.15})
+    assert abs(sku_data["SKU-A"]["revenue"] - 387.92) < 0.001
+    assert abs(sku_data["SKU-A"]["referral_total"] - 58.14) < 0.01
+    assert abs(sku_data["SKU-A"]["fba_total"] - 147.90) < 0.01
 
 
 def test_physical_or_refund_counts_as_returned():
@@ -135,3 +142,38 @@ def test_physical_or_refund_counts_as_returned():
     assert returned_qty_for_sku(physical=3, refunded=1) == 3
     assert returned_qty_for_sku(physical=0, refunded=2) == 2
     assert returned_qty_for_sku(physical=0, refunded=0) == 0
+
+
+def test_returns_net_us_units_and_keep_mexico_unit():
+    sku_data = {
+        "SKU-A": {
+            "units": 62,
+            "revenue": 555.66,
+            "referral_total": 83.43,
+            "fba_total": 156.24,
+            "units_by_marketplace": {
+                "ATVPDKIKX0DER": 61,
+                "A1AM78C64UM0Y8": 1,
+            },
+            "units_by_usd_price": {
+                8.75: 61,
+                14.69: 1,
+            },
+        }
+    }
+    returns = {
+        "SKU-A": {
+            "returned_units": 2,
+            "refunded_revenue": 17.95,
+            "refunded_referral": 2.70,
+            "refunded_fulfillment": 5.04,
+            "returned_units_by_marketplace": {"ATVPDKIKX0DER": 2},
+            "returned_units_by_usd_price": {8.75: 2},
+        }
+    }
+    _apply_returns_to_sku_data(sku_data, returns)
+    assert sku_data["SKU-A"]["net_units"] == 60
+    assert sku_data["SKU-A"]["units_by_marketplace"]["ATVPDKIKX0DER"] == 59
+    assert sku_data["SKU-A"]["units_by_marketplace"]["A1AM78C64UM0Y8"] == 1
+    assert sku_data["SKU-A"]["units_by_usd_price"][8.75] == 59
+    assert sku_data["SKU-A"]["units_by_usd_price"][14.69] == 1

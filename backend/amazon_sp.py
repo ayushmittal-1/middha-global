@@ -582,9 +582,9 @@ def parse_fee_detail_lines(detail_list: list) -> dict:
             has_explicit_fuel = bundled_fuel > 0
         has_base_fba = True
     elif fba > 0 and fuel == 0 and has_base_fba and not has_explicit_fuel:
-        fuel = round(round(fba, 2) * 0.035, 2)
-        # Keep base+fuel consistent with Amazon cent display when we invented fuel.
-        fba = round(float(fba), 2)
+        # Live FBAPerUnitFulfillmentFee is often today's bundle ($5.61 =
+        # $5.42 base + 3.5% fuel). Peel instead of stacking 3.5% on top.
+        fba, fuel = split_bundled_fulfillment_total(fba)
 
     total = referral + fba + fuel + variable_closing
     return {
@@ -603,11 +603,13 @@ def _parse_fees_result(result: dict) -> dict:
     the result came from the singleton or batch endpoint."""
     estimate = (result.get("FeesEstimate") or {})
     detail_list = (estimate.get("FeeDetailList") or [])
-    total = (estimate.get("TotalFeesEstimate") or {}).get("Amount") or 0
+    total_block = estimate.get("TotalFeesEstimate") or {}
+    total = total_block.get("Amount") or 0
     parsed = parse_fee_detail_lines(detail_list)
     out = {
         **parsed,
         "total": float(total) if total else parsed["total"],
+        "currency": (total_block.get("CurrencyCode") or "").strip().upper(),
         "status": (result.get("Status") or "").lower(),
         "error": result.get("Error"),
     }
@@ -621,6 +623,7 @@ async def get_fees_estimate(
     is_fba: bool = True,
     marketplace: str | None = None,
     currency: str = "USD",
+    marketplace_id: str | None = None,
 ) -> dict:
     """Estimate Amazon fees Amazon would charge if this ASIN sold at `price`.
     Returns {referral, fba, fuel_surcharge, total, breakdown:[...]} where each
@@ -630,9 +633,17 @@ async def get_fees_estimate(
     Per the PDF: referral, FBA fulfilment fee, and 3.5%-of-FBA fuel surcharge
     are all returned by Amazon as line items here, so we don't need to
     maintain a category percentages table or size-tier formulas ourselves.
+
+    ``marketplace_id`` (a known Amazon id such as Mexico ``A1AM78C64UM0Y8``)
+    is used as-is so mixed US+MX profitability can request that market's
+    FBA even when ``resolve_marketplace`` would fall back to the US primary.
     """
     user = require_user()
-    marketplace_id = resolve_marketplace(user, marketplace, multiple=False)
+    explicit = (marketplace_id or "").strip()
+    if explicit and explicit in MARKETPLACE_NAMES:
+        marketplace_id = explicit
+    else:
+        marketplace_id = resolve_marketplace(user, marketplace, multiple=False)
     price_r = round(price, 2)
     cache_key = (asin, price_r, bool(is_fba), marketplace_id, currency)
     now_ts = time.time()
@@ -676,6 +687,7 @@ async def get_fees_estimates_batch(
     is_fba: bool = True,
     marketplace: str | None = None,
     currency: str = "USD",
+    marketplace_id: str | None = None,
 ) -> dict[str, dict]:
     """Batch variant of get_fees_estimate — one HTTP call per 20 ASINs via
     /products/fees/v0/feesEstimate. Cache-aware: skips ASINs already in
@@ -690,12 +702,20 @@ async def get_fees_estimates_batch(
     `items` is a list of (asin, price) or (asin, price, is_fba) tuples.
     Per-item `is_fba` overrides the keyword default (needed so FBM SKUs
     are not estimated as Amazon-fulfilled). Duplicate ASINs are
-    de-duplicated by (asin, rounded price, is_fba)."""
+    de-duplicated by (asin, rounded price, is_fba).
+
+    ``marketplace_id`` is used as-is when it is a known Amazon id so
+    Mexico/Canada FBA can be estimated without falling back to US.
+    """
     global _last_fees_batch_ts
     if not items:
         return {}
     user = require_user()
-    marketplace_id = resolve_marketplace(user, marketplace, multiple=False)
+    explicit = (marketplace_id or "").strip()
+    if explicit and explicit in MARKETPLACE_NAMES:
+        marketplace_id = explicit
+    else:
+        marketplace_id = resolve_marketplace(user, marketplace, multiple=False)
     now_ts = time.time()
     out: dict[str, dict] = {}
     # De-dupe by (asin, rounded price, is_fba).

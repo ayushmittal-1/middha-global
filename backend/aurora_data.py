@@ -26,7 +26,9 @@ from currency_fx import (
     infer_line_currency,
     infer_marketplace_id,
     infer_order_date,
+    is_us_marketplace,
     money_field_currency,
+    US_MARKETPLACE_ID,
 )
 
 # Match auroraBackend dashboardMetrics — cancelled/unfulfillable orders are not sales.
@@ -356,6 +358,9 @@ def aggregate_sku_metrics_from_orders(
             "asin": None,
             "referral_total": 0.0,
             "fba_total": 0.0,
+            "units_by_marketplace": {},
+            "marketplace_fee_quotes": {},
+            "units_by_usd_price": {},
         }
     )
     na_price_rows: list[dict] = []
@@ -383,7 +388,7 @@ def aggregate_sku_metrics_from_orders(
             line_ccy = infer_line_currency(doc, it)
             usd_rev = table.to_usd(amount, line_ccy, on)
             fba_block = it.get("fulfillmentFee") or {}
-            fba_ccy = money_field_currency(fba_block, line_ccy)
+            fba_ccy = money_field_currency(fba_block, "USD")
             usd_fba = table.to_usd(_money_amount(fba_block), fba_ccy, on)
             sku_data[sku]["units"] += qty
             sku_data[sku]["revenue"] += usd_rev
@@ -393,6 +398,23 @@ def aggregate_sku_metrics_from_orders(
             sku_data[sku]["fba_total"] += usd_fba
             if not sku_data[sku]["asin"] and it.get("asin"):
                 sku_data[sku]["asin"] = it["asin"]
+            mp = infer_marketplace_id(doc) or US_MARKETPLACE_ID
+            by_mp = sku_data[sku]["units_by_marketplace"]
+            by_mp[mp] = int(by_mp.get(mp) or 0) + int(qty or 0)
+            # Native price for a later Fees API call on CA/MX/etc. (US catalog
+            # FBA is stamped on those lines and is the wrong marketplace rate.)
+            if not is_us_marketplace(mp):
+                quotes = sku_data[sku]["marketplace_fee_quotes"]
+                if mp not in quotes:
+                    quotes[mp] = {
+                        "amount": amount,
+                        "currency": line_ccy,
+                        "asin": it.get("asin"),
+                        "on": on,
+                    }
+            unit_usd = round(float(usd_rev) / float(qty or 1), 2)
+            by_price = sku_data[sku]["units_by_usd_price"]
+            by_price[unit_usd] = int(by_price.get(unit_usd) or 0) + int(qty or 0)
 
     return sku_data, na_price_rows, eligible_orders
 
@@ -698,13 +720,13 @@ async def fba_returns_by_sku(
             ref_block = it.get("referralFee") or {}
             usd_ref = table.to_usd(
                 float(ref_block.get("amount") or 0),
-                money_field_currency(ref_block, line_ccy),
+                line_ccy,
                 on,
             )
             fba_block = it.get("fulfillmentFee") or {}
             usd_fba = table.to_usd(
                 _money_amount(fba_block),
-                money_field_currency(fba_block, line_ccy),
+                money_field_currency(fba_block, "USD"),
                 on,
             )
             ordered_by_sku[sku_key] = ordered_by_sku.get(sku_key, 0.0) + float(
@@ -773,7 +795,21 @@ async def fba_returns_by_sku(
                     refund_units[sku] = refund_units.get(sku, 0) - prev + qty
                     refund_id_qty[key] = qty
             else:
-                refund_units[sku] = refund_units.get(sku, 0) + qty
+                # Same refund posted twice without refundId (v0 + tx) — keep max
+                # qty, do not sum. Summing made 2 real refunds look like 4 units
+                # and subtracted revenue/referral/FBA twice.
+                key = "|".join(
+                    [
+                        sku,
+                        str(row.get("quantity") or ""),
+                        str(row.get("amount") or ""),
+                        str(row.get("refundDate") or "")[:10],
+                    ]
+                )
+                prev = refund_id_qty.get(key, 0)
+                if qty > prev:
+                    refund_units[sku] = refund_units.get(sku, 0) - prev + qty
+                    refund_id_qty[key] = qty
 
         for sku in set(return_units) | set(refund_units):
             qty = returned_qty_for_sku(
@@ -793,7 +829,11 @@ async def fba_returns_by_sku(
                 qty = min(qty, int(ordered))
             referral_total = float(referral_by_sku.get(sku) or 0)
             if referral_total <= 0 and primary:
-                referral_total = float((primary.get("referralFee") or {}).get("amount") or 0)
+                referral_total = table.to_usd(
+                    float((primary.get("referralFee") or {}).get("amount") or 0),
+                    infer_line_currency(order, primary),
+                    on,
+                )
             revenue_total = float(revenue_by_sku.get(sku) or 0)
             if revenue_total <= 0 and primary:
                 revenue_total = float(line_item_sales_amount(primary))
@@ -815,6 +855,8 @@ async def fba_returns_by_sku(
                     "refunded_referral": 0.0,
                     "refunded_revenue": 0.0,
                     "refunded_fulfillment": 0.0,
+                    "returned_units_by_marketplace": {},
+                    "returned_units_by_usd_price": {},
                     "asin": None,
                 },
             )
@@ -822,6 +864,12 @@ async def fba_returns_by_sku(
             entry["refunded_referral"] += referral_per_unit * qty
             entry["refunded_revenue"] += revenue_per_unit * qty
             entry["refunded_fulfillment"] += fulfillment_per_unit * qty
+            ret_mp = infer_marketplace_id(order) or US_MARKETPLACE_ID
+            by_mp = entry["returned_units_by_marketplace"]
+            by_mp[ret_mp] = int(by_mp.get(ret_mp) or 0) + int(qty)
+            unit_usd = round(float(revenue_per_unit or 0), 2)
+            by_price = entry["returned_units_by_usd_price"]
+            by_price[unit_usd] = int(by_price.get(unit_usd) or 0) + int(qty)
             if not entry["asin"]:
                 entry["asin"] = (
                     asin_by_sku.get(sku)

@@ -1756,6 +1756,7 @@ async def profitability_sku_prices(
             "promotion_discount": {"$ifNull": ["$orderItems.promotionDiscount.amount", 0]},
             "currency": {"$ifNull": ["$orderItems.itemPrice.currencyCode", "$orderTotal.currencyCode"]},
             "sales_channel": "$salesChannel",
+            "marketplace_id": "$marketplaceId",
             "asin": "$orderItems.asin",
             "city": "$shippingAddress.city",
             "state": "$shippingAddress.stateOrRegion",
@@ -1765,21 +1766,19 @@ async def profitability_sku_prices(
     from currency_fx import infer_line_currency, infer_order_date, load_usd_fx
 
     docs = await _db().orders.aggregate(pipeline).to_list(length=None)
-    currencies = {
-        str(d.get("currency") or "").strip().upper()
-        for d in docs
-        if str(d.get("currency") or "").strip()
-    }
+    currencies = set()
     for d in docs:
-        ch = str(d.get("sales_channel") or "").strip()
-        if ch:
-            currencies.add(
-                infer_line_currency(
-                    {"salesChannel": ch, "orderTotal": {"currencyCode": d.get("currency")}},
-                    {"itemPrice": {"currencyCode": d.get("currency")}},
-                    default="",
-                )
+        currencies.add(
+            infer_line_currency(
+                {
+                    "salesChannel": d.get("sales_channel"),
+                    "marketplaceId": d.get("marketplace_id"),
+                    "orderTotal": {"currencyCode": d.get("currency")},
+                },
+                {"itemPrice": {"currencyCode": d.get("currency")}},
+                default="",
             )
+        )
     currencies.discard("")
     fx = await load_usd_fx(currencies, start_dt, end_dt)
 
@@ -1791,12 +1790,13 @@ async def profitability_sku_prices(
         promo = float(d.get("promotion_discount") or 0)
         gross_line = subtotal if subtotal > 0 else item_price
         net_line = max(0.0, gross_line - promo)
-        native_ccy = (
-            str(d.get("currency") or "").strip().upper()
-            or infer_line_currency(
-                {"salesChannel": d.get("sales_channel")},
-                None,
-            )
+        native_ccy = infer_line_currency(
+            {
+                "salesChannel": d.get("sales_channel"),
+                "marketplaceId": d.get("marketplace_id"),
+                "orderTotal": {"currencyCode": d.get("currency")},
+            },
+            {"itemPrice": {"currencyCode": d.get("currency")}},
         )
         on = infer_order_date({"purchaseDate": d.get("purchase_date")})
         usd_gross = fx.to_usd(gross_line, native_ccy, on)
