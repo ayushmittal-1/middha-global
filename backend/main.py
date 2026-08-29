@@ -50,6 +50,7 @@ from database import (
     delete_purchase_order,
     open_ordered_qty_by_sku,
     _forecast_cache,
+    _db,
 )
 from forecasting.ingest import (
     backfill_user,
@@ -532,6 +533,13 @@ async def forecasting_restock(
         if not cached:
             return {"count": 0, "rows": []}
 
+    # Join in any Q4 backtest results the user has run. Keyed by sku;
+    # each row surfaces `q4_best_source`, `q4_best_name`, `q4_accuracy_pct`
+    # if a Q4 backtest exists for the SKU, or nulls otherwise.
+    q4_by_sku: dict[str, dict] = {}
+    async for d in _db()["q4BacktestResults"].find({"userId": user_id}):
+        q4_by_sku[d.get("sku")] = d
+
     # Side joins for the derived columns.
     cogs_rows = await get_cogs()
     cogs_by_sku: dict[str, dict] = {r["sku"]: r for r in cogs_rows}
@@ -870,6 +878,18 @@ async def forecasting_restock(
         best_model_name = _bt.get("method") or c.get("method")
         best_model_accuracy_pct = _bt_metrics.get("accuracy_pct")
 
+        # Q4 backtest join — populated when the user has run
+        # POST /forecasting/q4-backtest for this SKU (either as part of
+        # the fleet run or via the per-SKU button). Null out cleanly
+        # when the SKU hasn't been tested yet — FE renders "—".
+        _q4 = q4_by_sku.get(sku) or {}
+        _q4_winner = _q4.get("winner") or {}
+        q4_best_source = _q4_winner.get("source")
+        q4_best_name = _q4_winner.get("name")
+        q4_accuracy_pct = _q4_winner.get("accuracy_pct")
+        q4_actual_units = _q4.get("actual_q4_units")
+        q4_year = _q4.get("year")
+
         rows.append({
             "sku": sku,
             "asin": c.get("asin"),
@@ -877,6 +897,11 @@ async def forecasting_restock(
             "method": c.get("method"),
             "best_model_name": best_model_name,
             "best_model_accuracy_pct": best_model_accuracy_pct,
+            "q4_best_source": q4_best_source,   # "model" | "config" | null
+            "q4_best_name": q4_best_name,       # e.g. "prophet" or "Mid-balanced"
+            "q4_accuracy_pct": q4_accuracy_pct,
+            "q4_actual_units": q4_actual_units,
+            "q4_year": q4_year,
             "is_buyable": is_buyable,
             "status": inv_row.get("status"),
             "listing_status": inv_row.get("listing_status"),
@@ -1338,6 +1363,68 @@ async def put_product_settings_endpoint(
 ):
     settings = await upsert_product_settings(sku, patch)
     return {"sku": sku, "settings": settings}
+
+
+@app.post("/forecasting/q4-backtest")
+async def forecasting_q4_backtest_fleet(user: dict = Depends(protect)):
+    """Kick off a fleet-wide Q4 backtest as an async job. Returns
+    {job_id, status: 'queued'} immediately; poll
+    /forecasting/q4-backtest/job/{job_id} for progress.
+
+    Runtime: ~1-3 min on ~45 SKUs without deep models. Persists per-SKU
+    results to `q4BacktestResults` as it goes so the restock table can
+    surface partial results before the whole run is done.
+    """
+    from bson import ObjectId as _OID
+    from q4_backtest import start_q4_job
+    user_id = _OID(str(user["_id"]))
+    job_id = await start_q4_job(user_id)
+    return {"job_id": job_id, "status": "queued", "scope": "fleet"}
+
+
+@app.post("/forecasting/q4-backtest/{sku}")
+async def forecasting_q4_backtest_sku(sku: str, user: dict = Depends(protect)):
+    """Per-SKU Q4 backtest (fast path — no user-global retrain).
+    Trains only Prophet + Naive for this SKU plus the weight-config
+    sweep. ~10-30 sec. Same async job pattern as the fleet endpoint.
+    """
+    from bson import ObjectId as _OID
+    from q4_backtest import start_q4_job
+    user_id = _OID(str(user["_id"]))
+    job_id = await start_q4_job(user_id, sku=sku)
+    return {"job_id": job_id, "status": "queued", "scope": "sku", "sku": sku}
+
+
+@app.get("/forecasting/q4-backtest/job/{job_id}")
+async def forecasting_q4_backtest_status(
+    job_id: str, user: dict = Depends(protect),
+):
+    """Poll a Q4 backtest job's status. FE hits this every 3-5 sec
+    while the job is running. Returns 404 for unknown jobs, 403 if
+    the caller doesn't own the job."""
+    from q4_backtest import get_q4_job
+    doc = await get_q4_job(job_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="job not found")
+    if doc.get("userId") != str(user["_id"]):
+        raise HTTPException(status_code=403, detail="not your job")
+    return doc
+
+
+@app.get("/forecasting/q4-backtest/results")
+async def forecasting_q4_backtest_results(
+    user: dict = Depends(protect),
+    sku: str | None = None,
+    year: int | None = None,
+):
+    """Fetch persisted Q4 backtest results for the caller. Optional
+    ?sku= and ?year= filters. Returns [] if the user has never run
+    a Q4 backtest for the requested scope."""
+    from bson import ObjectId as _OID
+    from q4_backtest import get_q4_results
+    user_id = _OID(str(user["_id"]))
+    rows = await get_q4_results(user_id, sku=sku, year=year)
+    return {"count": len(rows), "rows": rows}
 
 
 @app.post("/forecasting/weight-sweep")

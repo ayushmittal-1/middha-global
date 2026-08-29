@@ -1267,8 +1267,13 @@
       top: 0;
       right: 0;
       bottom: 0;
-      width: 520px;
-      max-width: 90vw;
+      /* Wider by default so the Prediction accuracy card + the multi-
+         model comparison table + the 90d chart all fit side-by-side
+         without wrapping. Cap at 96vw so a sliver of the underlying
+         page is still visible on smaller screens — that helps users
+         remember the drawer is an overlay, not a new page. */
+      width: 1200px;
+      max-width: 96vw;
       background: #fff;
       box-shadow: -8px 0 24px rgba(0,0,0,0.12);
       transform: translateX(100%);
@@ -1995,6 +2000,8 @@
 
         <button id="restock-settings-toggle" class="secondary">Settings</button>
         <button id="restock-refresh">Refresh forecasts</button>
+        <button id="restock-q4-fleet" class="secondary" title="Train every model with data ≤ Sep 30 last year and score against actual Q4 sales. Populates the Q4 accuracy column for every SKU. ~1-3 min.">Test all on Q4</button>
+        <span id="restock-q4-fleet-status" style="margin-left:10px;color:#3730a3;font-size:12px;"></span>
       </div>
 
       <div id="restock-settings">
@@ -2033,6 +2040,7 @@
               <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next arrival</th>
               <th class="num" title="Weighted sales velocity across the 7/14/30/60/90-day windows (out-of-stock days excluded). Default weights are recent-biased (0.4×v7d + 0.3×v14d + 0.2×v30d + 0.1×v60d + 0×v90d); override per-SKU in Actions → Forecast tab.">Orders Velocity</th>
               <th title="Winning forecast model (from the nightly picker's 30-day holdout backtest) and its accuracy_pct. Any of prophet / naive / lgbm / xgb / ensemble / deepar / tft may win depending on the SKU's demand pattern.">Best model</th>
+              <th title="Q4 accuracy — how accurate the best model/config would have been for last Q4 (Oct-Dec). Populated after clicking 'Test on Q4' in the drawer, or from a fleet Q4 backtest run.">Q4 accuracy</th>
               <th class="num" title="Average units sold per day over the selected window (units sold ÷ window size; Aurora orders, cancelled/pending excluded)"><span id="restock-orders-header">Orders/day (30d)</span></th>
               <!-- <th class="num" title="Total units sold in the selected window (Aurora orders, cancelled/pending excluded)"><span id="restock-units-header">Units (30d)</span></th> -->
               <th class="num">30-day forecast</th>
@@ -3818,6 +3826,22 @@
             const accStr = acc == null ? '—' : `${acc}%`;
             const cls = acc == null ? 'low' : (acc >= 75 ? 'ok' : acc >= 40 ? 'mid' : 'low');
             return `<span class="best-model-cell best-model-${cls}"><strong>${escapeHtml(label)}</strong> ${accStr}</span>`;
+          })()}</td>
+          <td data-q4-sku="${escapeHtml(row.sku)}">${(() => {
+            const MODEL_LABELS = {
+              naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
+              xgb: 'XGBoost', ensemble: 'Ensemble',
+              deepar: 'DeepAR', tft: 'TFT',
+            };
+            const acc = row.q4_accuracy_pct;
+            const name = row.q4_best_name;
+            const year = row.q4_year;
+            if (acc == null) return '<span style="color:#888;">—</span>';
+            const label = row.q4_best_source === 'model'
+              ? (MODEL_LABELS[name] || name || '—')
+              : `Cfg: ${name || '—'}`;
+            const cls = acc >= 75 ? 'ok' : acc >= 40 ? 'mid' : 'low';
+            return `<span class="best-model-cell best-model-${cls}" title="Q4 ${year} · actual=${row.q4_actual_units} units"><strong>${escapeHtml(label)}</strong> ${acc}%</span>`;
           })()}</td>
           <td class="num">${fmtRestockNum((row[ordersField] ?? 0) / ordersWindow, 2)}</td>
           <!-- <td class="num restock-units-cell">${fmtRestockNum(row.units_30d ?? 0)}</td> -->
@@ -5720,6 +5744,17 @@
                   <div><span style="color:#6b7280;">Bias</span><br><strong>${m.bias > 0 ? '+' : ''}${m.bias}</strong><br><span style="font-size:10px;color:#6b7280;">(${biasSign})</span></div>
                   <div><span style="color:#6b7280;">Coverage (p90)</span><br><strong>${m.coverage_pct}%</strong></div>
                 </div>
+              </div>
+              <div class="sku-q4-panel" style="margin-top:12px;padding:10px;border:1px solid #cbd5e1;border-radius:6px;background:#f0f9ff;">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                  <div>
+                    <div style="font-weight:600;font-size:13px;">Q4 backtest for this SKU</div>
+                    <div style="font-size:11px;color:#6b7280;">Trains Prophet + Naive with data ≤ Sep 30 last year, scores against actual Q4 (Oct–Dec) sales. ~10-30 sec.</div>
+                  </div>
+                  <button type="button" id="sku-q4-btn" data-sku="${escapeHtml(sku)}" class="secondary">Test on Q4</button>
+                </div>
+                <div id="sku-q4-status" style="margin-top:8px;font-size:12px;color:#3730a3;"></div>
+                <div id="sku-q4-result" style="margin-top:8px;"></div>
               </div>`;
           })()}
           ${(() => {
@@ -5952,10 +5987,146 @@
             },
           },
         });
+
+        // Q4 backtest button in the drawer — kicks off async job for
+        // this SKU, polls for status, splices result back into the
+        // restock cache when done.
+        const skuQ4Btn = document.getElementById('sku-q4-btn');
+        if (skuQ4Btn) {
+          skuQ4Btn.addEventListener('click', async () => {
+            const targetSku = skuQ4Btn.dataset.sku;
+            await runQ4Job({
+              scope: 'sku', sku: targetSku,
+              statusEl: document.getElementById('sku-q4-status'),
+              resultEl: document.getElementById('sku-q4-result'),
+              buttonEl: skuQ4Btn,
+            });
+          });
+        }
       } catch (err) {
         drawerKV.innerHTML = `<div>Failed to load: ${escapeHtml(String(err))}</div>`;
       }
     }
+
+    // ── Q4 backtest job runner (used by drawer + fleet buttons) ────
+    // Kicks off the job, polls every 3s, updates the caller's status
+    // element. Splices results back into restockCache when done.
+    async function runQ4Job({scope, sku, statusEl, resultEl, buttonEl}) {
+      const MODEL_LABELS = {
+        naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
+        xgb: 'XGBoost', ensemble: 'Ensemble',
+        deepar: 'DeepAR', tft: 'TFT',
+      };
+      const url = scope === 'sku'
+        ? `/forecasting/q4-backtest/${encodeURIComponent(sku)}`
+        : '/forecasting/q4-backtest';
+      if (buttonEl) { buttonEl.disabled = true; }
+      statusEl.textContent = 'Starting job…';
+      if (resultEl) { resultEl.innerHTML = ''; }
+      let jobId;
+      try {
+        const r = await fetch(url, { method: 'POST', headers: authHeaders() });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        jobId = (await r.json()).job_id;
+      } catch (e) {
+        statusEl.textContent = `Failed to start: ${e.message}`;
+        if (buttonEl) { buttonEl.disabled = false; }
+        return;
+      }
+      const startTs = Date.now();
+      const pollOnce = async () => {
+        try {
+          const r = await fetch(
+            `/forecasting/q4-backtest/job/${jobId}`,
+            { headers: authHeaders() },
+          );
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const doc = await r.json();
+          const elapsedSec = ((Date.now() - startTs) / 1000).toFixed(0);
+          if (doc.status === 'running' || doc.status === 'queued') {
+            const detail = scope === 'sku'
+              ? `Training… ${elapsedSec}s elapsed`
+              : `${doc.stage || 'Running'} · ${doc.done_skus ?? 0}/${doc.total_skus ?? '?'} SKUs · ${elapsedSec}s`;
+            statusEl.textContent = detail;
+            setTimeout(pollOnce, 3000);
+            return;
+          }
+          if (doc.status === 'done') {
+            statusEl.textContent = `Done in ${doc.elapsed_sec}s.`;
+            if (buttonEl) { buttonEl.disabled = false; }
+            if (scope === 'sku') {
+              // Splice into restockCache so the table column updates
+              // without a full reload.
+              try {
+                const rr = await fetch(
+                  `/forecasting/q4-backtest/results?sku=${encodeURIComponent(sku)}`,
+                  { headers: authHeaders() },
+                );
+                const body = await rr.json();
+                const row = (body.rows || [])[0];
+                if (row) {
+                  const idx = restockCache.findIndex(r => r.sku === sku);
+                  if (idx !== -1) {
+                    const w = row.winner || {};
+                    restockCache[idx].q4_best_source = w.source || null;
+                    restockCache[idx].q4_best_name = w.name || null;
+                    restockCache[idx].q4_accuracy_pct = w.accuracy_pct ?? null;
+                    restockCache[idx].q4_actual_units = row.actual_q4_units;
+                    restockCache[idx].q4_year = row.year;
+                    renderRestockRows();
+                  }
+                  if (resultEl) {
+                    const w = row.winner;
+                    if (w) {
+                      const label = w.source === 'model'
+                        ? (MODEL_LABELS[w.name] || w.name)
+                        : `Config: ${w.name}`;
+                      resultEl.innerHTML = `
+                        <div style="font-size:12px;padding:8px;background:#dcfce7;border:1px solid #bbf7d0;border-radius:4px;">
+                          <strong>Winner:</strong> ${escapeHtml(label)} — accuracy <strong>${w.accuracy_pct}%</strong>
+                          · predicted ${w.predicted} units vs actual ${row.actual_q4_units} (Q4 ${row.year})
+                        </div>`;
+                    } else {
+                      resultEl.innerHTML = `<div style="font-size:12px;color:#6b7280;">No winner (SKU may have had zero Q4 sales).</div>`;
+                    }
+                  }
+                }
+              } catch (e) {
+                if (resultEl) {
+                  resultEl.textContent = `Job complete but result fetch failed: ${e.message}`;
+                }
+              }
+            } else {
+              // Fleet job done — reload the whole table so every row
+              // picks up its Q4 columns.
+              if (typeof loadRestock === 'function') await loadRestock();
+            }
+            return;
+          }
+          if (doc.status === 'failed') {
+            statusEl.textContent = `Failed: ${doc.error || 'unknown error'}`;
+            if (buttonEl) { buttonEl.disabled = false; }
+            return;
+          }
+          setTimeout(pollOnce, 3000);
+        } catch (e) {
+          statusEl.textContent = `Poll failed: ${e.message}. Retrying…`;
+          setTimeout(pollOnce, 5000);
+        }
+      };
+      pollOnce();
+    }
+
+    // Fleet Q4 backtest button — top of the Restock tab.
+    const restockQ4FleetBtn = document.getElementById('restock-q4-fleet');
+    const restockQ4FleetStatus = document.getElementById('restock-q4-fleet-status');
+    restockQ4FleetBtn?.addEventListener('click', async () => {
+      await runQ4Job({
+        scope: 'fleet',
+        statusEl: restockQ4FleetStatus,
+        buttonEl: restockQ4FleetBtn,
+      });
+    });
 
     // ── Init ───────────────────────────────────────────
 
