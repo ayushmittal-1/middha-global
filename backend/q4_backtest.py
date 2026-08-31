@@ -55,6 +55,7 @@ from forecasting.model import (
     _prophet_forecast,
     _score_forecast_days,
     _split_train_holdout,
+    _try_deepts_train,
     _try_lgbm_train,
     _try_xgb_train,
     compute_velocity_windows,
@@ -118,6 +119,7 @@ async def _q4_backtest_one_sku(
     lgbm_module=None,
     xgb_state=None,
     xgb_module=None,
+    deepts_state: dict | None = None,
 ) -> dict:
     """Score every model + every weight config for one SKU on the
     Q4 holdout. Optional pre-trained user-global bundles (LGBM/XGB)
@@ -207,7 +209,30 @@ async def _q4_backtest_one_sku(
         except Exception as e:
             log.warning("q4 xgb failed sku=%s: %s", sku, e)
 
-    # ── Ensemble (per-day mean of positive p50s from prophet/naive/lgbm/xgb) ──
+    # ── DeepAR + TFT ──
+    # Same pattern as the picker: reuse the pre-trained user-global
+    # bundles the fleet orchestrator built. If they weren't trained
+    # (per-SKU call, or DEEPTS_ENABLED unset) these branches no-op.
+    if deepts_state and deepts_state.get("module") is not None and not train_fit.empty:
+        deepts_mod = deepts_state["module"]
+        for kind_key in ("deepar", "tft"):
+            fc_state = deepts_state.get(kind_key)
+            if fc_state is None:
+                continue
+            try:
+                d_result = deepts_mod.forecast_sku(
+                    fc_state, train_fit, sku,
+                    horizon=Q4_LENGTH_DAYS, today=q4_start,
+                )
+                _apply_recovery_bump(d_result, train_rows, q4_start)
+                _, d_metrics = _score_forecast_days(
+                    d_result.get("forecast") or [], q4_days,
+                )
+                candidates[kind_key] = d_metrics or {}
+            except Exception as e:
+                log.warning("q4 %s failed sku=%s: %s", kind_key, sku, e)
+
+    # ── Ensemble (per-day mean of positive p50s from prophet/naive/lgbm/xgb/deepar/tft) ──
     # Rebuild from the per-model forecasts we just computed.
     # For simplicity we score on total: mean of positive predicted_totals.
     positives = [
@@ -354,6 +379,15 @@ async def run_q4_backtest_fleet(user_id: ObjectId, job_id: str) -> dict:
     xgb_state, xgb_module = await asyncio.to_thread(
         _try_xgb_train, train_series_by_sku, train_end_ts,
     )
+    # DeepAR + TFT (gated by DEEPTS_ENABLED). Training takes 2-5 min
+    # each on Render Pro Plus CPU; total fleet Q4 run goes from ~3 min
+    # to ~15-25 min when they're on. `_try_deepts_train` returns a
+    # dict with `deepar`/`tft`/`module` keys, or empty dict when
+    # DEEPTS_ENABLED is unset.
+    await update(stage="training DeepAR + TFT (this can take 10+ min)")
+    deepts_state = await asyncio.to_thread(
+        _try_deepts_train, train_series_by_sku, train_end_ts,
+    )
     await update(stage="running per-SKU backtests")
 
     # 3. Loop every SKU, storing results as we go.
@@ -365,6 +399,7 @@ async def run_q4_backtest_fleet(user_id: ObjectId, job_id: str) -> dict:
                 user_id, sku,
                 train_cutoff, q4_start, q4_end, year,
                 lgbm_state, lgbm_module, xgb_state, xgb_module,
+                deepts_state,
             )
             result["userId"] = user_id
             result["computedAt"] = computed_at
@@ -378,18 +413,39 @@ async def run_q4_backtest_fleet(user_id: ObjectId, job_id: str) -> dict:
             log.exception("q4 fleet: sku=%s failed: %s", sku, e)
         await update(done_skus=i, progress=int(100 * i / max(total_skus, 1)))
 
-    # 4. Aggregate across the fleet for the summary field.
+    # 4. Aggregate across the fleet.
+    # Two views the FE + tester care about:
+    #   a) `winner_leaderboard` — how many SKUs each candidate WON,
+    #      sorted by wins. Answers "which candidate won most often?"
+    #   b) `model_leaderboard` — for each model, median Q4 accuracy
+    #      across every non-low-volume SKU (regardless of whether it
+    #      won that SKU). Answers "which model is most accurate for
+    #      Q4 overall?" — the metric the client explicitly asked for.
+    #   c) `config_leaderboard` — same as (b) but for weight configs.
     scored_docs = await results_coll.find(
         {"userId": user_id, "year": year, "low_volume": False},
-        {"winner": 1, "models": 1},
+        {"winner": 1, "models": 1, "per_config": 1},
     ).to_list(length=None)
+
     winner_by_source: dict[str, list[float]] = {}
+    model_accuracies: dict[str, list[float]] = {}
+    config_accuracies: dict[str, list[float]] = {}
     for d in scored_docs:
         w = d.get("winner")
         if w and w.get("accuracy_pct") is not None:
             key = f"{w['source']}:{w['name']}"
             winner_by_source.setdefault(key, []).append(w["accuracy_pct"])
-    fleet_summary = [
+        for model_name, m in (d.get("models") or {}).items():
+            acc = (m or {}).get("accuracy_pct")
+            if acc is not None:
+                model_accuracies.setdefault(model_name, []).append(float(acc))
+        for cfg in (d.get("per_config") or []):
+            acc = cfg.get("accuracy_pct")
+            name = cfg.get("name")
+            if acc is not None and name:
+                config_accuracies.setdefault(name, []).append(float(acc))
+
+    winner_leaderboard = [
         {
             "source_name": k,
             "n_wins": len(v),
@@ -399,6 +455,37 @@ async def run_q4_backtest_fleet(user_id: ObjectId, job_id: str) -> dict:
             winner_by_source.items(), key=lambda kv: -len(kv[1]),
         )
     ]
+
+    def _rank(accs_by_key: dict[str, list[float]]) -> list[dict]:
+        out = []
+        for k, v in accs_by_key.items():
+            if not v:
+                continue
+            out.append({
+                "name": k,
+                "median_accuracy_pct": round(statistics.median(v), 1),
+                "mean_accuracy_pct": round(statistics.mean(v), 1),
+                "skus_at_or_above_75pct": sum(1 for a in v if a >= 75),
+                "n_scored": len(v),
+            })
+        out.sort(key=lambda r: (
+            -r["median_accuracy_pct"],
+            -r["mean_accuracy_pct"],
+            -r["skus_at_or_above_75pct"],
+        ))
+        return out
+
+    model_leaderboard = _rank(model_accuracies)
+    config_leaderboard = _rank(config_accuracies)
+    best_q4_model = model_leaderboard[0] if model_leaderboard else None
+    best_q4_config = config_leaderboard[0] if config_leaderboard else None
+    fleet_summary = {
+        "winner_leaderboard": winner_leaderboard,
+        "model_leaderboard": model_leaderboard,
+        "config_leaderboard": config_leaderboard,
+        "best_q4_model": best_q4_model,
+        "best_q4_config": best_q4_config,
+    }
 
     finished_at = datetime.now(timezone.utc)
     await update(
@@ -415,6 +502,8 @@ async def run_q4_backtest_fleet(user_id: ObjectId, job_id: str) -> dict:
         "year": year,
         "n_skus_scored": total_skus,
         "fleet_summary": fleet_summary,
+        "best_q4_model": best_q4_model,
+        "best_q4_config": best_q4_config,
     }
 
 

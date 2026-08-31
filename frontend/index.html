@@ -2000,8 +2000,12 @@
 
         <button id="restock-settings-toggle" class="secondary">Settings</button>
         <button id="restock-refresh">Refresh forecasts</button>
-        <button id="restock-q4-fleet" class="secondary" title="Train every model with data ≤ Sep 30 last year and score against actual Q4 sales. Populates the Q4 accuracy column for every SKU. ~1-3 min.">Test all on Q4</button>
+        <button id="restock-q4-fleet" class="secondary" title="Train every model with data ≤ Sep 30 last year and score against actual Q4 sales. Populates the Q4 accuracy column for every SKU. ~1-3 min (or ~15-25 min with DEEPTS_ENABLED=1).">Test all on Q4</button>
         <span id="restock-q4-fleet-status" style="margin-left:10px;color:#3730a3;font-size:12px;"></span>
+      </div>
+
+      <div id="restock-q4-summary" style="display:none;margin:6px 0 12px;padding:12px;border:1px solid #cbd5e1;border-radius:8px;background:#f0f9ff;">
+        <!-- Populated by the fleet Q4 handler with best_q4_model + top 3 leaderboards. -->
       </div>
 
       <div id="restock-settings">
@@ -6098,8 +6102,83 @@
               }
             } else {
               // Fleet job done — reload the whole table so every row
-              // picks up its Q4 columns.
+              // picks up its Q4 columns, then render the fleet-level
+              // "Best Q4 model" leaderboard panel above the table.
               if (typeof loadRestock === 'function') await loadRestock();
+              const summaryEl = document.getElementById('restock-q4-summary');
+              const fs = doc.fleet_summary || {};
+              const bestModel = fs.best_q4_model;
+              const bestConfig = fs.best_q4_config;
+              if (summaryEl && (bestModel || bestConfig)) {
+                const MODEL_LABELS = {
+                  naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
+                  xgb: 'XGBoost', ensemble: 'Ensemble',
+                  deepar: 'DeepAR', tft: 'TFT',
+                };
+                const modelLabel = (n) => MODEL_LABELS[n] || n || '—';
+                const renderRow = (r, labelFn) => `
+                  <tr>
+                    <td style="padding:4px 8px;"><strong>${escapeHtml(labelFn(r.name))}</strong></td>
+                    <td style="padding:4px 8px;text-align:right;"><strong>${r.median_accuracy_pct}%</strong></td>
+                    <td style="padding:4px 8px;text-align:right;">${r.mean_accuracy_pct}%</td>
+                    <td style="padding:4px 8px;text-align:right;">${r.skus_at_or_above_75pct}</td>
+                    <td style="padding:4px 8px;text-align:right;">${r.n_scored}</td>
+                  </tr>`;
+                const modelRows = (fs.model_leaderboard || []).map(r => renderRow(r, modelLabel)).join('');
+                const configRows = (fs.config_leaderboard || []).map(r => renderRow(r, n => 'Cfg: ' + n)).join('');
+                const bestBanner = bestModel ? `
+                  <div style="font-size:14px;margin-bottom:8px;">
+                    <span style="color:#6b7280;">Best model for Q4:</span>
+                    <strong style="color:#0369a1;">${escapeHtml(modelLabel(bestModel.name))}</strong>
+                    · median <strong>${bestModel.median_accuracy_pct}%</strong>
+                    · mean ${bestModel.mean_accuracy_pct}%
+                    · ${bestModel.skus_at_or_above_75pct}/${bestModel.n_scored} SKUs ≥ 75%
+                  </div>` : '';
+                const bestConfigBanner = bestConfig ? `
+                  <div style="font-size:14px;margin-bottom:8px;">
+                    <span style="color:#6b7280;">Best weight config for Q4:</span>
+                    <strong style="color:#0369a1;">${escapeHtml(bestConfig.name)}</strong>
+                    · median <strong>${bestConfig.median_accuracy_pct}%</strong>
+                    · mean ${bestConfig.mean_accuracy_pct}%
+                    · ${bestConfig.skus_at_or_above_75pct}/${bestConfig.n_scored} SKUs ≥ 75%
+                  </div>` : '';
+                summaryEl.innerHTML = `
+                  <div style="font-weight:600;font-size:14px;margin-bottom:8px;">Q4 backtest — fleet leaderboard</div>
+                  ${bestBanner}${bestConfigBanner}
+                  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:10px;">
+                    <div>
+                      <div style="font-size:12px;color:#6b7280;margin-bottom:4px;">Models ranked by median Q4 accuracy</div>
+                      <table style="width:100%;font-size:12px;border-collapse:collapse;">
+                        <thead>
+                          <tr style="color:#6b7280;font-size:11px;border-bottom:1px solid #cbd5e1;">
+                            <th style="text-align:left;padding:4px 8px;">Model</th>
+                            <th style="text-align:right;padding:4px 8px;">Median</th>
+                            <th style="text-align:right;padding:4px 8px;">Mean</th>
+                            <th style="text-align:right;padding:4px 8px;" title="Number of SKUs where this model hit ≥75% Q4 accuracy">≥75%</th>
+                            <th style="text-align:right;padding:4px 8px;">n</th>
+                          </tr>
+                        </thead>
+                        <tbody>${modelRows || '<tr><td colspan="5" style="padding:4px 8px;color:#6b7280;">No models scored</td></tr>'}</tbody>
+                      </table>
+                    </div>
+                    <div>
+                      <div style="font-size:12px;color:#6b7280;margin-bottom:4px;">Weight configs ranked by median Q4 accuracy</div>
+                      <table style="width:100%;font-size:12px;border-collapse:collapse;">
+                        <thead>
+                          <tr style="color:#6b7280;font-size:11px;border-bottom:1px solid #cbd5e1;">
+                            <th style="text-align:left;padding:4px 8px;">Config</th>
+                            <th style="text-align:right;padding:4px 8px;">Median</th>
+                            <th style="text-align:right;padding:4px 8px;">Mean</th>
+                            <th style="text-align:right;padding:4px 8px;">≥75%</th>
+                            <th style="text-align:right;padding:4px 8px;">n</th>
+                          </tr>
+                        </thead>
+                        <tbody>${configRows || '<tr><td colspan="5" style="padding:4px 8px;color:#6b7280;">No configs scored</td></tr>'}</tbody>
+                      </table>
+                    </div>
+                  </div>`;
+                summaryEl.style.display = 'block';
+              }
             }
             return;
           }
