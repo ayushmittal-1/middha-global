@@ -1412,7 +1412,7 @@ async def fetch_fba_rates_by_sale_price(
     unique: dict[tuple[str, float, bool], None] = {}
 
     for sku, d in (sku_data or {}).items():
-        by_price = d.get("units_by_usd_price") or {}
+        by_price = d.get("ordered_units_by_usd_price") or d.get("units_by_usd_price") or {}
         if not by_price:
             continue
         asin = str(d.get("asin") or "").strip()
@@ -1545,7 +1545,13 @@ def _aggregate_sku_from_sp_api(
         o.get("AmazonOrderId"): o for o in orders if o.get("AmazonOrderId")
     }
     sku_data: dict[str, dict] = defaultdict(
-        lambda: {"units": 0, "revenue": 0.0, "asin": None},
+        lambda: {
+            "units": 0,
+            "revenue": 0.0,
+            "asin": None,
+            "referral_total": 0.0,
+            "fba_total": 0.0,
+        },
     )
     for oid, items_resp in items_results:
         if oid in excluded_ids:
@@ -1572,6 +1578,9 @@ def _aggregate_sku_from_sp_api(
             usd_rev = table.to_usd(amount, infer_line_currency(parent, it), on)
             sku_data[sku]["units"] += qty
             sku_data[sku]["revenue"] += usd_rev
+            sku_data[sku]["referral_total"] += aurora_data.line_referral_fee(
+                usd_rev, aurora_data._DEFAULT_REFERRAL_RATE, qty or 1,
+            )
             if not sku_data[sku]["asin"] and it.get("ASIN"):
                 sku_data[sku]["asin"] = it["ASIN"]
             mp = infer_marketplace_id(parent) or US_MARKETPLACE_ID
@@ -1618,22 +1627,30 @@ def _apply_returns_to_sku_data(
     (sum of line ``quantityOrdered`` — a 3-unit order counts as 3, not 1).
     ``returned_units`` is the returned/refunded quantity (also unit-based,
     not one-per-order). ``net_units`` = ordered − returned is used for
-    COGS / per-unit fee math.
+    COGS. Referral and FBA stay on shipped/ordered units after USD
+    conversion (B07H4S83D8: 77 shipped including a Mexico 2-pack → fees
+    × 77; revenue nets the 2 returns).
 
-    Revenue / referral / FBA subtract the **refunded order lines'** dollars
-    (``refunded_revenue`` / referral / fulfillment). A SKU-wide
-    ``× kept/ordered`` ratio is wrong when sale prices differ across units
-    (Andexports B08P3CD3WR: $399.68 × 34/35 = $388.26 vs true $387.92).
+    Revenue subtracts the **refunded order lines'** dollars
+    (``refunded_revenue``). A SKU-wide ``× kept/ordered`` ratio is wrong
+    when sale prices differ (Andexports B08P3CD3WR: $399.68 × 34/35 =
+    $388.26 vs true $387.92).
     """
     if not sku_data:
         return
-    rates = rate_by_sku or {}
-    rates_lower = {str(k).lower(): float(v) for k, v in rates.items()}
     for sku, d in sku_data.items():
         ordered = int(d.get("units") or 0)
         d["ordered_units"] = ordered
         d["returned_units"] = 0
         d["net_units"] = ordered
+        if "ordered_units_by_usd_price" not in d:
+            d["ordered_units_by_usd_price"] = {
+                round(float(k), 2): int(v)
+                for k, v in (d.get("units_by_usd_price") or {}).items()
+                if int(v or 0) > 0
+            }
+        if "ordered_revenue" not in d:
+            d["ordered_revenue"] = float(d.get("revenue") or 0.0)
         # Keep d["units"] == ordered so Units column matches All Orders qty.
         if ordered <= 0 or not returns_by_sku:
             continue
@@ -1661,55 +1678,14 @@ def _apply_returns_to_sku_data(
 
         old_rev = float(d.get("revenue") or 0.0)
         refunded_rev = abs(float((ret or {}).get("refunded_revenue") or 0.0))
-        refunded_ref = abs(float((ret or {}).get("refunded_referral") or 0.0))
-        refunded_ful = abs(float((ret or {}).get("refunded_fulfillment") or 0.0))
 
         if refunded_rev > 0:
             refunded_rev = min(refunded_rev, old_rev)
             d["revenue"] = max(0.0, old_rev - refunded_rev)
-            rate = rates.get(sku)
-            if rate is None:
-                rate = rates_lower.get(str(sku).lower())
-            if rate is None:
-                rate = aurora_data._DEFAULT_REFERRAL_RATE
-            # Match recompute_referral_totals (snapped % × refunded $).
-            ref_delta = aurora_data.line_referral_fee(
-                refunded_rev, float(rate), returned,
-            )
-            if "referral_total" in d:
-                d["referral_total"] = max(
-                    0.0,
-                    float(d.get("referral_total") or 0.0) - ref_delta,
-                )
-            if "fba_total" in d:
-                if refunded_ful <= 0 and ordered > 0:
-                    refunded_ful = (
-                        float(d.get("fba_total") or 0.0) / ordered
-                    ) * returned
-                d["fba_total"] = max(
-                    0.0,
-                    float(d.get("fba_total") or 0.0) - refunded_ful,
-                )
         else:
             # Legacy path when returns map has units only (unit tests / old data).
             ratio = kept / ordered if ordered else 0.0
             d["revenue"] = old_rev * ratio
-            if "referral_total" in d:
-                if refunded_ref > 0:
-                    d["referral_total"] = max(
-                        0.0,
-                        float(d.get("referral_total") or 0.0) - refunded_ref,
-                    )
-                else:
-                    d["referral_total"] = float(d.get("referral_total") or 0.0) * ratio
-            if "fba_total" in d:
-                if refunded_ful > 0:
-                    d["fba_total"] = max(
-                        0.0,
-                        float(d.get("fba_total") or 0.0) - refunded_ful,
-                    )
-                else:
-                    d["fba_total"] = float(d.get("fba_total") or 0.0) * ratio
 
 
 # Storage / aged-charges report generation on Amazon's side runs 30-240s for
@@ -1810,9 +1786,10 @@ async def compute_profitability_data(
     otherwise spread uniformly across units sold. Returns / low-inv /
     inbound-placement come from Finances / Aurora events; aged-inv and
     removal / disposal come from their Seller Central charge reports.
-    Units, revenue, Referral, FBA, Fuel, and COGS are net of returned/
-    refunded units for orders purchased in the window; Return Proc still
-    charges 20% of referral on those returned units.
+    Units stay Amazon All Orders qty. Revenue and COGS are net of
+    returned/refunded units; Referral and FBA stay on shipped/ordered
+    units after USD conversion. Return Proc still charges 20% of
+    referral on those returned units.
 
     Window is defined by `start`/`end` (YYYY-MM-DD strings or datetimes)
     when either is provided; falls back to `days_back` for legacy callers
@@ -2920,30 +2897,45 @@ async def compute_profitability_data(
     # mixed sale prices match Seller Central. Stored line referralFee used
     # referral$/listing$ and undercounted (e.g. $159.46 vs $159.74).
     rate_by_sku: dict[str, float] = {}
+    for _sku in skus:
+        _pf = product_fee_fallback.get(_sku) if product_fee_fallback else None
+        if not _pf and product_fee_fallback:
+            _pf = next(
+                (
+                    v for k, v in product_fee_fallback.items()
+                    if str(k).lower() == str(_sku).lower()
+                ),
+                None,
+            )
+        if _pf:
+            rate_by_sku[_sku] = aurora_data.snap_referral_rate(
+                _pf.get("listing_price"),
+                _pf.get("referral_per_unit"),
+            )
+        else:
+            rate_by_sku[_sku] = aurora_data._DEFAULT_REFERRAL_RATE
     if use_db and db_orders and sku_data:
-        for _sku in skus:
-            _pf = product_fee_fallback.get(_sku) if product_fee_fallback else None
-            if not _pf and product_fee_fallback:
-                _pf = next(
-                    (
-                        v for k, v in product_fee_fallback.items()
-                        if str(k).lower() == str(_sku).lower()
-                    ),
-                    None,
-                )
-            if _pf:
-                rate_by_sku[_sku] = aurora_data.snap_referral_rate(
-                    _pf.get("listing_price"),
-                    _pf.get("referral_per_unit"),
-                )
-            else:
-                rate_by_sku[_sku] = aurora_data._DEFAULT_REFERRAL_RATE
         aurora_data.recompute_referral_totals(
             db_orders, sku_data, rate_by_sku, fx=fx_table,
         )
+    elif sku_data:
+        # Live SP-API path has no Aurora order docs. Lines were accumulated
+        # at the default 15%; rescale to the snapped category rate.
+        default_rate = aurora_data._DEFAULT_REFERRAL_RATE
+        if default_rate:
+            for _sku, _rate in rate_by_sku.items():
+                _d = sku_data.get(_sku)
+                if not _d or abs(float(_rate) - default_rate) < 1e-9:
+                    continue
+                _d["referral_total"] = round(
+                    float(_d.get("referral_total") or 0)
+                    * (float(_rate) / default_rate),
+                    2,
+                )
 
-    # Net out returned/refunded units before fee × units math and storage /
-    # ad allocation. Return Proc still uses full returned_units below.
+    # Snapshot shipped units/revenue, then net only revenue for COGS /
+    # avg price. Referral and FBA stay on ordered units. Return Proc
+    # still uses full returned_units below.
     _apply_returns_to_sku_data(sku_data, returns_by_sku, rate_by_sku)
 
     # Units sold per ASIN — used to split that ASIN's report fee across SKUs.
@@ -2983,13 +2975,24 @@ async def compute_profitability_data(
     for sku in skus:
         d = sku_data[sku]
         # `units` = Amazon All Orders quantity (sum of quantityOrdered).
-        # COGS / per-unit fees use net_units (ordered − returned).
+        # COGS uses net_units (ordered − returned). Referral / FBA use
+        # shipped/ordered units after USD conversion so a Mexico 2-pack
+        # (B07H4S83D8) is not dropped with the 2 US returns.
         units = int(d.get("units") or 0)
         ordered_units = int(d.get("ordered_units") or units)
         returned_units = int(d.get("returned_units") or 0)
         net_units = int(d.get("net_units") if d.get("net_units") is not None else max(0, ordered_units - returned_units))
         bill_units = net_units if net_units > 0 else 0
+        fee_units = ordered_units if ordered_units > 0 else bill_units
+        fee_prices = d.get("ordered_units_by_usd_price") or d.get("units_by_usd_price")
         revenue = round(d["revenue"], 2)
+        # Gross converted sales (before refunds) so a missing line-referral
+        # fallback still bills 15% of shipped USD, not net after returns.
+        fee_revenue = round(float(
+            d["ordered_revenue"]
+            if d.get("ordered_revenue") is not None
+            else d["revenue"]
+        ), 2)
         avg_price = revenue / bill_units if bill_units else 0.0
         asin = d["asin"]
 
@@ -3009,8 +3012,8 @@ async def compute_profitability_data(
         referral_total, fba_total, fuel_total, fee_source = resolve_sku_referral_fba_fuel(
             line_referral=float(d.get("referral_total") or 0),
             line_fba=float(d.get("fba_total") or 0),
-            bill_units=bill_units,
-            revenue=revenue,
+            bill_units=fee_units,
+            revenue=fee_revenue,
             product_fees=pf,
             fee_estimate=est,
             include_fuel=fuel_applies,
@@ -3049,16 +3052,16 @@ async def compute_profitability_data(
             }
             if fba_per_band or fba_per_price:
                 rebuilt = apply_sale_price_fba(
-                    bill_units=bill_units,
-                    units_by_usd_price=d.get("units_by_usd_price"),
+                    bill_units=fee_units,
+                    units_by_usd_price=fee_prices,
                     fba_per_usd_price=fba_per_price,
                     catalog_fba_per_unit=(
-                        (fba_total / bill_units) if bill_units else 0.0
+                        (fba_total / fee_units) if fee_units else 0.0
                     ),
                     include_fuel=fuel_applies,
                     fuel_per_usd_price=fuel_per_price,
                     catalog_fuel_per_unit=(
-                        (fuel_total / bill_units) if bill_units else 0.0
+                        (fuel_total / fee_units) if fee_units else 0.0
                     ),
                     fba_per_band=fba_per_band,
                     fuel_per_band=fuel_per_band,
@@ -3080,8 +3083,8 @@ async def compute_profitability_data(
                 (pf or {}).get("referral_per_unit"),
             )
             ref_rebuilt = apply_sale_price_referral(
-                bill_units=bill_units,
-                units_by_usd_price=d.get("units_by_usd_price"),
+                bill_units=fee_units,
+                units_by_usd_price=fee_prices,
                 category_rate=cat_rate,
                 referral_per_band=referral_per_band,
                 referral_per_usd_price=referral_per_price,
