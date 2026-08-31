@@ -127,17 +127,17 @@ def test_returns_subtract_actual_refunded_line_not_sku_average():
     assert abs(sku_data["SKU-A"]["revenue"] - 387.92) < 0.001
     # Not the buggy proportional 399.68 * 34/35 = 388.26
     assert abs(sku_data["SKU-A"]["revenue"] - 388.26) > 0.01
-    # Referral / FBA stay on the 35 shipped units (All Orders qty after
-    # USD conversion). Revenue is what nets the refunded line.
-    assert abs(sku_data["SKU-A"]["referral_total"] - 59.90) < 0.01
-    assert abs(sku_data["SKU-A"]["fba_total"] - 152.25) < 0.01
+    # Referral / FBA net the refunded line (Andexports $1.76 / $4.35).
+    # Revenue is what nets the refunded dollars. Units stay ordered qty.
+    assert abs(sku_data["SKU-A"]["referral_total"] - 58.14) < 0.01
+    assert abs(sku_data["SKU-A"]["fba_total"] - 147.90) < 0.01
     # Applying the same returns map again must not subtract twice
     # (that produced Blink Jan $519.75 / $78.03 / $146.16 instead of
     # $537.71 / $80.73 / $151.20).
     _apply_returns_to_sku_data(sku_data, returns, {"SKU-A": 0.15})
     assert abs(sku_data["SKU-A"]["revenue"] - 387.92) < 0.001
-    assert abs(sku_data["SKU-A"]["referral_total"] - 59.90) < 0.01
-    assert abs(sku_data["SKU-A"]["fba_total"] - 152.25) < 0.01
+    assert abs(sku_data["SKU-A"]["referral_total"] - 58.14) < 0.01
+    assert abs(sku_data["SKU-A"]["fba_total"] - 147.90) < 0.01
 
 
 def test_physical_or_refund_counts_as_returned():
@@ -187,15 +187,15 @@ def test_returns_net_us_units_and_keep_mexico_unit():
     assert sku_data["SKU-A"]["ordered_units_by_usd_price"][14.69] == 1
 
 
-def test_phase_card_mexico_fees_stay_on_shipped_units():
+def test_phase_card_mexico_stays_in_net_fees():
     """B07H4S83D8: 75 US + 2 MX shipped, 2 US returns.
 
-    MXN 801.18 converted to USD is already in gross referral $206.79.
-    Fees stay on 77 shipped (FBA $4.20 × 77 = $323.40). Revenue nets
-    the 2 returns → $1,344.49. Old path billed fees on 75 net units
-    ($201.71 / $315).
+    MXN converts to USD first (not pesos-as-dollars). Fees then follow
+    net units: FBA $4.20 × 75 = $315. Referral is 15% of net converted
+    sales (~$201.26–$201.71), not $4.20 × 77 shipped.
     """
     from agent import apply_sale_price_fba
+    from aurora_data import line_referral_fee
 
     sku = "ASG - PHASE CARD GAME PO2"
     sku_data = {
@@ -220,33 +220,64 @@ def test_phase_card_mexico_fees_stay_on_shipped_units():
             "returned_units_by_usd_price": {17.96: 2},
         }
     }
-    _apply_returns_to_sku_data(sku_data, returns)
+    _apply_returns_to_sku_data(sku_data, returns, {sku: 0.15})
     d = sku_data[sku]
     assert d["units"] == 77
     assert d["ordered_units"] == 77
     assert d["returned_units"] == 2
     assert d["net_units"] == 75
     assert abs(d["revenue"] - 1344.49) < 0.001
-    assert abs(d["ordered_revenue"] - 1378.60) < 0.001
-    assert abs(d["referral_total"] - 206.79) < 0.01
-    assert d["ordered_units_by_usd_price"][17.96] == 75
-    assert d["ordered_units_by_usd_price"][21.40] == 2
+    assert abs(d["units_by_marketplace"]["A1AM78C64UM0Y8"] - 2) < 0.001
+    want_ref = round(206.79 - line_referral_fee(34.11, 0.15, 2), 2)
+    assert abs(d["referral_total"] - want_ref) < 0.02
+    assert abs(d["referral_total"] - 201.26) < 0.5
     rebuilt = apply_sale_price_fba(
-        bill_units=77,
-        units_by_usd_price=d["ordered_units_by_usd_price"],
+        bill_units=75,
+        units_by_usd_price=d["units_by_usd_price"],
         fba_per_usd_price={},
         catalog_fba_per_unit=4.20,
         include_fuel=False,
     )
-    assert rebuilt == (323.40, 0.0)
+    assert rebuilt == (315.00, 0.0)
 
 
-def test_referral_fallback_bills_gross_shipped_not_net():
-    """When order-line referral is missing, % of gross shipped USD.
+def test_listing_under_10_uses_10_50_fba_on_higher_sale_prices():
+    """B07TJT135V: listed $9.92 (lt10 FBA $3.38), sold at $11–$15.
 
-    Passing net revenue after returns is the old $201.67 bug. The row
-    loop now sends ordered_revenue so FBA × 77 and referral stay on
-    shipped units for every SKU, not only ones with precomputed lines.
+    Mexico 21 units in the $10–$50 band are $4.20 each → $88.20, not
+    $3.38 × 21 = $70.98. Referral stays 15% of converted USD (not the
+    US $14.63 preview × 21 = $46.08).
+    """
+    from agent import apply_sale_price_fba
+
+    rebuilt = apply_sale_price_fba(
+        bill_units=21,
+        units_by_usd_price={11.13: 21},
+        fba_per_usd_price={},
+        catalog_fba_per_unit=3.38,
+        include_fuel=False,
+        fba_per_band={"10_50": 4.20, "lt10": 3.38},
+        fuel_per_band={"10_50": 0.15, "lt10": 0.12},
+    )
+    assert rebuilt == (88.20, 0.0)
+
+    mixed = apply_sale_price_fba(
+        bill_units=98,
+        units_by_usd_price={14.70: 77, 11.13: 21},
+        fba_per_usd_price={},
+        catalog_fba_per_unit=3.38,
+        include_fuel=False,
+        fba_per_band={"10_50": 4.20, "lt10": 3.38},
+        fuel_per_band={"10_50": 0.15, "lt10": 0.12},
+    )
+    assert mixed == (411.60, 0.0)
+
+
+def test_referral_fallback_bills_net_converted_not_shipped():
+    """Missing line-referral uses 15% of net converted USD × net units.
+
+    B07H4S83D8 expected FBA $315 = $4.20 × 75 kept units. Gross shipped
+    $1378.60 / 77 would overstate after the 2 US returns.
     """
     from agent import resolve_sku_referral_fba_fuel
 
@@ -257,27 +288,17 @@ def test_referral_fallback_bills_gross_shipped_not_net():
         "fuel_per_unit": 0.15,
         "fulfillment_per_unit": 4.35,
     }
-    ref_gross, fba, fuel, _ = resolve_sku_referral_fba_fuel(
+    ref_net, fba, fuel, _ = resolve_sku_referral_fba_fuel(
         line_referral=0,
         line_fba=0,
-        bill_units=77,
-        revenue=1378.60,
-        product_fees=pf,
-        fee_estimate=None,
-        include_fuel=False,
-    )
-    ref_net, _, _, _ = resolve_sku_referral_fba_fuel(
-        line_referral=0,
-        line_fba=0,
-        bill_units=77,
+        bill_units=75,
         revenue=1344.49,
         product_fees=pf,
         fee_estimate=None,
         include_fuel=False,
     )
-    assert ref_gross > 205.0
-    assert ref_net < ref_gross - 4.0
-    assert abs(fba - 323.40) < 0.01
+    assert abs(ref_net - 201.67) < 1.0
+    assert abs(fba - 315.00) < 0.05
     assert fuel == 0.0
 
 

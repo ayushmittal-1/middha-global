@@ -476,6 +476,53 @@ def _pack_product_fee_doc(doc: dict) -> dict | None:
     }
 
 
+def _usd_listing_fba_band(price: float) -> str:
+    """Same $10 / $50 cuts as ``agent.usd_fba_price_band`` (no import cycle)."""
+    p = float(price or 0)
+    if p < 10:
+        return "lt10"
+    if p < 50:
+        return "10_50"
+    return "gt50"
+
+
+async def fba_band_rates_for_asins(
+    asins: list[str],
+) -> dict[str, dict[str, tuple[float, float]]]:
+    """US FBA base+fuel per sale-price band from catalog listings of each ASIN.
+
+    A SKU listed at $9.92 keeps the under-$10 FBA card ($3.38). Units sold
+    at $11–$15 are Amazon's $10–$50 band ($4.20 on the same size-tier).
+    Live Fees API quotes that band; when the quote is missing, another
+    listing of the same ASIN already priced in that band is the same
+    physical product's rate (B07TJT135V: $4.20 × 21 MX units = $88.20).
+    """
+    wanted = sorted({str(a).strip().upper() for a in (asins or []) if str(a).strip()})
+    if not wanted:
+        return {}
+    out: dict[str, dict[str, tuple[float, float]]] = {}
+    async for doc in _db().products.find(
+        {"asin": {"$in": wanted}},
+        {"asin": 1, "fees": 1, "price": 1, "fulfillmentType": 1},
+    ):
+        packed = _pack_product_fee_doc(doc)
+        if not packed:
+            continue
+        asin = str(packed.get("asin") or doc.get("asin") or "").strip().upper()
+        if asin not in wanted:
+            continue
+        listing = float(packed.get("listing_price") or 0)
+        fba = float(packed.get("fba_per_unit") or 0)
+        fuel = float(packed.get("fuel_per_unit") or 0)
+        if listing <= 0 or fba <= 0:
+            continue
+        band = _usd_listing_fba_band(listing)
+        dest = out.setdefault(asin, {})
+        if band not in dest:
+            dest[band] = (round(fba, 2), round(fuel, 2))
+    return out
+
+
 def _fulfillment_per_unit(pf: dict | None) -> float:
     if not pf:
         return 0.0
