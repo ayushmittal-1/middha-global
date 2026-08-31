@@ -348,3 +348,140 @@ def test_sp_api_aggregate_accrues_referral_on_converted_lines():
     assert abs(d["revenue"] - usd) < 0.01
     assert d["referral_total"] > 0
     assert abs(d["referral_total"] - usd * 0.15) < 0.05
+
+
+def test_net_fees_and_sale_bands_apply_to_every_asin():
+    """No ASIN allowlist: two unrelated SKUs both net returns and use the
+    sale-price FBA band of that ASIN, not a Phase Card special case."""
+    from agent import apply_sale_price_fba, merge_asin_catalog_fba_bands
+
+    sku_data = {
+        "SKU-CARD": {
+            "units": 77,
+            "revenue": 1378.60,
+            "referral_total": 206.79,
+            "fba_total": 334.95,
+            "asin": "B00AAA1111",
+            "units_by_usd_price": {17.96: 75, 21.40: 2},
+        },
+        "SKU-UNO": {
+            "units": 22,
+            "revenue": 250.00,
+            "referral_total": 37.50,
+            "fba_total": 74.36,
+            "asin": "B00BBB2222",
+            "units_by_usd_price": {11.13: 21, 9.50: 1},
+        },
+    }
+    returns = {
+        "SKU-CARD": {
+            "returned_units": 2,
+            "refunded_revenue": 34.11,
+            "returned_units_by_usd_price": {17.96: 2},
+        },
+        "SKU-UNO": {
+            "returned_units": 1,
+            "refunded_revenue": 9.50,
+            "returned_units_by_usd_price": {9.50: 1},
+        },
+    }
+    _apply_returns_to_sku_data(
+        sku_data, returns, {"SKU-CARD": 0.15, "SKU-UNO": 0.15},
+    )
+    assert sku_data["SKU-CARD"]["net_units"] == 75
+    assert sku_data["SKU-UNO"]["net_units"] == 21
+
+    listing_bands = {
+        "B00AAA1111": {"10_50": (4.20, 0.15)},
+        "B00BBB2222": {"lt10": (3.38, 0.12), "10_50": (4.20, 0.15)},
+    }
+    for sku, catalog, listing_band, want_fba in (
+        ("SKU-CARD", 4.20, "10_50", 315.00),
+        ("SKU-UNO", 3.38, "lt10", 88.20),
+    ):
+        d = sku_data[sku]
+        rates = merge_asin_catalog_fba_bands(
+            {}, asin=d["asin"], listing_bands=listing_bands,
+        )
+        rates.pop(listing_band, None)
+        rebuilt = apply_sale_price_fba(
+            bill_units=int(d["net_units"]),
+            units_by_usd_price=d["units_by_usd_price"],
+            fba_per_usd_price={},
+            catalog_fba_per_unit=catalog,
+            include_fuel=False,
+            fba_per_band={k: v[0] for k, v in rates.items()},
+            fuel_per_band={k: v[1] for k, v in rates.items()},
+        )
+        assert rebuilt == (want_fba, 0.0)
+
+
+def test_catalog_10_50_fba_wins_over_live_quote():
+    """Listed under $10, sold at ~$14.70, 21 net units.
+
+    Live Fees API may return today's $4.60. A sibling listing already in
+    the $10–$50 band is $4.20 → FBA $4.20 × 21 = $88.20, not $96.60.
+    """
+    from agent import apply_sale_price_fba, merge_asin_catalog_fba_bands
+
+    live = {"le20": (4.60, 0.16, 2.19), "10_50": (4.60, 0.16, 2.19)}
+    listing_bands = {
+        "B00UNO1111": {"lt10": (3.38, 0.12), "10_50": (4.20, 0.15)},
+    }
+    rates = merge_asin_catalog_fba_bands(
+        live, asin="B00UNO1111", listing_bands=listing_bands,
+    )
+    rates.pop("lt10", None)
+    assert rates["10_50"][0] == 4.20
+    rebuilt = apply_sale_price_fba(
+        bill_units=21,
+        units_by_usd_price={14.77: 20, 11.50: 1},
+        fba_per_usd_price={},
+        catalog_fba_per_unit=3.38,
+        include_fuel=False,
+        fba_per_band={
+            k: v[0] for k, v in rates.items() if k in {"lt10", "10_50", "gt50"}
+        },
+        fuel_per_band={
+            k: v[1] for k, v in rates.items() if k in {"lt10", "10_50", "gt50"}
+        },
+    )
+    assert rebuilt == (88.20, 0.0)
+    assert rebuilt != (96.60, 0.0)
+
+
+def test_fba_uses_net_quantity_ordered_in_10_50_band():
+    """Each line's quantityOrdered in the $10–$50 sale-price band is $4.20.
+
+    22 ordered − 1 return = 21 kept → $4.20 × 21 = $88.20. Extra buckets
+    on the ordered map must not add an 22nd or 23rd unit.
+    """
+    from agent import apply_sale_price_fba
+
+    rebuilt = apply_sale_price_fba(
+        bill_units=21,
+        units_by_usd_price={14.77: 20, 11.50: 1, 14.72: 1},
+        fba_per_usd_price={},
+        catalog_fba_per_unit=3.38,
+        include_fuel=False,
+        fba_per_band={"10_50": 4.20, "lt10": 3.38},
+        fuel_per_band={"10_50": 0.15, "lt10": 0.12},
+    )
+    assert rebuilt == (88.20, 0.0)
+
+
+def test_same_15pct_live_quote_keeps_per_line_referral():
+    from agent import _referral_quotes_differ_from_category
+
+    assert not _referral_quotes_differ_from_category(
+        0.15,
+        {"le15": 2.19, "10_50": 2.19},
+        {},
+        {14.77: 20, 11.50: 1},
+    )
+    assert _referral_quotes_differ_from_category(
+        0.15,
+        {"lt10": 0.56},
+        {},
+        {6.99: 10, 13.29: 2},
+    )

@@ -1152,6 +1152,29 @@ def referral_price_tier(price: float) -> str:
     return "gt20"
 
 
+def merge_asin_catalog_fba_bands(
+    sale_rates: dict | None,
+    *,
+    asin: str | None,
+    listing_bands: dict | None,
+) -> dict:
+    """Attach this ASIN's catalog $10/$50 FBA bands onto the SKU rate map.
+
+    Catalog listings of the same ASIN win over a live Fees API quote for
+    FBA bands. Today's quote is often a later-year rate (UNO $4.60 vs the
+    $10–$50 card $4.20). Referral tiers (le10 / le15 / …) stay on the live
+    quote. If this ASIN has no listing in that band, the live FBA stays.
+    """
+    out = dict(sale_rates or {})
+    bands = (listing_bands or {}).get(str(asin or "").strip().upper()) or {}
+    for band, pair in bands.items():
+        key = str(band)
+        if not pair:
+            continue
+        out[key] = (float(pair[0]), float(pair[1]), 0.0)
+    return out
+
+
 def needs_sale_price_fee_quote(sale_usd: float, listing_usd: float) -> bool:
     """True when listing-price fees would be the wrong FBA or referral."""
     sale = round(float(sale_usd or 0), 2)
@@ -1298,22 +1321,91 @@ def apply_sale_price_fba(
 
     fba = 0.0
     fuel = 0.0
-    accounted = 0
+    remaining = int(bill_units)
     for price, u in by_price.items():
+        take = min(int(u), remaining)
+        if take <= 0:
+            continue
         band = usd_fba_price_band(price)
-        fba += float(_unit_fba(price, band)) * u
-        accounted += u
+        fba += float(_unit_fba(price, band)) * take
+        remaining -= take
         if include_fuel:
             fuel_u = fuels.get(price)
             if fuel_u is None:
                 fuel_u = band_fuel.get(band, catalog_fuel)
-            fuel += float(fuel_u) * u
-    if accounted < bill_units:
-        leftover = bill_units - accounted
-        fba += catalog_fba * leftover
+            fuel += float(fuel_u) * take
+    if remaining > 0:
+        # Extra quantityOrdered with no price bucket: use the sale-price
+        # band already on this SKU ($4.20 for $10–$50), not the listing card.
+        leftover_rate = catalog_fba
+        leftover_fuel = catalog_fuel
+        band_counts: dict[str, int] = {}
+        for price, u in by_price.items():
+            band_counts[usd_fba_price_band(price)] = (
+                band_counts.get(usd_fba_price_band(price), 0) + int(u)
+            )
+        if band_counts:
+            majority = max(band_counts, key=band_counts.get)
+            dummy = {"lt10": 5.0, "10_50": 15.0, "gt50": 60.0}.get(majority, 15.0)
+            leftover_rate = float(_unit_fba(dummy, majority))
+            leftover_fuel = float(band_fuel.get(majority, catalog_fuel))
+        fba += leftover_rate * remaining
         if include_fuel:
-            fuel += catalog_fuel * leftover
+            fuel += leftover_fuel * remaining
     return round(fba, 2), (round(fuel, 2) if include_fuel else 0.0)
+
+
+def _referral_quotes_differ_from_category(
+    category_rate: float,
+    referral_per_band: dict | None,
+    referral_per_usd_price: dict | None,
+    units_by_usd_price: dict | None,
+) -> bool:
+    """True when a Fees API quote is a different % than the category rate.
+
+    Toys/games 15% of each line's converted USD must not be replaced by
+    one quote × quantityOrdered ($2.19 × 21 = $45.99 vs per-line $46.08).
+    Beauty 8% under $10 vs 15% listing still returns True so that split runs.
+    """
+    rate = float(category_rate or aurora_data._DEFAULT_REFERRAL_RATE)
+    for price, per in (referral_per_usd_price or {}).items():
+        p = float(price)
+        r = float(per or 0)
+        if p > 0 and r > 0 and abs(r / p - rate) > 0.02:
+            return True
+    per_band = {
+        str(k): float(v)
+        for k, v in (referral_per_band or {}).items()
+        if float(v or 0) > 0
+    }
+    if not per_band:
+        return False
+    # Compare the quote to the qty-weighted avg price in that tier, not
+    # each line (a $2.19 quote at ~$14.61 is still 15% on a $11.50 MX unit).
+    buckets: dict[str, list[float]] = {}
+    for raw, qty in (units_by_usd_price or {}).items():
+        q = int(qty or 0)
+        if q <= 0:
+            continue
+        price = round(float(raw), 2)
+        if price <= 0:
+            continue
+        key = referral_price_tier(price)
+        rec = buckets.setdefault(key, [0.0, 0.0])
+        rec[0] += price * q
+        rec[1] += q
+    for tier, (psum, q) in buckets.items():
+        if q <= 0:
+            continue
+        avg = psum / q
+        per = per_band.get(tier)
+        if per is None:
+            per = per_band.get(usd_fba_price_band(avg))
+        if not per:
+            continue
+        if abs(float(per) / avg - rate) > 0.02:
+            return True
+    return False
 
 
 def apply_sale_price_referral(
@@ -1422,59 +1514,90 @@ async def fetch_fba_rates_by_sale_price(
             )
             unique[(asin, rep, is_fba)] = None
 
-    if not unique:
-        return {}
-
-    est_by_key: dict[tuple[str, float, bool], tuple[float, float, float]] = {}
-    for chunk in _one_price_per_asin_chunks(list(unique.keys())):
-        batch: dict[str, dict] = {}
-        try:
-            batch = await amazon_sp.get_fees_estimates_batch(
-                chunk, marketplace_id=US_MARKETPLACE_ID, currency="USD",
-            )
-        except Exception:
-            batch = {}
-        for asin, usd_price, is_fba in chunk:
-            pair = _fees_from_estimate(batch.get(asin))
-            if not pair:
-                try:
-                    est = await amazon_sp.get_fees_estimate(
-                        asin,
-                        usd_price,
-                        marketplace_id=US_MARKETPLACE_ID,
-                        currency="USD",
-                        is_fba=is_fba,
-                    )
-                    pair = _fees_from_estimate(est)
-                except Exception:
-                    pair = None
-            if pair:
-                est_by_key[(asin, usd_price, is_fba)] = pair
-
+    all_asins = sorted({
+        str((d.get("asin") or "")).strip().upper()
+        for d in (sku_data or {}).values()
+        if str(d.get("asin") or "").strip()
+    } | {
+        str(asin).strip().upper()
+        for _, asin, *_ in sku_need
+        if str(asin or "").strip()
+    })
     listing_bands: dict[str, dict[str, tuple[float, float]]] = {}
     try:
-        listing_bands = await aurora_data.fba_band_rates_for_asins(
-            [asin for _, asin, *_ in sku_need],
-        )
+        listing_bands = await aurora_data.fba_band_rates_for_asins(all_asins)
     except Exception:
         listing_bands = {}
+
+    est_by_key: dict[tuple[str, float, bool], tuple[float, float, float]] = {}
+    if unique:
+        for chunk in _one_price_per_asin_chunks(list(unique.keys())):
+            batch: dict[str, dict] = {}
+            try:
+                batch = await amazon_sp.get_fees_estimates_batch(
+                    chunk, marketplace_id=US_MARKETPLACE_ID, currency="USD",
+                )
+            except Exception:
+                batch = {}
+            for asin, usd_price, is_fba in chunk:
+                pair = _fees_from_estimate(batch.get(asin))
+                if not pair:
+                    try:
+                        est = await amazon_sp.get_fees_estimate(
+                            asin,
+                            usd_price,
+                            marketplace_id=US_MARKETPLACE_ID,
+                            currency="USD",
+                            is_fba=is_fba,
+                        )
+                        pair = _fees_from_estimate(est)
+                    except Exception:
+                        pair = None
+                if pair:
+                    est_by_key[(asin, usd_price, is_fba)] = pair
+
     out: dict[str, dict[str, tuple[float, float, float]]] = {}
     for sku, asin, fba_band, ref_tier, usd_price, is_fba, listing_fba in sku_need:
         pair = est_by_key.get((asin, usd_price, is_fba))
         dest = out.setdefault(sku, {})
         if pair:
             dest[ref_tier] = pair
-            if not listing_fba or fba_band != listing_fba:
+            if listing_fba and fba_band == listing_fba:
+                continue
+            catalog_band = (listing_bands.get(str(asin).upper()) or {}).get(fba_band)
+            if catalog_band:
+                dest[fba_band] = (
+                    float(catalog_band[0]), float(catalog_band[1]), 0.0,
+                )
+            else:
                 dest[fba_band] = pair
             continue
-        # Fees API miss: same-ASIN listing already in this $10/$50 band
-        # (B07TJT135V listed at $9.92, sold at $11–$15 → $4.20 not $3.38).
+        # Fees API miss: another listing of this ASIN already in that
+        # $10/$50 band (under-$10 card vs units sold at $11–$15).
         if listing_fba and fba_band == listing_fba:
             continue
         band_pair = (listing_bands.get(str(asin).upper()) or {}).get(fba_band)
         if not band_pair:
             continue
         dest[fba_band] = (float(band_pair[0]), float(band_pair[1]), 0.0)
+    # Every SKU in the window — not only those that queued a live quote.
+    for sku, d in (sku_data or {}).items():
+        pf = pf_all.get(sku) or pf_lower.get(str(sku).lower()) or {}
+        asin = str(d.get("asin") or pf.get("asin") or "").strip()
+        if not asin:
+            continue
+        listing = float(pf.get("listing_price") or 0)
+        listing_fba = usd_fba_price_band(listing) if listing > 0 else ""
+        dest = out.setdefault(sku, {})
+        merged = merge_asin_catalog_fba_bands(
+            dest, asin=asin, listing_bands=listing_bands,
+        )
+        if listing_fba:
+            merged.pop(listing_fba, None)
+        if merged:
+            out[sku] = merged
+        else:
+            out.pop(sku, None)
     return {sku: bands for sku, bands in out.items() if bands}
 
 
@@ -1613,10 +1736,9 @@ def _apply_returns_to_sku_data(
     (sum of line ``quantityOrdered`` — a 3-unit order counts as 3, not 1).
     ``returned_units`` is the returned/refunded quantity (also unit-based,
     not one-per-order). ``net_units`` = ordered − returned is used for
-    COGS and for referral / FBA. CAD/MXN lines are converted to USD
-    first so a Mexico 2-pack is not summed as pesos-as-dollars, then
-    the 2 US returns net fees (B07H4S83D8: 77 shipped → 75 net →
-    FBA $4.20 × 75 = $315; referral 15% of net converted sales).
+    COGS and for referral / FBA on every SKU. CAD/MXN lines convert to
+    USD first so a foreign 2-pack is not summed as pesos-as-dollars;
+    then US returns net fees (shipped 77 → net 75 → FBA × 75).
 
     Revenue / referral / FBA subtract the **refunded order lines'** dollars
     (``refunded_revenue`` / snapped % / fulfillment). A SKU-wide
@@ -2105,6 +2227,7 @@ async def compute_profitability_data(
     fees_by_asin: dict[str, dict] = {}
     fee_errors_pre: list[str] = []
     sale_fba_by_sku: dict[str, dict[str, tuple[float, float, float]]] = {}
+    listing_fba_bands: dict[str, dict[str, tuple[float, float]]] = {}
     returns_by_sku: dict[str, dict] = {}
 
     removal_fees_by_sku: dict[str, float] = {}
@@ -2654,7 +2777,7 @@ async def compute_profitability_data(
         # SKUs missing fees or whose sale price drifted from listing price —
         # never for every sold SKU (that was ~N/20 × 2.1s and blocked the UI).
         # Always pass correct IsAmazonFulfilled so FBM is not charged FBA.
-        nonlocal product_fee_fallback, fees_by_asin, fee_errors_pre, sale_fba_by_sku
+        nonlocal product_fee_fallback, fees_by_asin, fee_errors_pre, sale_fba_by_sku, listing_fba_bands
         if use_db:
             product_fee_fallback = await aurora_data.product_fee_estimates_by_sku(
                 require_user(), skus,
@@ -2693,6 +2816,15 @@ async def compute_profitability_data(
                 f"Sale-price FBA lookup failed ({e}); listing FBA used."
             )
             sale_fba_by_sku = {}
+        try:
+            listing_fba_bands = await aurora_data.fba_band_rates_for_asins(
+                [
+                    str((sku_data.get(s) or {}).get("asin") or "")
+                    for s in skus
+                ],
+            )
+        except Exception:
+            listing_fba_bands = {}
 
     async def _load_ads():
         # Per-SKU when a campaign lists its SKUs (Aurora Ad.skus[]); campaigns
@@ -3006,8 +3138,7 @@ async def compute_profitability_data(
         d = sku_data[sku]
         # `units` = Amazon All Orders quantity (sum of quantityOrdered).
         # COGS / referral / FBA use net_units (ordered − returned) after
-        # CAD/MXN → USD so Mexico units stay in the mix (B07H4S83D8:
-        # 75 US + 2 MX shipped, 2 US returns → FBA $4.20 × 75 = $315).
+        # CAD/MXN → USD so foreign-marketplace units stay in the mix.
         units = int(d.get("units") or 0)
         ordered_units = int(d.get("ordered_units") or units)
         returned_units = int(d.get("returned_units") or 0)
@@ -3050,6 +3181,14 @@ async def compute_profitability_data(
                 ),
                 None,
             )
+        listing_band = ""
+        if pf and float(pf.get("listing_price") or 0) > 0:
+            listing_band = usd_fba_price_band(float(pf.get("listing_price") or 0))
+        sale_rates = merge_asin_catalog_fba_bands(
+            sale_rates, asin=asin, listing_bands=listing_fba_bands,
+        )
+        if listing_band:
+            sale_rates.pop(listing_band, None)
         if sale_rates:
             fba_band_keys = {"lt10", "10_50", "gt50"}
             ref_tier_keys = {"le10", "le15", "le20", "gt20"}
@@ -3105,15 +3244,23 @@ async def compute_profitability_data(
                 (pf or {}).get("listing_price"),
                 (pf or {}).get("referral_per_unit"),
             )
-            ref_rebuilt = apply_sale_price_referral(
-                bill_units=fee_units,
-                units_by_usd_price=fee_prices,
-                category_rate=cat_rate,
-                referral_per_band=referral_per_band,
-                referral_per_usd_price=referral_per_price,
-            )
-            if ref_rebuilt is not None:
-                referral_total = ref_rebuilt
+            # Per-line 15% of converted quantityOrdered stays unless the
+            # quote is a different category % (e.g. 8% under $10).
+            if _referral_quotes_differ_from_category(
+                cat_rate,
+                referral_per_band,
+                referral_per_price,
+                fee_prices,
+            ):
+                ref_rebuilt = apply_sale_price_referral(
+                    bill_units=fee_units,
+                    units_by_usd_price=fee_prices,
+                    category_rate=cat_rate,
+                    referral_per_band=referral_per_band,
+                    referral_per_usd_price=referral_per_price,
+                )
+                if ref_rebuilt is not None:
+                    referral_total = ref_rebuilt
         if fee_source == "products_fees" and not asin and pf and pf.get("asin"):
             asin = pf["asin"]
         if fee_source == "none":

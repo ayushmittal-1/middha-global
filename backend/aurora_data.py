@@ -491,11 +491,11 @@ async def fba_band_rates_for_asins(
 ) -> dict[str, dict[str, tuple[float, float]]]:
     """US FBA base+fuel per sale-price band from catalog listings of each ASIN.
 
-    A SKU listed at $9.92 keeps the under-$10 FBA card ($3.38). Units sold
-    at $11–$15 are Amazon's $10–$50 band ($4.20 on the same size-tier).
-    Live Fees API quotes that band; when the quote is missing, another
-    listing of the same ASIN already priced in that band is the same
-    physical product's rate (B07TJT135V: $4.20 × 21 MX units = $88.20).
+    A SKU listed under $10 keeps that listing's FBA card. Units sold in
+    the $10–$50 band use that band's rate on the same size-tier. Live
+    Fees API quotes the band; when the quote is missing, another listing
+    of the same ASIN already priced in that band is the same physical
+    product's rate. Applies to every ASIN in the window.
     """
     wanted = sorted({str(a).strip().upper() for a in (asins or []) if str(a).strip()})
     if not wanted:
