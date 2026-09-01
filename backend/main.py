@@ -1365,6 +1365,64 @@ async def put_product_settings_endpoint(
     return {"sku": sku, "settings": settings}
 
 
+@app.post("/forecasting/history-comparison")
+async def forecasting_history_comparison_fleet(user: dict = Depends(protect)):
+    """Kick off a fleet all-history vs 540d comparison as an async job.
+    Trains a fresh picker with unbounded training data (all sales
+    history in Mongo), scores every model on the last-30d holdout, and
+    compares each SKU's per-model accuracy to what the standard 540d
+    picker cached at last nightly refresh.
+
+    Runtime: ~5-10 min without deep models, ~15-30 min with
+    DEEPTS_ENABLED=1. Polls /forecasting/history-comparison/job/{id}
+    for progress; final `fleet_summary` tells you whether all-history
+    is net-better, net-worse, or a wash.
+    """
+    from bson import ObjectId as _OID
+    from history_comparison import start_history_comparison_job
+    user_id = _OID(str(user["_id"]))
+    job_id = await start_history_comparison_job(user_id)
+    return {"job_id": job_id, "status": "queued", "scope": "fleet"}
+
+
+@app.post("/forecasting/history-comparison/{sku}")
+async def forecasting_history_comparison_sku(
+    sku: str, user: dict = Depends(protect),
+):
+    """Per-SKU comparison — Prophet + Naive only, no user-global retrain.
+    ~10-30 sec. Compares to that SKU's cached 540d results."""
+    from bson import ObjectId as _OID
+    from history_comparison import start_history_comparison_job
+    user_id = _OID(str(user["_id"]))
+    job_id = await start_history_comparison_job(user_id, sku=sku)
+    return {"job_id": job_id, "status": "queued", "scope": "sku", "sku": sku}
+
+
+@app.get("/forecasting/history-comparison/job/{job_id}")
+async def forecasting_history_comparison_status(
+    job_id: str, user: dict = Depends(protect),
+):
+    from history_comparison import get_history_comparison_job
+    doc = await get_history_comparison_job(job_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="job not found")
+    if doc.get("userId") != str(user["_id"]):
+        raise HTTPException(status_code=403, detail="not your job")
+    return doc
+
+
+@app.get("/forecasting/history-comparison/results")
+async def forecasting_history_comparison_results(
+    user: dict = Depends(protect),
+    sku: str | None = None,
+):
+    from bson import ObjectId as _OID
+    from history_comparison import get_history_comparison_results
+    user_id = _OID(str(user["_id"]))
+    rows = await get_history_comparison_results(user_id, sku=sku)
+    return {"count": len(rows), "rows": rows}
+
+
 @app.post("/forecasting/q4-backtest")
 async def forecasting_q4_backtest_fleet(user: dict = Depends(protect)):
     """Kick off a fleet-wide Q4 backtest as an async job. Returns

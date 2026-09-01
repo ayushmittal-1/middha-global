@@ -2002,10 +2002,16 @@
         <button id="restock-refresh">Refresh forecasts</button>
         <button id="restock-q4-fleet" class="secondary" title="Train every model with data ≤ Sep 30 last year and score against actual Q4 sales. Populates the Q4 accuracy column for every SKU. ~1-3 min (or ~15-25 min with DEEPTS_ENABLED=1).">Test all on Q4</button>
         <span id="restock-q4-fleet-status" style="margin-left:10px;color:#3730a3;font-size:12px;"></span>
+
+        <button id="restock-history-compare" class="secondary" title="Train every model on ALL available sales history (not just trailing 540d) and compare per-SKU accuracy to what's currently cached. Answers whether the 540d cap is leaving accuracy on the table. ~5-10 min (or ~15-30 min with DEEPTS_ENABLED=1).">Compare all-history vs 540d</button>
+        <span id="restock-history-compare-status" style="margin-left:10px;color:#3730a3;font-size:12px;"></span>
       </div>
 
       <div id="restock-q4-summary" style="display:none;margin:6px 0 12px;padding:12px;border:1px solid #cbd5e1;border-radius:8px;background:#f0f9ff;">
         <!-- Populated by the fleet Q4 handler with best_q4_model + top 3 leaderboards. -->
+      </div>
+      <div id="restock-history-compare-summary" style="display:none;margin:6px 0 12px;padding:12px;border:1px solid #cbd5e1;border-radius:8px;background:#fef9c3;">
+        <!-- Populated by the fleet history-comparison handler. -->
       </div>
 
       <div id="restock-settings">
@@ -6206,6 +6212,134 @@
         buttonEl: restockQ4FleetBtn,
       });
     });
+
+    // Fleet all-history vs 540d comparison button.
+    const restockHistoryCompareBtn = document.getElementById('restock-history-compare');
+    const restockHistoryCompareStatus = document.getElementById('restock-history-compare-status');
+    restockHistoryCompareBtn?.addEventListener('click', async () => {
+      await runHistoryCompareJob({
+        scope: 'fleet',
+        statusEl: restockHistoryCompareStatus,
+        buttonEl: restockHistoryCompareBtn,
+      });
+    });
+
+    // All-history vs 540d comparison runner — same async job pattern as Q4.
+    async function runHistoryCompareJob({scope, sku, statusEl, buttonEl}) {
+      const MODEL_LABELS = {
+        naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
+        xgb: 'XGBoost', ensemble: 'Ensemble',
+        deepar: 'DeepAR', tft: 'TFT',
+      };
+      const url = scope === 'sku'
+        ? `/forecasting/history-comparison/${encodeURIComponent(sku)}`
+        : '/forecasting/history-comparison';
+      if (buttonEl) buttonEl.disabled = true;
+      statusEl.textContent = 'Starting job…';
+      let jobId;
+      try {
+        const r = await fetch(url, { method: 'POST', headers: authHeaders() });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        jobId = (await r.json()).job_id;
+      } catch (e) {
+        statusEl.textContent = `Failed to start: ${e.message}`;
+        if (buttonEl) buttonEl.disabled = false;
+        return;
+      }
+      const startTs = Date.now();
+      const pollOnce = async () => {
+        try {
+          const r = await fetch(
+            `/forecasting/history-comparison/job/${jobId}`,
+            { headers: authHeaders() },
+          );
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const doc = await r.json();
+          const elapsedSec = ((Date.now() - startTs) / 1000).toFixed(0);
+          if (doc.status === 'running' || doc.status === 'queued') {
+            statusEl.textContent = scope === 'sku'
+              ? `${doc.stage || 'Running'} · ${elapsedSec}s`
+              : `${doc.stage || 'Running'} · ${doc.done_skus ?? 0}/${doc.total_skus ?? '?'} SKUs · ${elapsedSec}s`;
+            setTimeout(pollOnce, 5000);
+            return;
+          }
+          if (doc.status === 'done') {
+            statusEl.textContent = `Done in ${doc.elapsed_sec}s.`;
+            if (buttonEl) buttonEl.disabled = false;
+            const summaryEl = document.getElementById('restock-history-compare-summary');
+            const fs = doc.fleet_summary || {};
+            if (summaryEl && fs.n_skus_scored != null) {
+              const modelDeltas = fs.median_delta_by_model || {};
+              const rows = Object.entries(modelDeltas)
+                .map(([name, m]) => ({
+                  name,
+                  median_delta_pct: m.median_delta_pct,
+                  mean_delta_pct: m.mean_delta_pct,
+                  n_scored: m.n_scored,
+                  n_positive: m.n_positive,
+                  n_negative: m.n_negative,
+                }))
+                .sort((a, b) => b.median_delta_pct - a.median_delta_pct);
+              const rowsHtml = rows.map(r => {
+                const cls = r.median_delta_pct > 0 ? '#16a34a' : r.median_delta_pct < 0 ? '#dc2626' : '#6b7280';
+                const sign = r.median_delta_pct > 0 ? '+' : '';
+                return `
+                  <tr>
+                    <td style="padding:4px 8px;"><strong>${escapeHtml(MODEL_LABELS[r.name] || r.name)}</strong></td>
+                    <td style="padding:4px 8px;text-align:right;color:${cls};"><strong>${sign}${r.median_delta_pct}%</strong></td>
+                    <td style="padding:4px 8px;text-align:right;">${sign}${r.mean_delta_pct}%</td>
+                    <td style="padding:4px 8px;text-align:right;">${r.n_positive}</td>
+                    <td style="padding:4px 8px;text-align:right;">${r.n_negative}</td>
+                    <td style="padding:4px 8px;text-align:right;">${r.n_scored}</td>
+                  </tr>`;
+              }).join('');
+              const netWinnerLabel = fs.net_winner_window === 'all_history'
+                ? '<span style="color:#16a34a;"><strong>all-history training wins</strong></span>'
+                : fs.net_winner_window === '540d'
+                  ? '<span style="color:#dc2626;"><strong>540d baseline wins</strong></span>'
+                  : '<span style="color:#6b7280;"><strong>Tie</strong></span>';
+              summaryEl.innerHTML = `
+                <div style="font-weight:600;font-size:14px;margin-bottom:8px;">All-history vs 540d — fleet comparison</div>
+                <div style="font-size:13px;margin-bottom:6px;">
+                  Net winner: ${netWinnerLabel} · median winner-shift ${fs.median_winner_delta_pct == null ? '—' : (fs.median_winner_delta_pct > 0 ? '+' : '') + fs.median_winner_delta_pct + '%'}
+                </div>
+                <div style="font-size:12px;color:#6b7280;margin-bottom:10px;">
+                  ${fs.n_skus_improved} SKUs improved · ${fs.n_skus_regressed} regressed · ${fs.n_skus_no_change} unchanged · out of ${fs.n_skus_scored} scored
+                </div>
+                <table style="width:100%;font-size:12px;border-collapse:collapse;">
+                  <thead>
+                    <tr style="color:#6b7280;font-size:11px;border-bottom:1px solid #cbd5e1;">
+                      <th style="text-align:left;padding:4px 8px;">Model</th>
+                      <th style="text-align:right;padding:4px 8px;" title="Median accuracy delta across SKUs (all-history − 540d). Positive means training on all history helped this model.">Median Δ</th>
+                      <th style="text-align:right;padding:4px 8px;">Mean Δ</th>
+                      <th style="text-align:right;padding:4px 8px;">SKUs↑</th>
+                      <th style="text-align:right;padding:4px 8px;">SKUs↓</th>
+                      <th style="text-align:right;padding:4px 8px;">n</th>
+                    </tr>
+                  </thead>
+                  <tbody>${rowsHtml || '<tr><td colspan="6" style="padding:4px 8px;color:#6b7280;">No models scored</td></tr>'}</tbody>
+                </table>
+                <div style="font-size:11px;color:#6b7280;margin-top:8px;">
+                  Positive Δ = all-history training gave better accuracy than the 540d baseline.
+                  Low-volume SKUs (&lt;30 units in last 30d) excluded from aggregates.
+                </div>`;
+              summaryEl.style.display = 'block';
+            }
+            return;
+          }
+          if (doc.status === 'failed') {
+            statusEl.textContent = `Failed: ${doc.error || 'unknown error'}`;
+            if (buttonEl) buttonEl.disabled = false;
+            return;
+          }
+          setTimeout(pollOnce, 5000);
+        } catch (e) {
+          statusEl.textContent = `Poll failed: ${e.message}. Retrying…`;
+          setTimeout(pollOnce, 8000);
+        }
+      };
+      pollOnce();
+    }
 
     // ── Init ───────────────────────────────────────────
 
