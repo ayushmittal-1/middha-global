@@ -45,7 +45,7 @@ DEFAULT_HORIZON = 90
 # Lookback windows shown in the Actions modal's Forecast tab. Ordered
 # short-to-long so the UI table renders top-down from most-recent to
 # longest-history.
-VELOCITY_WINDOWS = (7, 14, 30, 60, 90)
+VELOCITY_WINDOWS = (3, 7, 30, 60, 180)
 
 
 def apply_returns_to_daily_rows(
@@ -136,8 +136,8 @@ def compute_velocity_windows(
 def weighted_velocity(windows: list[dict], weights: dict | None) -> float | None:
     """Weighted average across the lookback windows.
 
-    `weights` is a `{d7, d14, d30, d60, d90}` dict (any missing key = 0).
-    Legacy `d3` / `d180` keys in stored user settings are silently
+    `weights` is a `{d3, d7, d30, d60, d180}` dict (any missing key = 0).
+    Legacy `d14` / `d90` keys in stored user settings are silently
     ignored — the window set was retired.
 
     Returns None when no positive weights are provided — signals the caller
@@ -145,7 +145,7 @@ def weighted_velocity(windows: list[dict], weights: dict | None) -> float | None
     """
     if not weights:
         return None
-    key_map = {7: "d7", 14: "d14", 30: "d30", 60: "d60", 90: "d90"}
+    key_map = {3: "d3", 7: "d7", 30: "d30", 60: "d60", 180: "d180"}
     num = 0.0
     denom = 0.0
     for w in windows:

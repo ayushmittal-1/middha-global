@@ -45,41 +45,41 @@ log = logging.getLogger("weight_sweep")
 CANDIDATE_WEIGHT_CONFIGS: list[dict[str, Any]] = [
     {
         "name": "Mid-balanced",
-        "weights": {"d7": 15, "d14": 20, "d30": 30, "d60": 20, "d90": 15},
+        "weights": {"d3": 15, "d7": 20, "d30": 30, "d60": 20, "d180": 15},
         "description": (
-            "Peaks at 30-day, tapering out to 7d and 90d. Good default "
+            "Peaks at 30-day, tapering out to 3d and 180d. Good default "
             "for SKUs with steady demand and no strong recency signal."
         ),
     },
     {
         "name": "Recent-heavy",
-        "weights": {"d7": 30, "d14": 25, "d30": 20, "d60": 15, "d90": 10},
+        "weights": {"d3": 30, "d7": 25, "d30": 20, "d60": 15, "d180": 10},
         "description": (
-            "Monotonic decay from 7d down to 90d. Best when demand is "
+            "Monotonic decay from 3d down to 180d. Best when demand is "
             "accelerating or you want the forecast to react quickly to "
             "recent momentum."
         ),
     },
     {
         "name": "Ultra-recent",
-        "weights": {"d7": 50, "d14": 30, "d30": 15, "d60": 5, "d90": 0},
+        "weights": {"d3": 50, "d7": 30, "d30": 15, "d60": 5, "d180": 0},
         "description": (
-            "Almost all weight on the trailing 2 weeks. Reacts fastest "
+            "Almost all weight on the trailing 3-7 days. Reacts fastest "
             "to shifts but noisy on low-volume SKUs."
         ),
     },
     {
         "name": "Long-tail",
-        "weights": {"d7": 0, "d14": 5, "d30": 15, "d60": 30, "d90": 50},
+        "weights": {"d3": 0, "d7": 5, "d30": 15, "d60": 30, "d180": 50},
         "description": (
             "Mirror image of Recent-heavy — inverse decay. Best when "
-            "recent sales look noisy and the 60-90d trend is more "
+            "recent sales look noisy and the 60-180d trend is more "
             "representative of true demand."
         ),
     },
     {
         "name": "Uniform",
-        "weights": {"d7": 20, "d14": 20, "d30": 20, "d60": 20, "d90": 20},
+        "weights": {"d3": 20, "d7": 20, "d30": 20, "d60": 20, "d180": 20},
         "description": (
             "Equal weight across all windows. Baseline to measure the "
             "other configs against — no bias in either direction."

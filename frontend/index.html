@@ -2048,7 +2048,7 @@
               <th class="num" title="Damaged or customer-returned units currently unsellable">Unfulfillable</th>
               <!-- <th class="num" title="Total units still to arrive across all in-flight shipments (unitsExpected − unitsReceived)">Inbound</th> -->
               <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next arrival</th>
-              <th class="num" title="Weighted sales velocity across the 7/14/30/60/90-day windows (out-of-stock days excluded). Default weights are recent-biased (0.4×v7d + 0.3×v14d + 0.2×v30d + 0.1×v60d + 0×v90d); override per-SKU in Actions → Forecast tab.">Orders Velocity</th>
+              <th class="num" title="Weighted sales velocity across the 3/7/30/60/180-day windows (out-of-stock days excluded). Default weights are recent-biased (0.4×v3d + 0.3×v7d + 0.2×v30d + 0.1×v60d + 0×v180d); override per-SKU in Actions → Forecast tab.">Orders Velocity</th>
               <th title="Winning forecast model (from the nightly picker's 30-day holdout backtest) and its accuracy_pct. Any of prophet / naive / lgbm / xgb / ensemble / deepar / tft may win depending on the SKU's demand pattern.">Best model</th>
               <th title="Q4 accuracy — how accurate the best model/config would have been for last Q4 (Oct-Dec). Populated after clicking 'Test on Q4' in the drawer, or from a fleet Q4 backtest run.">Q4 accuracy</th>
               <th class="num" title="Average units sold per day over the selected window (units sold ÷ window size; Aurora orders, cancelled/pending excluded)"><span id="restock-orders-header">Orders/day (30d)</span></th>
@@ -5373,12 +5373,12 @@
           </div>
         `;
       } else if (tab === 'forecast') {
-        // Per-SKU editable velocity weights. Windows are (7,14,30,60,90)
+        // Per-SKU editable velocity weights. Windows are (3,7,30,60,180)
         // days; weights are normalized backend-side so absolute magnitudes
         // don't matter, only the ratio between windows. Any saved
         // per-SKU override in Mongo is used; falls back to the platform
         // default (recent-biased) below when nothing's saved.
-        const DEFAULT_VELOCITY_WEIGHTS = { d7: 0.4, d14: 0.3, d30: 0.2, d60: 0.1, d90: 0 };
+        const DEFAULT_VELOCITY_WEIGHTS = { d3: 0.4, d7: 0.3, d30: 0.2, d60: 0.1, d180: 0 };
         const savedWeights = s.velocity_weights || {};
         const rows = settingsState.windows.map(w => {
           const wKey = 'd' + w.period_days;
