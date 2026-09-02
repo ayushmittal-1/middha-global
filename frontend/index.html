@@ -1939,7 +1939,6 @@
 
     <nav id="tab-nav">
       <button class="tab-btn active" data-tab="chat">Chat</button>
-      <button class="tab-btn" data-tab="restock">Restock</button>
       <button class="tab-btn" data-tab="orders">Orders</button>
       <button class="tab-btn" data-tab="campaigns">Campaigns</button>
       <button class="tab-btn" data-tab="profit">Profitability</button>
@@ -3102,6 +3101,9 @@
     let kwPollTimer = null;
 
     function setActiveTab(tab) {
+      // Restock is kept out of the prod UI. Chat is the fallback if a
+      // bookmark still points at the restock tab.
+      if (tab === 'restock') tab = 'chat';
       document.querySelectorAll('.tab-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
       });
