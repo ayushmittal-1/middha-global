@@ -5,6 +5,10 @@ Returns reduce returned_units / net_units by return quantity, not by
 order count, and must not change the displayed Units (ordered) figure.
 """
 
+import os
+
+os.environ.setdefault("GROQ_API_KEY", "test-stub")
+
 from aurora_data import aggregate_sku_metrics_from_orders, line_item_quantity
 from agent import _apply_returns_to_sku_data
 
@@ -123,6 +127,15 @@ def test_returns_subtract_actual_refunded_line_not_sku_average():
     assert abs(sku_data["SKU-A"]["revenue"] - 387.92) < 0.001
     # Not the buggy proportional 399.68 * 34/35 = 388.26
     assert abs(sku_data["SKU-A"]["revenue"] - 388.26) > 0.01
+    # Referral / FBA net the refunded line (Andexports $1.76 / $4.35).
+    # Revenue is what nets the refunded dollars. Units stay ordered qty.
+    assert abs(sku_data["SKU-A"]["referral_total"] - 58.14) < 0.01
+    assert abs(sku_data["SKU-A"]["fba_total"] - 147.90) < 0.01
+    # Applying the same returns map again must not subtract twice
+    # (that produced Blink Jan $519.75 / $78.03 / $146.16 instead of
+    # $537.71 / $80.73 / $151.20).
+    _apply_returns_to_sku_data(sku_data, returns, {"SKU-A": 0.15})
+    assert abs(sku_data["SKU-A"]["revenue"] - 387.92) < 0.001
     assert abs(sku_data["SKU-A"]["referral_total"] - 58.14) < 0.01
     assert abs(sku_data["SKU-A"]["fba_total"] - 147.90) < 0.01
 
@@ -135,3 +148,340 @@ def test_physical_or_refund_counts_as_returned():
     assert returned_qty_for_sku(physical=3, refunded=1) == 3
     assert returned_qty_for_sku(physical=0, refunded=2) == 2
     assert returned_qty_for_sku(physical=0, refunded=0) == 0
+
+
+def test_returns_net_us_units_and_keep_mexico_unit():
+    sku_data = {
+        "SKU-A": {
+            "units": 62,
+            "revenue": 555.66,
+            "referral_total": 83.43,
+            "fba_total": 156.24,
+            "units_by_marketplace": {
+                "ATVPDKIKX0DER": 61,
+                "A1AM78C64UM0Y8": 1,
+            },
+            "units_by_usd_price": {
+                8.75: 61,
+                14.69: 1,
+            },
+        }
+    }
+    returns = {
+        "SKU-A": {
+            "returned_units": 2,
+            "refunded_revenue": 17.95,
+            "refunded_referral": 2.70,
+            "refunded_fulfillment": 5.04,
+            "returned_units_by_marketplace": {"ATVPDKIKX0DER": 2},
+            "returned_units_by_usd_price": {8.75: 2},
+        }
+    }
+    _apply_returns_to_sku_data(sku_data, returns)
+    assert sku_data["SKU-A"]["net_units"] == 60
+    assert sku_data["SKU-A"]["units_by_marketplace"]["ATVPDKIKX0DER"] == 59
+    assert sku_data["SKU-A"]["units_by_marketplace"]["A1AM78C64UM0Y8"] == 1
+    assert sku_data["SKU-A"]["units_by_usd_price"][8.75] == 59
+    assert sku_data["SKU-A"]["units_by_usd_price"][14.69] == 1
+    assert sku_data["SKU-A"]["ordered_units_by_usd_price"][8.75] == 61
+    assert sku_data["SKU-A"]["ordered_units_by_usd_price"][14.69] == 1
+
+
+def test_phase_card_mexico_stays_in_net_fees():
+    """B07H4S83D8: 75 US + 2 MX shipped, 2 US returns.
+
+    MXN converts to USD first (not pesos-as-dollars). Fees then follow
+    net units: FBA $4.20 × 75 = $315. Referral is 15% of net converted
+    sales (~$201.26–$201.71), not $4.20 × 77 shipped.
+    """
+    from agent import apply_sale_price_fba
+    from aurora_data import line_referral_fee
+
+    sku = "ASG - PHASE CARD GAME PO2"
+    sku_data = {
+        sku: {
+            "units": 77,
+            "revenue": 1378.60,
+            "referral_total": 206.79,
+            "fba_total": 334.95,
+            "asin": "B07H4S83D8",
+            "units_by_usd_price": {17.96: 75, 21.40: 2},
+            "units_by_marketplace": {
+                "ATVPDKIKX0DER": 75,
+                "A1AM78C64UM0Y8": 2,
+            },
+        }
+    }
+    returns = {
+        sku: {
+            "returned_units": 2,
+            "refunded_revenue": 34.11,
+            "returned_units_by_marketplace": {"ATVPDKIKX0DER": 2},
+            "returned_units_by_usd_price": {17.96: 2},
+        }
+    }
+    _apply_returns_to_sku_data(sku_data, returns, {sku: 0.15})
+    d = sku_data[sku]
+    assert d["units"] == 77
+    assert d["ordered_units"] == 77
+    assert d["returned_units"] == 2
+    assert d["net_units"] == 75
+    assert abs(d["revenue"] - 1344.49) < 0.001
+    assert abs(d["units_by_marketplace"]["A1AM78C64UM0Y8"] - 2) < 0.001
+    want_ref = round(206.79 - line_referral_fee(34.11, 0.15, 2), 2)
+    assert abs(d["referral_total"] - want_ref) < 0.02
+    assert abs(d["referral_total"] - 201.26) < 0.5
+    rebuilt = apply_sale_price_fba(
+        bill_units=75,
+        units_by_usd_price=d["units_by_usd_price"],
+        fba_per_usd_price={},
+        catalog_fba_per_unit=4.20,
+        include_fuel=False,
+    )
+    assert rebuilt == (315.00, 0.0)
+
+
+def test_listing_under_10_uses_10_50_fba_on_higher_sale_prices():
+    """B07TJT135V: listed $9.92 (lt10 FBA $3.38), sold at $11–$15.
+
+    Mexico 21 units in the $10–$50 band are $4.20 each → $88.20, not
+    $3.38 × 21 = $70.98. Referral stays 15% of converted USD (not the
+    US $14.63 preview × 21 = $46.08).
+    """
+    from agent import apply_sale_price_fba
+
+    rebuilt = apply_sale_price_fba(
+        bill_units=21,
+        units_by_usd_price={11.13: 21},
+        fba_per_usd_price={},
+        catalog_fba_per_unit=3.38,
+        include_fuel=False,
+        fba_per_band={"10_50": 4.20, "lt10": 3.38},
+        fuel_per_band={"10_50": 0.15, "lt10": 0.12},
+    )
+    assert rebuilt == (88.20, 0.0)
+
+    mixed = apply_sale_price_fba(
+        bill_units=98,
+        units_by_usd_price={14.70: 77, 11.13: 21},
+        fba_per_usd_price={},
+        catalog_fba_per_unit=3.38,
+        include_fuel=False,
+        fba_per_band={"10_50": 4.20, "lt10": 3.38},
+        fuel_per_band={"10_50": 0.15, "lt10": 0.12},
+    )
+    assert mixed == (411.60, 0.0)
+
+
+def test_referral_fallback_bills_net_converted_not_shipped():
+    """Missing line-referral uses 15% of net converted USD × net units.
+
+    B07H4S83D8 expected FBA $315 = $4.20 × 75 kept units. Gross shipped
+    $1378.60 / 77 would overstate after the 2 US returns.
+    """
+    from agent import resolve_sku_referral_fba_fuel
+
+    pf = {
+        "listing_price": 17.96,
+        "referral_per_unit": 2.69,
+        "fba_per_unit": 4.20,
+        "fuel_per_unit": 0.15,
+        "fulfillment_per_unit": 4.35,
+    }
+    ref_net, fba, fuel, _ = resolve_sku_referral_fba_fuel(
+        line_referral=0,
+        line_fba=0,
+        bill_units=75,
+        revenue=1344.49,
+        product_fees=pf,
+        fee_estimate=None,
+        include_fuel=False,
+    )
+    assert abs(ref_net - 201.67) < 1.0
+    assert abs(fba - 315.00) < 0.05
+    assert fuel == 0.0
+
+
+def test_sp_api_aggregate_accrues_referral_on_converted_lines():
+    """Live Amazon fallback must not skip referral the way a units-only
+    defaultdict used to. MXN is converted, then 15% of USD."""
+    from datetime import datetime, timezone
+
+    from agent import _aggregate_sku_from_sp_api
+    from currency_fx import UsdFx
+
+    fx = UsdFx(source="test")
+    fx.rates[("MXN", datetime(2026, 1, 15).date())] = 0.0534
+    orders = [
+        {
+            "AmazonOrderId": "mx-1",
+            "OrderStatus": "Shipped",
+            "PurchaseDate": "2026-01-15T12:00:00Z",
+            "MarketplaceId": "A1AM78C64UM0Y8",
+        }
+    ]
+    items = [
+        (
+            "mx-1",
+            {
+                "payload": {
+                    "OrderItems": [
+                        {
+                            "SellerSKU": "ASG - PHASE CARD GAME PO2",
+                            "ASIN": "B07H4S83D8",
+                            "QuantityOrdered": 2,
+                            "ItemPrice": {"Amount": "801.18", "CurrencyCode": "MXN"},
+                            "PromotionDiscount": {"Amount": "0", "CurrencyCode": "MXN"},
+                        }
+                    ]
+                }
+            },
+        )
+    ]
+    sku_data, count = _aggregate_sku_from_sp_api(
+        orders, items, [], [], fx=fx,
+    )
+    assert count == 1
+    d = sku_data["ASG - PHASE CARD GAME PO2"]
+    assert d["units"] == 2
+    usd = 801.18 * 0.0534
+    assert abs(d["revenue"] - usd) < 0.01
+    assert d["referral_total"] > 0
+    assert abs(d["referral_total"] - usd * 0.15) < 0.05
+
+
+def test_net_fees_and_sale_bands_apply_to_every_asin():
+    """No ASIN allowlist: two unrelated SKUs both net returns and use the
+    sale-price FBA band of that ASIN, not a Phase Card special case."""
+    from agent import apply_sale_price_fba, merge_asin_catalog_fba_bands
+
+    sku_data = {
+        "SKU-CARD": {
+            "units": 77,
+            "revenue": 1378.60,
+            "referral_total": 206.79,
+            "fba_total": 334.95,
+            "asin": "B00AAA1111",
+            "units_by_usd_price": {17.96: 75, 21.40: 2},
+        },
+        "SKU-UNO": {
+            "units": 22,
+            "revenue": 250.00,
+            "referral_total": 37.50,
+            "fba_total": 74.36,
+            "asin": "B00BBB2222",
+            "units_by_usd_price": {11.13: 21, 9.50: 1},
+        },
+    }
+    returns = {
+        "SKU-CARD": {
+            "returned_units": 2,
+            "refunded_revenue": 34.11,
+            "returned_units_by_usd_price": {17.96: 2},
+        },
+        "SKU-UNO": {
+            "returned_units": 1,
+            "refunded_revenue": 9.50,
+            "returned_units_by_usd_price": {9.50: 1},
+        },
+    }
+    _apply_returns_to_sku_data(
+        sku_data, returns, {"SKU-CARD": 0.15, "SKU-UNO": 0.15},
+    )
+    assert sku_data["SKU-CARD"]["net_units"] == 75
+    assert sku_data["SKU-UNO"]["net_units"] == 21
+
+    listing_bands = {
+        "B00AAA1111": {"10_50": (4.20, 0.15)},
+        "B00BBB2222": {"lt10": (3.38, 0.12), "10_50": (4.20, 0.15)},
+    }
+    for sku, catalog, listing_band, want_fba in (
+        ("SKU-CARD", 4.20, "10_50", 315.00),
+        ("SKU-UNO", 3.38, "lt10", 88.20),
+    ):
+        d = sku_data[sku]
+        rates = merge_asin_catalog_fba_bands(
+            {}, asin=d["asin"], listing_bands=listing_bands,
+        )
+        rates.pop(listing_band, None)
+        rebuilt = apply_sale_price_fba(
+            bill_units=int(d["net_units"]),
+            units_by_usd_price=d["units_by_usd_price"],
+            fba_per_usd_price={},
+            catalog_fba_per_unit=catalog,
+            include_fuel=False,
+            fba_per_band={k: v[0] for k, v in rates.items()},
+            fuel_per_band={k: v[1] for k, v in rates.items()},
+        )
+        assert rebuilt == (want_fba, 0.0)
+
+
+def test_catalog_10_50_fba_wins_over_live_quote():
+    """Listed under $10, sold at ~$14.70, 21 net units.
+
+    Live Fees API may return today's $4.60. A sibling listing already in
+    the $10–$50 band is $4.20 → FBA $4.20 × 21 = $88.20, not $96.60.
+    """
+    from agent import apply_sale_price_fba, merge_asin_catalog_fba_bands
+
+    live = {"le20": (4.60, 0.16, 2.19), "10_50": (4.60, 0.16, 2.19)}
+    listing_bands = {
+        "B00UNO1111": {"lt10": (3.38, 0.12), "10_50": (4.20, 0.15)},
+    }
+    rates = merge_asin_catalog_fba_bands(
+        live, asin="B00UNO1111", listing_bands=listing_bands,
+    )
+    rates.pop("lt10", None)
+    assert rates["10_50"][0] == 4.20
+    rebuilt = apply_sale_price_fba(
+        bill_units=21,
+        units_by_usd_price={14.77: 20, 11.50: 1},
+        fba_per_usd_price={},
+        catalog_fba_per_unit=3.38,
+        include_fuel=False,
+        fba_per_band={
+            k: v[0] for k, v in rates.items() if k in {"lt10", "10_50", "gt50"}
+        },
+        fuel_per_band={
+            k: v[1] for k, v in rates.items() if k in {"lt10", "10_50", "gt50"}
+        },
+    )
+    assert rebuilt == (88.20, 0.0)
+    assert rebuilt != (96.60, 0.0)
+
+
+def test_fba_uses_net_quantity_ordered_in_10_50_band():
+    """Each line's quantityOrdered in the $10–$50 sale-price band is $4.20.
+
+    22 ordered − 1 return = 21 kept → $4.20 × 21 = $88.20. Extra buckets
+    on the ordered map must not add an 22nd or 23rd unit.
+    """
+    from agent import apply_sale_price_fba
+
+    rebuilt = apply_sale_price_fba(
+        bill_units=21,
+        units_by_usd_price={14.77: 20, 11.50: 1, 14.72: 1},
+        fba_per_usd_price={},
+        catalog_fba_per_unit=3.38,
+        include_fuel=False,
+        fba_per_band={"10_50": 4.20, "lt10": 3.38},
+        fuel_per_band={"10_50": 0.15, "lt10": 0.12},
+    )
+    assert rebuilt == (88.20, 0.0)
+
+
+def test_same_15pct_live_quote_keeps_per_line_referral():
+    from agent import _referral_quotes_differ_from_category
+
+    assert not _referral_quotes_differ_from_category(
+        0.15,
+        {"le15": 2.19, "10_50": 2.19},
+        {},
+        {14.77: 20, 11.50: 1},
+    )
+    assert _referral_quotes_differ_from_category(
+        0.15,
+        {"lt10": 0.56},
+        {},
+        {6.99: 10, 13.29: 2},
+    )

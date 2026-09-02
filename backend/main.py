@@ -50,6 +50,7 @@ from database import (
     delete_purchase_order,
     open_ordered_qty_by_sku,
     _forecast_cache,
+    _db,
 )
 from forecasting.ingest import (
     backfill_user,
@@ -532,6 +533,13 @@ async def forecasting_restock(
         if not cached:
             return {"count": 0, "rows": []}
 
+    # Join in any Q4 backtest results the user has run. Keyed by sku;
+    # each row surfaces `q4_best_source`, `q4_best_name`, `q4_accuracy_pct`
+    # if a Q4 backtest exists for the SKU, or nulls otherwise.
+    q4_by_sku: dict[str, dict] = {}
+    async for d in _db()["q4BacktestResults"].find({"userId": user_id}):
+        q4_by_sku[d.get("sku")] = d
+
     # Side joins for the derived columns.
     cogs_rows = await get_cogs()
     cogs_by_sku: dict[str, dict] = {r["sku"]: r for r in cogs_rows}
@@ -859,11 +867,41 @@ async def forecasting_restock(
             returns_view["reorder_by_date_air"] = reorder_by_date_air_iso
             returns_view["reorder_by_date_ocean"] = reorder_by_date_ocean_iso
 
+        # Winning model + its backtest accuracy for the "Best model"
+        # column. Sourced from the picker's cached backtest slice so
+        # it stays consistent with the drawer's "Prediction accuracy"
+        # card. Best model can be prophet / naive / lgbm / xgb /
+        # ensemble / deepar / tft depending on which won the last
+        # nightly picker.
+        _bt = c.get("backtest") or {}
+        _bt_metrics = _bt.get("metrics") or {}
+        best_model_name = _bt.get("method") or c.get("method")
+        best_model_accuracy_pct = _bt_metrics.get("accuracy_pct")
+
+        # Q4 backtest join — populated when the user has run
+        # POST /forecasting/q4-backtest for this SKU (either as part of
+        # the fleet run or via the per-SKU button). Null out cleanly
+        # when the SKU hasn't been tested yet — FE renders "—".
+        _q4 = q4_by_sku.get(sku) or {}
+        _q4_winner = _q4.get("winner") or {}
+        q4_best_source = _q4_winner.get("source")
+        q4_best_name = _q4_winner.get("name")
+        q4_accuracy_pct = _q4_winner.get("accuracy_pct")
+        q4_actual_units = _q4.get("actual_q4_units")
+        q4_year = _q4.get("year")
+
         rows.append({
             "sku": sku,
             "asin": c.get("asin"),
             "fnsku": inv_row.get("fnsku"),
             "method": c.get("method"),
+            "best_model_name": best_model_name,
+            "best_model_accuracy_pct": best_model_accuracy_pct,
+            "q4_best_source": q4_best_source,   # "model" | "config" | null
+            "q4_best_name": q4_best_name,       # e.g. "prophet" or "Mid-balanced"
+            "q4_accuracy_pct": q4_accuracy_pct,
+            "q4_actual_units": q4_actual_units,
+            "q4_year": q4_year,
             "is_buyable": is_buyable,
             "status": inv_row.get("status"),
             "listing_status": inv_row.get("listing_status"),
@@ -1327,6 +1365,172 @@ async def put_product_settings_endpoint(
     return {"sku": sku, "settings": settings}
 
 
+@app.post("/forecasting/history-comparison")
+async def forecasting_history_comparison_fleet(user: dict = Depends(protect)):
+    """Kick off a fleet all-history vs 540d comparison as an async job.
+    Trains a fresh picker with unbounded training data (all sales
+    history in Mongo), scores every model on the last-30d holdout, and
+    compares each SKU's per-model accuracy to what the standard 540d
+    picker cached at last nightly refresh.
+
+    Runtime: ~5-10 min without deep models, ~15-30 min with
+    DEEPTS_ENABLED=1. Polls /forecasting/history-comparison/job/{id}
+    for progress; final `fleet_summary` tells you whether all-history
+    is net-better, net-worse, or a wash.
+    """
+    from bson import ObjectId as _OID
+    from history_comparison import start_history_comparison_job
+    user_id = _OID(str(user["_id"]))
+    job_id = await start_history_comparison_job(user_id)
+    return {"job_id": job_id, "status": "queued", "scope": "fleet"}
+
+
+@app.post("/forecasting/history-comparison/{sku}")
+async def forecasting_history_comparison_sku(
+    sku: str, user: dict = Depends(protect),
+):
+    """Per-SKU comparison — Prophet + Naive only, no user-global retrain.
+    ~10-30 sec. Compares to that SKU's cached 540d results."""
+    from bson import ObjectId as _OID
+    from history_comparison import start_history_comparison_job
+    user_id = _OID(str(user["_id"]))
+    job_id = await start_history_comparison_job(user_id, sku=sku)
+    return {"job_id": job_id, "status": "queued", "scope": "sku", "sku": sku}
+
+
+@app.get("/forecasting/history-comparison/job/{job_id}")
+async def forecasting_history_comparison_status(
+    job_id: str, user: dict = Depends(protect),
+):
+    from history_comparison import get_history_comparison_job
+    doc = await get_history_comparison_job(job_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="job not found")
+    if doc.get("userId") != str(user["_id"]):
+        raise HTTPException(status_code=403, detail="not your job")
+    return doc
+
+
+@app.get("/forecasting/history-comparison/results")
+async def forecasting_history_comparison_results(
+    user: dict = Depends(protect),
+    sku: str | None = None,
+):
+    from bson import ObjectId as _OID
+    from history_comparison import get_history_comparison_results
+    user_id = _OID(str(user["_id"]))
+    rows = await get_history_comparison_results(user_id, sku=sku)
+    return {"count": len(rows), "rows": rows}
+
+
+@app.post("/forecasting/q4-backtest")
+async def forecasting_q4_backtest_fleet(user: dict = Depends(protect)):
+    """Kick off a fleet-wide Q4 backtest as an async job. Returns
+    {job_id, status: 'queued'} immediately; poll
+    /forecasting/q4-backtest/job/{job_id} for progress.
+
+    Runtime: ~1-3 min on ~45 SKUs without deep models. Persists per-SKU
+    results to `q4BacktestResults` as it goes so the restock table can
+    surface partial results before the whole run is done.
+    """
+    from bson import ObjectId as _OID
+    from q4_backtest import start_q4_job
+    user_id = _OID(str(user["_id"]))
+    job_id = await start_q4_job(user_id)
+    return {"job_id": job_id, "status": "queued", "scope": "fleet"}
+
+
+@app.post("/forecasting/q4-backtest/{sku}")
+async def forecasting_q4_backtest_sku(sku: str, user: dict = Depends(protect)):
+    """Per-SKU Q4 backtest (fast path — no user-global retrain).
+    Trains only Prophet + Naive for this SKU plus the weight-config
+    sweep. ~10-30 sec. Same async job pattern as the fleet endpoint.
+    """
+    from bson import ObjectId as _OID
+    from q4_backtest import start_q4_job
+    user_id = _OID(str(user["_id"]))
+    job_id = await start_q4_job(user_id, sku=sku)
+    return {"job_id": job_id, "status": "queued", "scope": "sku", "sku": sku}
+
+
+@app.get("/forecasting/q4-backtest/job/{job_id}")
+async def forecasting_q4_backtest_status(
+    job_id: str, user: dict = Depends(protect),
+):
+    """Poll a Q4 backtest job's status. FE hits this every 3-5 sec
+    while the job is running. Returns 404 for unknown jobs, 403 if
+    the caller doesn't own the job."""
+    from q4_backtest import get_q4_job
+    doc = await get_q4_job(job_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="job not found")
+    if doc.get("userId") != str(user["_id"]):
+        raise HTTPException(status_code=403, detail="not your job")
+    return doc
+
+
+@app.get("/forecasting/q4-backtest/results")
+async def forecasting_q4_backtest_results(
+    user: dict = Depends(protect),
+    sku: str | None = None,
+    year: int | None = None,
+):
+    """Fetch persisted Q4 backtest results for the caller. Optional
+    ?sku= and ?year= filters. Returns [] if the user has never run
+    a Q4 backtest for the requested scope."""
+    from bson import ObjectId as _OID
+    from q4_backtest import get_q4_results
+    user_id = _OID(str(user["_id"]))
+    rows = await get_q4_results(user_id, sku=sku, year=year)
+    return {"count": len(rows), "rows": rows}
+
+
+@app.post("/forecasting/weight-sweep")
+async def forecasting_weight_sweep_run(user: dict = Depends(protect)):
+    """Score 5 candidate velocity_weights configs against a 30-day
+    holdout for every SKU in the caller's forecast_cache. Persists the
+    run to `weightSweepResults` and returns the aggregates.
+
+    Sweep runs synchronously (~5-15s on a 45-SKU catalog). Fine to
+    invoke from a curl and read the response; also stored so the
+    latest run is retrievable via GET /forecasting/weight-sweep.
+    """
+    from bson import ObjectId as _OID
+    from weight_sweep import run_weight_sweep
+    return await run_weight_sweep(_OID(str(user["_id"])))
+
+
+@app.get("/forecasting/weight-sweep")
+async def forecasting_weight_sweep_latest(user: dict = Depends(protect)):
+    """Return the most recent weight-sweep run for the caller, or
+    {"error": ...} if they've never triggered one. Useful for pulling
+    the last sweep's results without re-running the sweep."""
+    from bson import ObjectId as _OID
+    from weight_sweep import latest_weight_sweep
+    doc = await latest_weight_sweep(_OID(str(user["_id"])))
+    if not doc:
+        return {"error": "No weight sweep has been run for this user yet. "
+                          "POST to /forecasting/weight-sweep to trigger one."}
+    return doc
+
+
+@app.post("/product-settings/bulk-weights")
+async def bulk_apply_velocity_weights_endpoint(
+    body: dict, user: dict = Depends(protect),
+):
+    """Fan one velocity_weights config across every SKU in the user's
+    forecast_cache. Used by the Actions modal Forecast tab's "Apply to
+    all SKUs" button so testers can eyeball fleet-wide accuracy under
+    a candidate weight profile without editing each SKU by hand.
+    """
+    from database import bulk_apply_velocity_weights
+    weights = body.get("velocity_weights") or {}
+    if not isinstance(weights, dict) or not weights:
+        raise HTTPException(status_code=400, detail="velocity_weights required")
+    count = await bulk_apply_velocity_weights(weights)
+    return {"updated": count, "velocity_weights": weights}
+
+
 # ── Purchase orders (drives the "Ordered" column) ────────────────────────
 
 @app.get("/purchase-orders")
@@ -1610,6 +1814,7 @@ async def profitability_sku_prices(
             "promotion_discount": {"$ifNull": ["$orderItems.promotionDiscount.amount", 0]},
             "currency": {"$ifNull": ["$orderItems.itemPrice.currencyCode", "$orderTotal.currencyCode"]},
             "sales_channel": "$salesChannel",
+            "marketplace_id": "$marketplaceId",
             "asin": "$orderItems.asin",
             "city": "$shippingAddress.city",
             "state": "$shippingAddress.stateOrRegion",
@@ -1619,21 +1824,19 @@ async def profitability_sku_prices(
     from currency_fx import infer_line_currency, infer_order_date, load_usd_fx
 
     docs = await _db().orders.aggregate(pipeline).to_list(length=None)
-    currencies = {
-        str(d.get("currency") or "").strip().upper()
-        for d in docs
-        if str(d.get("currency") or "").strip()
-    }
+    currencies = set()
     for d in docs:
-        ch = str(d.get("sales_channel") or "").strip()
-        if ch:
-            currencies.add(
-                infer_line_currency(
-                    {"salesChannel": ch, "orderTotal": {"currencyCode": d.get("currency")}},
-                    {"itemPrice": {"currencyCode": d.get("currency")}},
-                    default="",
-                )
+        currencies.add(
+            infer_line_currency(
+                {
+                    "salesChannel": d.get("sales_channel"),
+                    "marketplaceId": d.get("marketplace_id"),
+                    "orderTotal": {"currencyCode": d.get("currency")},
+                },
+                {"itemPrice": {"currencyCode": d.get("currency")}},
+                default="",
             )
+        )
     currencies.discard("")
     fx = await load_usd_fx(currencies, start_dt, end_dt)
 
@@ -1645,12 +1848,13 @@ async def profitability_sku_prices(
         promo = float(d.get("promotion_discount") or 0)
         gross_line = subtotal if subtotal > 0 else item_price
         net_line = max(0.0, gross_line - promo)
-        native_ccy = (
-            str(d.get("currency") or "").strip().upper()
-            or infer_line_currency(
-                {"salesChannel": d.get("sales_channel")},
-                None,
-            )
+        native_ccy = infer_line_currency(
+            {
+                "salesChannel": d.get("sales_channel"),
+                "marketplaceId": d.get("marketplace_id"),
+                "orderTotal": {"currencyCode": d.get("currency")},
+            },
+            {"itemPrice": {"currencyCode": d.get("currency")}},
         )
         on = infer_order_date({"purchaseDate": d.get("purchase_date")})
         usd_gross = fx.to_usd(gross_line, native_ccy, on)

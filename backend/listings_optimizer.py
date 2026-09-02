@@ -59,10 +59,19 @@ MODEL = "openai/gpt-oss-120b"
 # consumes ~2 seconds per attempt without producing a JSON block.
 _MODEL_FALLBACK_CHAIN = (
     "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
     "allam-2-7b",
     "openai/gpt-oss-safeguard-20b",
     "groq/compound",
 )
+
+# Groq surfaces 429 messages with a "Please try again in X.XXXs" hint.
+# We parse it and honour it (capped) before moving on — otherwise
+# concurrent rewrites all bounce off the shared 30k TPM org limit and
+# every model in the chain fails together. See _parse_retry_after_seconds.
+_RETRY_AFTER_RE = re.compile(r"try again in ([\d.]+)s", re.IGNORECASE)
+_RATE_LIMIT_SLEEP_CAP_SECONDS = 5.0
+
 
 # Vision model for image compliance checks. Groq's llama-4-scout is
 # vision-capable but locked behind their Dev tier — free-tier accounts
@@ -82,7 +91,7 @@ log = logging.getLogger("listings_optimizer")
 # ── Amazon 2026 style-guide constants ──────────────────────────────────────
 # Values sourced from Amazon_Listing_Guidelines.docx (Aug 2026).
 
-TITLE_MAX_CHARS_DEFAULT = 200        # US default (200 chars for most categories)
+TITLE_MAX_CHARS_DEFAULT = 75         # US mobile-optimized cap (Amazon truncates ~75 on mobile SERP)
 TITLE_MAX_CHARS_INDIA = 75           # India / many categories in the 2026 update
 BULLET_MAX_CHARS = 500               # per bullet, US
 BULLET_TARGET_COUNT = 5              # Amazon renders 5 by default
@@ -421,7 +430,7 @@ _REWRITE_SYSTEM_PROMPT = """You are a senior Amazon listing optimization special
 The seller is paying for a rich, conversion-optimized rewrite. Thin, one-line-per-bullet output is a failure — expand every field to the top of what Amazon allows, keeping full compliance.
 
 # Length + richness targets (aim for the TOP of each range — under-length is a failure)
-- Title: 150-200 characters. Pack in brand, product type, material, key spec/pack size, primary use case, and 1-2 differentiators. Front-load the most-searched terms.
+- Title: 60-75 characters (Amazon truncates ~75 chars on mobile — every character must earn its place). Front-load the brand + primary keyword + top spec. Skip filler; every token should be one buyers search for.
 - Bullets: EXACTLY 5 bullets. Each bullet 250-500 characters (aim ~350). Format:
     ALL CAPS HEADER (5-8 words, hyphen-separated is fine) - detailed body sentence(s) covering the feature, concrete specs (dimensions/materials/quantity), the buyer benefit, and the use case or context. 2-4 sentences of body per bullet.
     Example bullet:
@@ -439,7 +448,7 @@ The seller is paying for a rich, conversion-optimized rewrite. Thin, one-line-pe
 # Return format
 Return VALID JSON only — no prose outside the object — with EXACTLY this shape:
 {
-  "title": "150-200 char rewritten title",
+  "title": "60-75 char rewritten title (brand + primary keyword + top spec, front-loaded)",
   "bullets": ["bullet 1 (250-500 chars, ALL CAPS HEADER - body)", "bullet 2", "bullet 3", "bullet 4", "bullet 5"],
   "description": "1200-1900 char rewritten description with section headers on their own lines",
   "backend_keywords": "space separated keyword string, 200-249 UTF-8 bytes, 30-50 tokens",
@@ -452,7 +461,7 @@ Return VALID JSON only — no prose outside the object — with EXACTLY this sha
 # output looks like the thin, one-line-per-bullet baseline the client
 # flagged as inferior to Seller Assistant. Above them, it matches the
 # depth of top-tier tools while staying inside Amazon's hard limits.
-RICHNESS_MIN_TITLE_CHARS = 130
+RICHNESS_MIN_TITLE_CHARS = 55
 RICHNESS_MIN_BULLET_AVG_CHARS = 220
 RICHNESS_MIN_BULLET_COUNT = 5
 RICHNESS_MIN_DESCRIPTION_CHARS = 1000
@@ -507,7 +516,7 @@ def _build_expansion_instruction(thin_fields: list[str]) -> str:
     the exact minimum each must clear. Precise beats polite here — the
     first-pass tendency is to under-deliver on length."""
     labels = {
-        "title": f"TITLE — expand to at least {RICHNESS_MIN_TITLE_CHARS} chars (aim 180). Add material, spec/pack size, use case, differentiators.",
+        "title": f"TITLE — expand to at least {RICHNESS_MIN_TITLE_CHARS} chars (aim 70, max 75). Add the brand + primary keyword + top spec if any is missing.",
         "bullets": f"BULLETS — expand each bullet to at least {RICHNESS_MIN_BULLET_AVG_CHARS} chars on average (aim 350). Keep the ALL CAPS HEADER but add 2-4 sentences of detail per bullet: specs, dimensions, materials, buyer benefit, use case.",
         "description": f"DESCRIPTION — expand to at least {RICHNESS_MIN_DESCRIPTION_CHARS} chars (aim 1500). Add 3-5 section headers on their own lines, each with 2-4 sentences of body.",
         "backend_keywords": f"BACKEND KEYWORDS — expand to at least {RICHNESS_MIN_BACKEND_BYTES} UTF-8 bytes (aim 240). Add synonyms, alternate spellings, misspellings, material variants, use-case terms. Still space-separated, no commas, no duplicates.",
@@ -588,66 +597,84 @@ async def _rewrite_with_fallback(
     """
     last_err: Exception | None = None
     for model_name in _MODEL_FALLBACK_CHAIN:
-        try:
-            resp = await client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                temperature=0.3,
-                max_tokens=4000,
-            )
-            raw = resp.choices[0].message.content or ""
+        # Two-attempt loop per model: first attempt, then one retry after
+        # honouring Groq's server-provided retry-after on 429. Without the
+        # retry, concurrent rewrites all bounce off the shared 30k TPM org
+        # limit and every model in the chain fails within the same second.
+        for attempt in range(2):
             try:
-                return _extract_json_block(raw), model_name
-            except json.JSONDecodeError as je:
-                # Model produced text with no parseable JSON block.
-                # Log a snippet + try the next model — different models
-                # respond differently to the same prompt.
-                log.warning(
-                    "rewrite_listing: model %s returned unparseable "
-                    "response (len=%d, snippet=%r) — trying next: %s",
-                    model_name, len(raw), raw[:200], je,
+                resp = await client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=2000,
                 )
-                last_err = je
-                continue
-        except json.JSONDecodeError:
-            # Model returned non-JSON text despite json_object mode.
-            # Bubble up — this is a prompt/parsing issue, not a model
-            # capability issue, so trying the next model won't help.
-            raise
-        except Exception as e:
-            msg = str(e)
-            # Retryable: 400 (json_validate_failed / prompt issues that
-            # a different model might tolerate), 404 (model decommissioned
-            # — try the next), 429 (rate limit — burn the rest of the
-            # chain since they're independent quotas), 5xx (transient
-            # server). Non-retryable: 401/403 (auth) — that's the same
-            # api key against every model, so short-circuit.
-            retryable_markers = (
-                "json_validate_failed", "model_not_found",
-                "400", "404", "429", "500", "502", "503", "504",
-            )
-            auth_markers = ("401", "403", "invalid_api_key", "authentication")
-            if any(m in msg for m in auth_markers):
-                raise
-            if any(m in msg for m in retryable_markers):
+                raw = resp.choices[0].message.content or ""
+                try:
+                    return _extract_json_block(raw), model_name
+                except json.JSONDecodeError as je:
+                    log.warning(
+                        "rewrite_listing: model %s returned unparseable "
+                        "response (len=%d, snippet=%r) — trying next: %s",
+                        model_name, len(raw), raw[:200], je,
+                    )
+                    last_err = je
+                    break  # move to next model
+            except Exception as e:
+                msg = str(e)
+                auth_markers = ("401", "403", "invalid_api_key", "authentication")
+                if any(m in msg for m in auth_markers):
+                    raise
+                # Rate limit: sleep the amount Groq asks us to (capped)
+                # and retry the SAME model once. If it's a persistent
+                # limit, the second try will also 429 and we fall through.
+                is_rate_limit = "429" in msg or "rate_limit" in msg.lower()
+                if is_rate_limit and attempt == 0:
+                    wait_s = _parse_retry_after_seconds(msg)
+                    log.warning(
+                        "rewrite_listing: model %s rate-limited — "
+                        "sleeping %.1fs then retrying same model",
+                        model_name, wait_s,
+                    )
+                    await asyncio.sleep(wait_s)
+                    last_err = e
+                    continue  # retry SAME model
+                retryable_markers = (
+                    "json_validate_failed", "model_not_found",
+                    "400", "404", "429", "500", "502", "503", "504",
+                )
+                if any(m in msg for m in retryable_markers):
+                    log.warning(
+                        "rewrite_listing: model %s failed (%s) — trying next: %s",
+                        model_name, type(e).__name__, msg[:200],
+                    )
+                    last_err = e
+                    break
                 log.warning(
-                    "rewrite_listing: model %s failed (%s) — trying next: %s",
+                    "rewrite_listing: model %s failed with unclassified "
+                    "error (%s) — trying next: %s",
                     model_name, type(e).__name__, msg[:200],
                 )
                 last_err = e
-                continue
-            # Unknown error class — try next anyway rather than crashing
-            # a user-visible feature. Log at warning so it shows up.
-            log.warning(
-                "rewrite_listing: model %s failed with unclassified "
-                "error (%s) — trying next: %s",
-                model_name, type(e).__name__, msg[:200],
-            )
-            last_err = e
-            continue
-    # Exhausted the chain — surface the last error to the caller.
+                break
     assert last_err is not None
     raise last_err
+
+
+def _parse_retry_after_seconds(err_msg: str) -> float:
+    """Extract Groq's ``Please try again in X.XXXs`` hint from a 429 body.
+    Returns a bounded sleep in seconds (1.0 minimum so we don't hammer
+    the API, ``_RATE_LIMIT_SLEEP_CAP_SECONDS`` maximum so user latency
+    stays reasonable — a longer required wait means the whole chain
+    should fall through and surface an error to the user)."""
+    m = _RETRY_AFTER_RE.search(err_msg)
+    if not m:
+        return 2.0
+    try:
+        s = float(m.group(1))
+    except ValueError:
+        return 2.0
+    return max(1.0, min(s, _RATE_LIMIT_SLEEP_CAP_SECONDS))
 
 
 async def rewrite_listing(
