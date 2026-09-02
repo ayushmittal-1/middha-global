@@ -812,6 +812,29 @@ def _multimodel_forecast(
     except Exception as e:
         log.warning("naive backtest failed for sku=%s: %s", sku, e)
 
+    # ── Croston + TSB backtest (intermittent-demand specialists) ──
+    # Both are dirt-cheap exponential-smoothing methods aimed at SKUs
+    # where most days are zero and sales come in bursts. TSB additionally
+    # decays the forecast toward zero when a SKU goes dormant (its
+    # obsolescence-aware update runs every period, not just on nonzero
+    # days). Prophet/DeepAR beat these on structured series; they only
+    # win when the target is genuinely sparse.
+    from .intermittent import croston_forecast, tsb_forecast
+    for kind_key, fn in (("croston", croston_forecast), ("tsb", tsb_forecast)):
+        try:
+            bt_result = fn(train_fit, horizon=BACKTEST_HOLDOUT_DAYS, today=cutoff)
+            _apply_recovery_bump(bt_result, train_rows, cutoff)
+            bt_days, bt_metrics = _score_forecast_days(
+                bt_result.get("forecast") or [], holdout_by_day,
+            )
+            candidates[kind_key] = {
+                "method_label": kind_key,
+                "backtest_days": bt_days,
+                "backtest_metrics": bt_metrics,
+            }
+        except Exception as e:
+            log.warning("%s backtest failed for sku=%s: %s", kind_key, sku, e)
+
     # ── LGBM backtest (only when the user-global fit succeeded) ──
     if lgbm_state is not None and lgbm_module is not None:
         target_series = all_train_series_by_sku.get(sku)
@@ -1007,6 +1030,17 @@ def _multimodel_forecast(
                         "falling back to naive", sku, e)
             refit_choice = "naive"
             fwd = _naive_forecast(full_fit, horizon, today)
+    elif refit_choice in ("croston", "tsb"):
+        # Croston/TSB refit is free — they're closed-form smoothing.
+        from .intermittent import croston_forecast, tsb_forecast
+        fn = croston_forecast if refit_choice == "croston" else tsb_forecast
+        try:
+            fwd = fn(full_fit, horizon, today)
+        except Exception as e:
+            log.warning("%s forward-forecast failed for sku=%s: %s — "
+                        "falling back to naive", refit_choice, sku, e)
+            refit_choice = "naive"
+            fwd = _naive_forecast(full_fit, horizon, today)
     elif refit_choice in ("deepar", "tft") and deepts_state and deepts_state.get(refit_choice) is not None:
         # Same trade-off as LGBM: reuse the pre-cutoff trained model
         # rather than retrain forward-fresh. Deep model training is
@@ -1049,6 +1083,16 @@ def _multimodel_forecast(
             base_forecasts.append(n_fwd.get("forecast") or [])
         except Exception as e:
             log.warning("naive forward for ensemble failed sku=%s: %s", sku, e)
+        # Croston + TSB forward — closed-form smoothing, free.
+        from .intermittent import croston_forecast, tsb_forecast
+        for kind_key, fn in (("croston", croston_forecast), ("tsb", tsb_forecast)):
+            try:
+                fwd_int = fn(full_fit, horizon, today)
+                _apply_recovery_bump(fwd_int, rows, today)
+                base_forecasts.append(fwd_int.get("forecast") or [])
+            except Exception as e:
+                log.warning("%s forward for ensemble failed sku=%s: %s",
+                            kind_key, sku, e)
         # LGBM forward — reuse the pre-cutoff state to avoid a second fit.
         if lgbm_state is not None and lgbm_module is not None:
             try:
