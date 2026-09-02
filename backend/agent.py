@@ -27,6 +27,7 @@ from currency_fx import (
     infer_order_date,
     is_us_marketplace,
     load_usd_fx,
+    looks_like_unconverted_foreign_face,
     US_MARKETPLACE_ID,
 )
 from marketplace_timezone import (
@@ -1500,6 +1501,8 @@ async def fetch_fba_rates_by_sale_price(
             usd_price = round(float(raw_price), 2)
             if usd_price <= 0:
                 continue
+            if looks_like_unconverted_foreign_face(usd_price, listing):
+                continue
             if not needs_sale_price_fee_quote(usd_price, listing):
                 continue
             key = (usd_fba_price_band(usd_price), referral_price_tier(usd_price))
@@ -1707,6 +1710,7 @@ def _aggregate_sku_from_sp_api(
             unit_usd = round(float(usd_rev) / float(qty or 1), 2)
             by_price = sku_data[sku].setdefault("units_by_usd_price", {})
             by_price[unit_usd] = int(by_price.get(unit_usd) or 0) + qty
+    aurora_data.repair_unconverted_foreign_price_buckets(sku_data, table)
     return sku_data, orders_count
 
 

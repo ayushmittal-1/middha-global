@@ -9,14 +9,21 @@ All profitability money is converted to USD *before* aggregating:
 
   USD amount = native amount × (USD per 1 unit of native currency)
 
-Rates come from Frankfurter (ECB daily) with a static fallback so a
-failed FX fetch never silently re-mixes currencies. Weekends/holidays
-carry forward the last published business-day rate.
+Rates come from Wise mid-market (same figures as
+https://wise.com/in/currency-converter/cad-to-usd-rate/history/30-01-2026 )
+for the *order's purchase date*. Frankfurter (ECB daily) fills days Wise
+misses; a static fallback is last resort so a failed FX fetch never
+silently re-mixes currencies. A December CAD order uses December's rate,
+not today's. Weekends/holidays carry forward the last known rate.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -29,6 +36,24 @@ log = logging.getLogger(__name__)
 _PENNY = Decimal("0.01")
 TARGET_CURRENCY = "USD"
 FRANKFURTER_URL = "https://api.frankfurter.dev/v1"
+WISE_HISTORY_BASE = os.getenv(
+    "WISE_HISTORY_BASE",
+    "https://wise.com/in/currency-converter",
+).rstrip("/")
+WISE_FX_ENABLED = os.getenv("WISE_FX", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+_WISE_NEXT_DATA = re.compile(
+    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+    re.DOTALL,
+)
+_WISE_SEM = asyncio.Semaphore(8)
+_WISE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; AuroraFX/1.0; +https://wise.com/)"
+    ),
+    "Accept": "text/html,application/json",
+}
 
 # Approximate USD per 1 unit — used when Frankfurter has no series
 # (AED/SAR/EGP) or the HTTP fetch fails. MXN ~ Jan 2026 ECB (~0.0555).
@@ -140,6 +165,11 @@ MARKETPLACE_CURRENCY: dict[str, str] = {
 
 # (currency, start_iso, end_iso) → {date: usd_per_unit}
 _FX_CACHE: dict[tuple[str, str, str], dict[date, float]] = {}
+# Per-day cache so a December CAD rate is never replaced by "today" when a
+# later request loads a different window (or Frankfurter misses one range).
+_DAILY_RATES: dict[tuple[str, date], float] = {}
+_WISE_HITS: set[tuple[str, date]] = set()
+LOOKBACK_DAYS = 14
 
 
 def _round_money(value: float | Decimal | str) -> float:
@@ -223,29 +253,51 @@ def infer_channel_currency(order: dict | None) -> str:
     return MARKETPLACE_CURRENCY.get(mid, "")
 
 
-def _explicit_money_currency(order: dict | None, item: dict | None) -> str:
+def _money_codes_from_block(block) -> list[str]:
+    if not isinstance(block, dict):
+        return []
+    code = _iso_currency(
+        block.get("currencyCode") or block.get("CurrencyCode")
+    )
+    return [code] if code else []
+
+
+def _collect_money_currencies(order: dict | None, item: dict | None) -> list[str]:
+    """Every ISO code on the line / order, first-seen order preserved."""
+    codes: list[str] = []
+    seen: set[str] = set()
+
+    def _add(block) -> None:
+        for code in _money_codes_from_block(block):
+            if code not in seen:
+                seen.add(code)
+                codes.append(code)
+
     if item:
         for field in (
             "itemSubtotal", "itemPrice", "promotionDiscount",
             "ItemPrice", "PromotionDiscount",
         ):
-            block = item.get(field) or {}
-            if not isinstance(block, dict):
-                continue
-            code = _iso_currency(
-                block.get("currencyCode") or block.get("CurrencyCode")
-            )
-            if code:
-                return code
+            _add(item.get(field))
     if order:
-        top = order.get("orderTotal") or order.get("OrderTotal") or {}
-        if isinstance(top, dict):
-            code = _iso_currency(
-                top.get("currencyCode") or top.get("CurrencyCode")
-            )
-            if code:
-                return code
-    return ""
+        _add(order.get("orderTotal") or order.get("OrderTotal"))
+    return codes
+
+
+def _explicit_money_currency(order: dict | None, item: dict | None) -> str:
+    """Prefer a real marketplace currency over a USD fee-map stamp.
+
+    Order sync often labels referral/itemPrice USD on Amazon.ca / .mx lines
+    while ``orderTotal`` (or another field) is still CAD/MXN. Returning the
+    first USD hit made 287.37 pesos look like $287.37.
+    """
+    codes = _collect_money_currencies(order, item)
+    if not codes:
+        return ""
+    non_usd = [c for c in codes if c != TARGET_CURRENCY]
+    if non_usd:
+        return non_usd[0]
+    return codes[0]
 
 
 def infer_line_currency(
@@ -271,6 +323,11 @@ def infer_line_currency(
         if money_ccy == TARGET_CURRENCY:
             return channel_ccy
         return money_ccy
+    if channel_ccy and (not money_ccy or money_ccy == TARGET_CURRENCY):
+        # Channel wins over a missing/USD stamp so Amazon.com.mx is MXN
+        # even when every money field was labelled USD by the fee map.
+        if channel_ccy != TARGET_CURRENCY:
+            return channel_ccy
     if money_ccy:
         return money_ccy
     if channel_ccy:
@@ -282,9 +339,45 @@ def referral_fee_currency(order: dict | None, item: dict | None = None) -> str:
     """Referral is a % of line revenue — always the line's marketplace currency.
 
     Stored ``referralFee.currencyCode`` is often USD from the US fee map even
-    when the 15% was taken of a CAD/MXN face value.
+    when the 15% was taken of a CAD/MXN face value (B08HGLL647 24 Mar 2026:
+    MXN 287.37 → referral 43.11 labelled USD).
     """
     return infer_line_currency(order, item)
+
+
+def fba_fee_currency(order: dict | None, item: dict | None = None) -> str:
+    """ISO code for a stored ``fulfillmentFee`` amount.
+
+    US catalog FBA ($4.35) is stamped USD on CA/MX lines — keep USD so we
+    do not treat dollars as pesos. A fee actually stored in CAD/MXN is
+    converted. Referral must NOT use this helper (that stamp is a lie).
+    """
+    block = {}
+    if item and isinstance(item, dict):
+        block = item.get("fulfillmentFee") or item.get("FulfillmentFee") or {}
+    stamped = money_field_currency(block, "")
+    if stamped and stamped != TARGET_CURRENCY:
+        return stamped
+    return TARGET_CURRENCY
+
+
+def looks_like_unconverted_foreign_face(
+    sale_usd: float,
+    listing_usd: float | None = None,
+) -> bool:
+    """True when a 'USD' unit price is almost certainly pesos/CAD as dollars.
+
+    B08HGLL647 listing $13.49 vs unconverted MXN 287.37. A real $10–$50
+    sale on the same SKU must still quote Fees API; 5× listing (or +$40)
+    is the cut.
+    """
+    sale = float(sale_usd or 0)
+    listing = float(listing_usd or 0)
+    if sale <= 0:
+        return False
+    if listing > 0:
+        return sale >= max(listing * 5.0, listing + 40.0)
+    return sale >= 80.0
 
 
 def money_field_currency(block, fallback: str = TARGET_CURRENCY) -> str:
@@ -308,14 +401,21 @@ class UsdFx:
     missing: set[str] = field(default_factory=set)
 
     def rate(self, currency: str | None, on: date | None = None) -> float:
+        """USD per 1 unit of ``currency`` on the *order* calendar date.
+
+        Never substitutes a later day's rate (e.g. today) for a December
+        order. Weekend/holiday gaps walk backward up to ``LOOKBACK_DAYS``.
+        Static fallback is last resort when that date's series is missing.
+        """
         cur = (currency or TARGET_CURRENCY).strip().upper() or TARGET_CURRENCY
         if cur == TARGET_CURRENCY:
             return 1.0
-        if on is not None:
-            found = self.rates.get((cur, on))
+        on_d = _as_date(on) if on is not None else None
+        if on_d is not None:
+            found = self.rates.get((cur, on_d))
             if found is None:
-                for i in range(1, 8):
-                    found = self.rates.get((cur, on - timedelta(days=i)))
+                for i in range(1, LOOKBACK_DAYS + 1):
+                    found = self.rates.get((cur, on_d - timedelta(days=i)))
                     if found is not None:
                         break
             if found is not None:
@@ -398,6 +498,93 @@ def _fill_calendar(
     return filled
 
 
+def wise_history_url(currency: str, day: date) -> str:
+    """Same URL shape as the Wise history page the seller uses."""
+    cur = (currency or "").strip().lower()
+    return (
+        f"{WISE_HISTORY_BASE}/{cur}-to-usd-rate/history/"
+        f"{day.strftime('%d-%m-%Y')}"
+    )
+
+
+def parse_wise_history_html(html: str) -> float | None:
+    """Read mid-market USD-per-unit from Wise converter ``__NEXT_DATA__``."""
+    if not html:
+        return None
+    m = _WISE_NEXT_DATA.search(html)
+    if not m:
+        return None
+    try:
+        payload = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    model = ((payload.get("props") or {}).get("pageProps") or {}).get("model") or {}
+    block = model.get("historicalRate") or model.get("rate") or {}
+    try:
+        value = float(block.get("value"))
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+async def _fetch_wise_day(
+    client: httpx.AsyncClient, currency: str, day: date,
+) -> tuple[date, float | None]:
+    if (currency, day) in _WISE_HITS:
+        cached = _DAILY_RATES.get((currency, day))
+        return day, float(cached) if cached is not None else None
+    url = wise_history_url(currency, day)
+    async with _WISE_SEM:
+        try:
+            resp = await client.get(url, headers=_WISE_HEADERS)
+            if resp.status_code >= 400:
+                return day, None
+            rate = parse_wise_history_html(resp.text)
+            return day, rate
+        except Exception as e:
+            log.warning("Wise FX fetch failed for %s %s: %s", currency, day, e)
+            return day, None
+
+
+async def _fetch_wise_range(
+    currency: str, start: date, end: date,
+) -> dict[date, float]:
+    """Daily Wise mid-market USD-per-unit for ``currency`` in [start, end]."""
+    if not WISE_FX_ENABLED:
+        return {}
+    cur = currency.upper()
+    days: list[date] = []
+    day = start
+    while day <= end:
+        days.append(day)
+        day += timedelta(days=1)
+    need = [d for d in days if (cur, d) not in _WISE_HITS]
+    daily: dict[date, float] = {}
+    for d in days:
+        if (cur, d) in _WISE_HITS:
+            hit = _DAILY_RATES.get((cur, d))
+            if hit is not None:
+                daily[d] = float(hit)
+    if need:
+        try:
+            async with httpx.AsyncClient(timeout=18, follow_redirects=True) as client:
+                rows = await asyncio.gather(
+                    *[_fetch_wise_day(client, cur, d) for d in need]
+                )
+        except Exception as e:
+            log.warning("Wise FX range failed for %s %s..%s: %s", cur, start, end, e)
+            rows = []
+        for d, rate in rows:
+            if rate is None:
+                continue
+            daily[d] = float(rate)
+            _DAILY_RATES[(cur, d)] = float(rate)
+            _WISE_HITS.add((cur, d))
+    return daily
+
+
 async def _fetch_frankfurter_range(
     currency: str, start: date, end: date,
 ) -> dict[date, float]:
@@ -438,7 +625,31 @@ async def _fetch_frankfurter_range(
                 continue
     filled = _fill_calendar(daily, start, end)
     _FX_CACHE[key] = filled
+    for d, r in filled.items():
+        _DAILY_RATES.setdefault((cur, d), float(r))
     return filled
+
+
+def _remember_daily(cur: str, daily: dict[date, float]) -> None:
+    for d, r in daily.items():
+        _DAILY_RATES.setdefault((cur, d), float(r))
+
+
+def _hydrate_from_daily(cur: str, start: date, end: date) -> dict[date, float]:
+    """Replay previously fetched days (and lookback) into a window."""
+    out: dict[date, float] = {}
+    day = start
+    while day <= end:
+        found = _DAILY_RATES.get((cur, day))
+        if found is None:
+            for i in range(1, LOOKBACK_DAYS + 1):
+                found = _DAILY_RATES.get((cur, day - timedelta(days=i)))
+                if found is not None:
+                    break
+        if found is not None:
+            out[day] = float(found)
+        day += timedelta(days=1)
+    return out
 
 
 async def load_usd_fx(
@@ -446,11 +657,18 @@ async def load_usd_fx(
     start: date | datetime | None,
     end: date | datetime | None,
 ) -> UsdFx:
-    """Load USD rates for every non-USD code in ``currencies``."""
+    """Load USD rates for every non-USD code in ``currencies``.
+
+    Fetches a padded window so a Saturday / Christmas order still gets the
+    prior business-day rate, not today's fallback. Each order later converts
+    with *its* ``purchaseDate``.
+    """
     start_d = _as_date(start) or date.today()
     end_d = _as_date(end) or start_d
     if end_d < start_d:
         start_d, end_d = end_d, start_d
+    fetch_start = start_d - timedelta(days=LOOKBACK_DAYS)
+    fetch_end = end_d + timedelta(days=1)
     need = sorted({
         str(c).strip().upper()
         for c in (currencies or [])
@@ -460,14 +678,42 @@ async def load_usd_fx(
         return identity_fx()
 
     table = UsdFx(source="fallback")
-    fetched_any = False
+    wise_any = False
+    frank_any = False
     for cur in need:
-        daily = await _fetch_frankfurter_range(cur, start_d, end_d)
-        if daily:
-            fetched_any = True
-            for d, r in daily.items():
-                table.rates[(cur, d)] = r
-        elif cur not in table.fallback:
+        wise = await _fetch_wise_range(cur, fetch_start, fetch_end)
+        if wise:
+            wise_any = True
+            _remember_daily(cur, wise)
+        frank: dict[date, float] = {}
+        needs_frank = not wise
+        if wise:
+            probe = fetch_start
+            while probe <= fetch_end:
+                if probe not in wise:
+                    needs_frank = True
+                    break
+                probe += timedelta(days=1)
+        if needs_frank:
+            frank = await _fetch_frankfurter_range(cur, fetch_start, fetch_end)
+            if frank:
+                frank_any = True
+                _remember_daily(cur, frank)
+        cached = _hydrate_from_daily(cur, fetch_start, fetch_end)
+        # Wise mid-market wins over ECB when both exist for the same day.
+        merged = {**cached, **(frank or {}), **(wise or {})}
+        if merged:
+            merged = _fill_calendar(merged, fetch_start, fetch_end)
+        for d, r in merged.items():
+            table.rates[(cur, d)] = r
+        if not merged and cur not in table.fallback:
             table.missing.add(cur)
-    table.source = "frankfurter" if fetched_any else "fallback"
+    if wise_any:
+        table.source = "wise"
+    elif frank_any:
+        table.source = "frankfurter"
+    elif table.rates:
+        table.source = "cache"
+    else:
+        table.source = "fallback"
     return table
