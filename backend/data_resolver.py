@@ -14,6 +14,7 @@ from typing import Any, Optional
 import amazon_sp
 import aurora_data
 from aurora_data import aurora_db_enabled
+from currency_fx import looks_like_unconverted_foreign_face
 
 log = logging.getLogger(__name__)
 
@@ -260,6 +261,8 @@ def skus_needing_fees_api(
         listing = float(pf.get("listing_price") or 0)
         avg_sale = float(d.get("revenue") or 0) / units
         if listing > 0 and avg_sale > 0:
+            if looks_like_unconverted_foreign_face(avg_sale, listing):
+                continue
             drift = abs(avg_sale - listing) / listing
             if drift >= price_divergence_pct:
                 need.append(sku)
@@ -291,6 +294,9 @@ def fee_batch_items_for_skus(
             continue
         avg_price = revenue / units
         pf = (product_fee_fallback or {}).get(sku) or pf_lower.get(str(sku).lower()) or {}
+        listing = float(pf.get("listing_price") or 0)
+        if looks_like_unconverted_foreign_face(avg_price, listing):
+            continue
         if "is_fba" in pf:
             item_is_fba = bool(pf.get("is_fba"))
         else:

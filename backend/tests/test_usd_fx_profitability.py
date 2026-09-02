@@ -69,14 +69,17 @@ def _jan_asin_orders() -> list[dict]:
 
 def test_observation_raw_sum_is_wrong_for_january_asin():
     """The bug: CAD face values added to USD as if they were dollars."""
+    raw = 10 * 6.99 + 2 * 17.98
+    assert round(raw, 2) == 105.86
+    # Safety net: even an FX table with no CAD rate still converts via
+    # marketplace quotes + fallback (must never ship 105.86).
     sku_data, _, _ = aggregate_sku_metrics_from_orders(
         _jan_asin_orders(), fx=UsdFx(source="identity", fallback={"USD": 1.0}),
     )
     d = sku_data[SKU]
     assert d["units"] == 12
-    # 69.90 USD + 35.96 CAD treated as $105.86
-    assert round(d["revenue"], 2) == 105.86
-    assert round(d["referral_total"], 2) == 15.90
+    assert round(d["revenue"], 2) < 100
+    assert 17.98 not in d["units_by_usd_price"]
 
 
 def test_convert_cad_then_calculate_matches_fx():
@@ -141,9 +144,186 @@ def test_mx_channel_overrides_usd_stamp():
     assert infer_line_currency(order, item) == "MXN"
 
 
+def test_order_total_mxn_beats_usd_item_price_stamp():
+    """itemPrice labelled USD but orderTotal MXN — still pesos."""
+    item = {"itemPrice": {"amount": 287.37, "currencyCode": "USD"}}
+    order = {
+        "orderTotal": {"amount": 287.37, "currencyCode": "MXN"},
+        "orderItems": [item],
+    }
+    assert infer_line_currency(order, item) == "MXN"
+
+
+def test_b08hgll647_march24_mxn_not_added_as_dollars():
+    """B08HGLL647 24 Mar 2026: Amazon.com $15.95 + Amazon.com.mx MXN 287.37.
+
+    Order sync stored referral 43.11 labelled USD (15% of pesos). Raw sum
+    is $303.32 revenue / $45.50 referral. Convert MXN first; referral is
+    15% of converted USD, never the 43.11 stamp. FBA stays US catalog
+    dollars (not 287-as-$287 gt50 Fees API).
+    """
+    from aurora_data import repair_unconverted_foreign_price_buckets
+    from currency_fx import looks_like_unconverted_foreign_face
+
+    sku = "ASG-UNO FLIP+PHASE 10"
+    asin = "B08HGLL647"
+    mxn_usd = 0.05591
+    day = datetime(2026, 3, 24, 3, 37, 4, tzinfo=timezone.utc)
+    fx = UsdFx(source="test")
+    fx.rates[("MXN", date(2026, 3, 24))] = mxn_usd
+
+    us = {
+        "amazonOrderId": "111-0337300-8003429",
+        "orderStatus": "Shipped",
+        "salesChannel": "Amazon.com",
+        "purchaseDate": day,
+        "orderTotal": {"amount": 15.95, "currencyCode": "USD"},
+        "orderItems": [{
+            "sellerSku": sku,
+            "asin": asin,
+            "quantityOrdered": 1,
+            "itemPrice": {"amount": 15.95, "currencyCode": "USD"},
+            "itemSubtotal": {"amount": 15.95, "currencyCode": "USD"},
+            "referralFee": {"amount": 2.39, "currencyCode": "USD"},
+            "fulfillmentFee": {"amount": 4.35, "currencyCode": "USD"},
+        }],
+    }
+    mx = {
+        "amazonOrderId": "702-0581238-9233808",
+        "orderStatus": "Shipped",
+        "salesChannel": "Amazon.com.mx",
+        "purchaseDate": day,
+        "orderTotal": {"amount": 287.37, "currencyCode": "MXN"},
+        "orderItems": [{
+            "sellerSku": sku,
+            "asin": asin,
+            "quantityOrdered": 1,
+            "itemPrice": {"amount": 287.37, "currencyCode": "MXN"},
+            "itemSubtotal": {"amount": 287.37, "currencyCode": "MXN"},
+            "referralFee": {"amount": 43.11, "currencyCode": "USD"},
+            "fulfillmentFee": {"amount": 4.35, "currencyCode": "USD"},
+        }],
+    }
+    sku_data, _, _ = aggregate_sku_metrics_from_orders([us, mx], fx=fx)
+    d = sku_data[sku]
+    mxn_usd_rev = round_money(287.37 * mxn_usd)
+    assert mxn_usd_rev == 16.07
+    assert round(d["revenue"], 2) == round_money(15.95 + mxn_usd_rev)
+    assert round(d["revenue"], 2) == 32.02
+    assert round(d["revenue"], 2) < 50
+    expected_ref = round_money(
+        line_referral_fee(15.95, 0.15, 1) + line_referral_fee(mxn_usd_rev, 0.15, 1)
+    )
+    assert round(d["referral_total"], 2) == expected_ref
+    assert round(d["referral_total"], 2) < 10
+    # Must not keep the 43.11 USD stamp or 15% of pesos-as-dollars.
+    assert round(d["referral_total"], 2) != 45.50
+    assert round(d["fba_total"], 2) == 8.70
+    assert 287.37 not in d["units_by_usd_price"]
+    assert d["units_by_usd_price"][15.95] == 1
+    assert d["units_by_usd_price"][mxn_usd_rev] == 1
+    assert looks_like_unconverted_foreign_face(287.37, 13.49)
+    assert not looks_like_unconverted_foreign_face(16.07, 13.49)
+
+    broken = UsdFx(source="identity", fallback={"USD": 1.0})
+    sku_raw, _, _ = aggregate_sku_metrics_from_orders([us, mx], fx=broken)
+    d_raw = sku_raw[sku]
+    assert 287.37 not in d_raw["units_by_usd_price"]
+    assert round(d_raw["revenue"], 2) < 50
+    repair_unconverted_foreign_price_buckets(sku_raw, broken)
+    assert round(sku_raw[sku]["revenue"], 2) < 50
+
+
+def test_december_cad_uses_december_rate_not_today():
+    """Same CAD face value in December vs March must convert at that day's rate.
+
+    A static / 'today' rate would make C$100 identical in both months.
+    """
+    sku = "FX-DATE-CAD"
+    dec_rate = 0.70
+    mar_rate = 0.73
+    fx = UsdFx(source="test", fallback={"USD": 1.0, "CAD": 0.99})
+    fx.rates[("CAD", date(2025, 12, 15))] = dec_rate
+    fx.rates[("CAD", date(2026, 3, 24))] = mar_rate
+
+    assert fx.rate("CAD", date(2025, 12, 15)) == dec_rate
+    assert fx.rate("CAD", date(2026, 3, 24)) == mar_rate
+    assert fx.rate("CAD", date(2025, 12, 15)) != fx.fallback["CAD"]
+    dec_usd = fx.to_usd(100, "CAD", date(2025, 12, 15))
+    mar_usd = fx.to_usd(100, "CAD", date(2026, 3, 24))
+    assert dec_usd == round_money(100 * dec_rate)
+    assert mar_usd == round_money(100 * mar_rate)
+    assert dec_usd != mar_usd
+
+    def _cad_order(when, oid):
+        return {
+            "amazonOrderId": oid,
+            "orderStatus": "Shipped",
+            "salesChannel": "Amazon.ca",
+            "purchaseDate": when,
+            "orderTotal": {"amount": 100.0, "currencyCode": "CAD"},
+            "orderItems": [{
+                "sellerSku": sku,
+                "asin": "B0FXDATECAD",
+                "quantityOrdered": 1,
+                "itemPrice": {"amount": 100.0, "currencyCode": "CAD"},
+                "itemSubtotal": {"amount": 100.0, "currencyCode": "CAD"},
+                "referralFee": {"amount": 15.0, "currencyCode": "USD"},
+                "fulfillmentFee": {"amount": 4.35, "currencyCode": "USD"},
+            }],
+        }
+
+    sku_data, _, _ = aggregate_sku_metrics_from_orders(
+        [
+            _cad_order(datetime(2025, 12, 15, 18, 0, tzinfo=timezone.utc), "701-dec"),
+            _cad_order(datetime(2026, 3, 24, 18, 0, tzinfo=timezone.utc), "701-mar"),
+        ],
+        fx=fx,
+    )
+    d = sku_data[sku]
+    assert round(d["revenue"], 2) == round_money(dec_usd + mar_usd)
+    assert round(d["revenue"], 2) != round_money(200 * 0.99)
+
+
+def test_weekend_order_uses_prior_business_day_not_fallback():
+    """Saturday / holiday should walk back to Friday, not jump to 'today'."""
+    fx = UsdFx(source="test", fallback={"USD": 1.0, "CAD": 0.99})
+    fx.rates[("CAD", date(2025, 12, 19))] = 0.71  # Friday
+    assert fx.rate("CAD", date(2025, 12, 20)) == 0.71
+    assert fx.rate("CAD", date(2025, 12, 21)) == 0.71
+    assert fx.rate("CAD", datetime(2025, 12, 20, 16, 45, tzinfo=timezone.utc)) == 0.71
+
+
+def test_fill_calendar_covers_christmas_weekend():
+    from currency_fx import _fill_calendar
+    daily = {
+        date(2025, 12, 24): 0.72,
+        date(2025, 12, 29): 0.73,
+    }
+    filled = _fill_calendar(daily, date(2025, 12, 24), date(2025, 12, 29))
+    assert filled[date(2025, 12, 25)] == 0.72
+    assert filled[date(2025, 12, 26)] == 0.72
+    assert filled[date(2025, 12, 29)] == 0.73
+
+
 def test_frankfurter_uses_current_host():
     """api.frankfurter.app 301s to .dev and httpx was not following redirects."""
     assert "frankfurter.dev" in FRANKFURTER_URL
+
+
+def test_wise_history_url_matches_seller_page():
+    from currency_fx import wise_history_url, parse_wise_history_html
+    url = wise_history_url("CAD", date(2026, 1, 30))
+    assert url.endswith("/cad-to-usd-rate/history/30-01-2026")
+    assert "wise.com" in url
+    html = (
+        '<script id="__NEXT_DATA__" type="application/json">'
+        '{"props":{"pageProps":{"model":{"historicalRate":{"value":0.741152},'
+        '"rate":{"value":0.718056}}}}}</script>'
+    )
+    assert parse_wise_history_html(html) == 0.741152
+    # Prefer the dated historicalRate, not today's live rate on the same page.
+    assert parse_wise_history_html(html) != 0.718056
 
 
 def test_cad_fba_labelled_cad_is_converted():
