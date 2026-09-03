@@ -1385,7 +1385,9 @@
       color: #e2e8f0;
     }
     body.embedded-in-aurora #sidebar {
-      display: none;
+      width: 240px;
+      background: #0b1220;
+      border-right: 1px solid rgba(255, 255, 255, 0.08);
     }
     body.embedded-in-aurora #sidebar-header { padding: 12px; }
     body.embedded-in-aurora #new-chat-btn {
@@ -1936,8 +1938,15 @@
     </header>
 
     <nav id="tab-nav">
-      <button class="tab-btn active" data-tab="profit">Profitability</button>
+      <button class="tab-btn active" data-tab="chat">Chat</button>
+      <button class="tab-btn" data-tab="restock">Restock</button>
+      <button class="tab-btn" data-tab="orders">Orders</button>
+      <button class="tab-btn" data-tab="campaigns">Campaigns</button>
+      <button class="tab-btn" data-tab="profit">Profitability</button>
+      <button class="tab-btn" data-tab="cogs">COGS</button>
+      <button class="tab-btn" data-tab="keywords">Keywords</button>
       <button class="tab-btn" data-tab="listings">Listing optimiser</button>
+      <button class="tab-btn" data-tab="deals">Deals</button>
     </nav>
 
     <div id="chat-container">
@@ -3093,7 +3102,6 @@
     let kwPollTimer = null;
 
     function setActiveTab(tab) {
-      if (tab !== 'profit' && tab !== 'listings') tab = 'profit';
       document.querySelectorAll('.tab-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
       });
@@ -3148,7 +3156,7 @@
     document.querySelectorAll('.tab-btn').forEach(b => {
       b.addEventListener('click', () => setActiveTab(b.dataset.tab));
     });
-    setActiveTab('profit');
+    setActiveTab('chat');
 
     // ── Listing Optimizer ───────────────────────────────
     let loListLoaded = false;
