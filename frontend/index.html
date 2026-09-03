@@ -1401,6 +1401,9 @@
       background: #0b1220;
       border-right: 1px solid rgba(255, 255, 255, 0.08);
     }
+    body.embedded-in-aurora:not(.ai-show-sidebar) #sidebar {
+      display: none;
+    }
     body.embedded-in-aurora #sidebar-header { padding: 12px; }
     body.embedded-in-aurora #new-chat-btn {
       background: rgba(30, 139, 255, 0.16);
@@ -3112,6 +3115,7 @@
     let kwPollTimer = null;
 
     function setActiveTab(tab) {
+      document.body.classList.toggle('ai-show-sidebar', tab === 'chat');
       document.querySelectorAll('.tab-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
       });
