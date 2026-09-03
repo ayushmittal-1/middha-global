@@ -21,6 +21,8 @@ def test_baseline_origins_include_the_two_render_and_auroratest_ones():
     assert "https://middha-global.onrender.com" in PRODUCTION_BASELINE_ORIGINS
     assert "https://www.auroratest.in" in PRODUCTION_BASELINE_ORIGINS
     assert "https://auroratest.in" in PRODUCTION_BASELINE_ORIGINS
+    assert "https://www.aurora-ai.io" in PRODUCTION_BASELINE_ORIGINS
+    assert "https://aurora-ai.io" in PRODUCTION_BASELINE_ORIGINS
 
 
 def test_empty_env_in_production_still_gets_baseline():
