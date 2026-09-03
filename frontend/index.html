@@ -1385,9 +1385,7 @@
       color: #e2e8f0;
     }
     body.embedded-in-aurora #sidebar {
-      width: 240px;
-      background: #0b1220;
-      border-right: 1px solid rgba(255, 255, 255, 0.08);
+      display: none;
     }
     body.embedded-in-aurora #sidebar-header { padding: 12px; }
     body.embedded-in-aurora #new-chat-btn {
@@ -1939,7 +1937,7 @@
 
     <nav id="tab-nav">
       <button class="tab-btn active" data-tab="profit">Profitability</button>
-      <button class="tab-btn" data-tab="listings">Listings</button>
+      <button class="tab-btn" data-tab="listings">Listing optimiser</button>
     </nav>
 
     <div id="chat-container">
@@ -2230,7 +2228,7 @@
       <!-- List view: paginated products with compliance scores -->
       <div id="lo-list-panel">
         <div id="lo-toolbar">
-          <h2>Listings</h2>
+          <h2>Listing optimiser</h2>
           <input id="lo-search" type="text" placeholder="Search title / ASIN / SKU">
           <button id="lo-refresh-btn" style="padding:6px 12px;font-size:13px;background:#e5e7eb;border:none;border-radius:4px;cursor:pointer;">Refresh</button>
           <span id="lo-list-status" style="font-size:12px;color:#666;"></span>
@@ -2258,7 +2256,7 @@
       <div id="lo-optimizer-panel" style="display:none;">
       <div id="lo-toolbar">
         <button id="lo-back-btn" style="padding:6px 10px;font-size:13px;background:#e5e7eb;border:none;border-radius:4px;cursor:pointer;">← Back to listings</button>
-        <h2>Listing Optimizer</h2>
+        <h2>Listing optimiser</h2>
         <input id="lo-asin" type="text" placeholder="ASIN — e.g. B0ABC12345">
         <button id="lo-prefill-btn" style="padding:6px 12px;font-size:13px;background:#e5e7eb;border:none;border-radius:4px;cursor:pointer;">Pre-fill from DB</button>
         <button id="lo-analyze-btn">Analyze &amp; rewrite</button>
