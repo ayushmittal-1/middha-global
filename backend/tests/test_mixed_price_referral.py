@@ -296,6 +296,20 @@ def test_sale_price_fba_covers_us_and_foreign_off_band():
     )
     assert blink_band == (141.83, 0.0)
 
+    blink_live_too_high = apply_sale_price_fba(
+        bill_units=27,
+        units_by_usd_price={8.97: 26, 14.86: 1},
+        fba_per_usd_price={},
+        catalog_fba_per_unit=2.43,
+        include_fuel=False,
+        fba_per_band={"10_50": 3.42},
+        fuel_per_band={"10_50": 0.12},
+    )
+    # Revenue Calculator at $14.86: base $3.32, not live Fees API $3.42.
+    assert blink_live_too_high == (round(2.43 * 26 + 3.32, 2), 0.0)
+    assert blink_live_too_high == (66.50, 0.0)
+    assert blink_live_too_high != (66.60, 0.0)
+
 
 def test_order_line_referral_preferred_over_single_price_estimate():
     line_ref = 159.74
