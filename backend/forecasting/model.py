@@ -1006,6 +1006,74 @@ def _multimodel_forecast(
     bt_winner = _pick_winner(candidates)
     winner_metrics = (candidates.get(bt_winner) or {}).get("backtest_metrics") if bt_winner else None
     winner_acc = (winner_metrics or {}).get("accuracy_pct")
+
+    # ── Rescue backtest: for SKUs whose standard 30d backtest all-fails ──
+    # When the collapse happens INSIDE the 30-day holdout window, no
+    # method trained on pre-holdout data can predict it — everyone
+    # scores 0%. Rescue path: rerun with a shorter (21-day) holdout so
+    # training data captures more of the collapse start, then try
+    # tail-based naive variants that respond fast to recent shifts.
+    # Only fires when standard winner_acc is < 15 (i.e. picker is
+    # genuinely broken for this SKU); never touches healthy SKUs.
+    if winner_acc is not None and winner_acc < 15:
+        from .intermittent import naive_tail_forecast
+        RESCUE_HOLDOUT_DAYS = 21
+        rescue_cutoff = (today - timedelta(days=RESCUE_HOLDOUT_DAYS)).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+        rescue_cutoff_naive = rescue_cutoff.replace(tzinfo=None)
+        rescue_train_rows = [
+            r for r in rows
+            if (d := _row_day_naive(r)) is not None and d < rescue_cutoff_naive
+        ]
+        rescue_holdout: dict[str, int] = {}
+        for r in rows:
+            d = _row_day_naive(r)
+            if d is None or d < rescue_cutoff_naive:
+                continue
+            key = d.date().isoformat()
+            rescue_holdout[key] = rescue_holdout.get(key, 0) + int(
+                r.get("units_ordered") or 0
+            )
+        rescue_train_full = _build_series_full(rescue_train_rows, rescue_cutoff)
+        rescue_candidates: dict[str, dict] = {}
+        for name, kwargs in (
+            ("naive_tail7",  {"tail_days": 7}),
+            ("naive_tail14", {"tail_days": 14}),
+            ("naive_tail21", {"tail_days": 21}),
+        ):
+            try:
+                r_result = naive_tail_forecast(
+                    rescue_train_full, horizon=RESCUE_HOLDOUT_DAYS,
+                    today=rescue_cutoff, **kwargs,
+                )
+                r_days, r_metrics = _score_forecast_days(
+                    r_result.get("forecast") or [], rescue_holdout,
+                )
+                if r_metrics and r_metrics.get("accuracy_pct") is not None:
+                    rescue_candidates[name] = {
+                        "method_label": name,
+                        "backtest_days": r_days,
+                        "backtest_metrics": r_metrics,
+                    }
+            except Exception as e:
+                log.warning("rescue %s backtest failed for sku=%s: %s",
+                            name, sku, e)
+        if rescue_candidates:
+            best_rescue = max(
+                rescue_candidates,
+                key=lambda k: rescue_candidates[k]["backtest_metrics"]["accuracy_pct"],
+            )
+            best_rescue_acc = rescue_candidates[best_rescue]["backtest_metrics"]["accuracy_pct"]
+            # Only take over if rescue is meaningfully better AND above 30%
+            if best_rescue_acc >= 30 and best_rescue_acc > (winner_acc or 0) + 10:
+                for k, v in rescue_candidates.items():
+                    candidates[k] = v
+                log.info("rescue: sku=%s switched from %s@%.1f%% to %s@%.1f%% (21d holdout)",
+                         sku, bt_winner, winner_acc, best_rescue, best_rescue_acc)
+                bt_winner = best_rescue
+                winner_metrics = rescue_candidates[best_rescue]["backtest_metrics"]
+                winner_acc = best_rescue_acc
     forced_fallback_reason: str | None = None
     # Guardrail: pathological winner (accuracy < 10%) → prefer naive so the
     # reorder math doesn't chase a broken forecast. Only applies when naive
@@ -1068,23 +1136,29 @@ def _multimodel_forecast(
                         "falling back to naive", sku, e)
             refit_choice = "naive"
             fwd = _naive_forecast(full_fit, horizon, today)
-    elif refit_choice in ("croston", "tsb", "ewma_short", "damped_ets"):
+    elif refit_choice in ("croston", "tsb", "ewma_short", "damped_ets") or refit_choice.startswith("naive_tail"):
         # All intermittent + regime-rescue methods are closed-form —
         # refit is free.
         from .intermittent import (
             croston_forecast, tsb_forecast,
             ewma_short_forecast, damped_ets_forecast,
+            naive_tail_forecast,
         )
-        fn = {
-            "croston": croston_forecast,
-            "tsb": tsb_forecast,
-            "ewma_short": ewma_short_forecast,
-            "damped_ets": damped_ets_forecast,
-        }[refit_choice]
-        # For ewma_short/damped_ets use dense daily (0-fill) NOT the
-        # imputed series — matches how they were scored in the backtest
-        # candidate above so the forward forecast trends consistently.
-        if refit_choice in ("ewma_short", "damped_ets"):
+        if refit_choice.startswith("naive_tail"):
+            tail_n = int(refit_choice.replace("naive_tail", ""))
+            fn = lambda s, h, t: naive_tail_forecast(s, h, t, tail_days=tail_n)
+        else:
+            fn = {
+                "croston": croston_forecast,
+                "tsb": tsb_forecast,
+                "ewma_short": ewma_short_forecast,
+                "damped_ets": damped_ets_forecast,
+            }[refit_choice]
+        # For ewma_short/damped_ets/naive_tail use dense daily (0-fill)
+        # NOT the imputed series — matches how they were scored in the
+        # backtest candidate above so the forward forecast trends
+        # consistently.
+        if refit_choice in ("ewma_short", "damped_ets") or refit_choice.startswith("naive_tail"):
             forecast_input = _build_series_full(rows, today)
         else:
             forecast_input = full_fit

@@ -171,6 +171,24 @@ def ewma_short_forecast(series: pd.DataFrame, horizon: int,
     return _forecast_flat(level, horizon, today, "ewma_short")
 
 
+def naive_tail_forecast(series: pd.DataFrame, horizon: int,
+                        today: datetime, tail_days: int = 14) -> dict:
+    """Simple mean of the last `tail_days` days, projected forward.
+    Used by the collapse-rescue path where longer trimmed-mean windows
+    still see pre-collapse baseline data. A tail of 7-14 days captures
+    the most recent regime; the picker's rescue mode tries multiple
+    tail lengths and picks the best on a shorter (21-day) holdout."""
+    label = f"naive_tail{tail_days}"
+    if series is None or series.empty:
+        return _forecast_flat(0.0, horizon, today, label)
+    y = series["y"].to_numpy()
+    if len(y) == 0:
+        return _forecast_flat(0.0, horizon, today, label)
+    n = min(tail_days, len(y))
+    rate = float(y[-n:].mean())
+    return _forecast_flat(rate, horizon, today, label)
+
+
 def damped_ets_forecast(series: pd.DataFrame, horizon: int, today: datetime,
                         alpha: float = 0.7, beta: float = 0.1,
                         phi: float = 0.9, window_days: int = 60) -> dict:
