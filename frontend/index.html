@@ -3827,7 +3827,7 @@
             const MODEL_LABELS = {
               naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
               xgb: 'XGBoost', ensemble: 'Ensemble',
-              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
             };
             const name = row.best_model_name;
             const acc = row.best_model_accuracy_pct;
@@ -3841,7 +3841,7 @@
             const MODEL_LABELS = {
               naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
               xgb: 'XGBoost', ensemble: 'Ensemble',
-              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
             };
             const acc = row.q4_accuracy_pct;
             const name = row.q4_best_name;
@@ -5713,7 +5713,7 @@
             const MODEL_LABELS = {
               naive: 'Naive (velocity)', prophet: 'Prophet', lgbm: 'LightGBM',
               ensemble: 'Ensemble',
-              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
               xgb: 'XGBoost', catboost: 'CatBoost', chronos: 'Chronos',
             };
             let bestKey = null;
@@ -5785,6 +5785,8 @@
               xgb:      { label: 'XGBoost',  color: '#3b82f6' },
               croston:  { label: 'Croston',  color: '#0891b2' },
               tsb:      { label: 'TSB',      color: '#65a30d' },
+              ewma_short: { label: 'EWMA',        color: '#f97316' },
+              damped_ets: { label: 'Damped-ETS',  color: '#a855f7' },
               catboost: { label: 'CatBoost', color: '#ec4899' },
               chronos:  { label: 'Chronos',  color: '#0ea5e9' },
             };
@@ -5921,6 +5923,8 @@
           xgb:      { label: 'XGBoost',  color: '#3b82f6' },
           croston:  { label: 'Croston',  color: '#0891b2' },
           tsb:      { label: 'TSB',      color: '#65a30d' },
+          ewma_short: { label: 'EWMA',        color: '#f97316' },
+          damped_ets: { label: 'Damped-ETS',  color: '#a855f7' },
           catboost: { label: 'CatBoost', color: '#ec4899' },
           chronos:  { label: 'Chronos',  color: '#0ea5e9' },
         };
@@ -6031,7 +6035,7 @@
       const MODEL_LABELS = {
         naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
         xgb: 'XGBoost', ensemble: 'Ensemble',
-        deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+        deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
       };
       const url = scope === 'sku'
         ? `/forecasting/q4-backtest/${encodeURIComponent(sku)}`
@@ -6125,7 +6129,7 @@
                 const MODEL_LABELS = {
                   naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
                   xgb: 'XGBoost', ensemble: 'Ensemble',
-                  deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+                  deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
                 };
                 const modelLabel = (n) => MODEL_LABELS[n] || n || '—';
                 const renderRow = (r, labelFn) => `
@@ -6235,7 +6239,7 @@
       const MODEL_LABELS = {
         naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
         xgb: 'XGBoost', ensemble: 'Ensemble',
-        deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+        deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
       };
       const url = scope === 'sku'
         ? `/forecasting/history-comparison/${encodeURIComponent(sku)}`

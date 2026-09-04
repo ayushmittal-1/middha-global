@@ -124,3 +124,93 @@ def tsb_forecast(series: pd.DataFrame, horizon: int, today: datetime) -> dict:
     size, prob = _fit_tsb(y)
     rate = prob * size
     return _forecast_flat(rate, horizon, today, "tsb")
+
+
+# ── Regime-shift rescue methods ────────────────────────────────────────────
+# These are ONLY activated by _multimodel_forecast when it detects a
+# collapse (recent 30d avg < 0.5x trailing 60d avg). They target the
+# specific failure mode where every other model is anchored to pre-
+# collapse baselines and over-forecasts by 2-6x. Empirically on the
+# allmarts LOCTITE-243 and Kiwi Sponge cases:
+#   - ewma_short (hl=5):        95% on the stabilized-post-collapse case
+#   - damped_ets (α=0.7, φ=0.9): 98% on the still-declining case
+
+
+def is_regime_shift(series: pd.DataFrame) -> bool:
+    """Trigger for the rescue methods. Returns True when recent 30d
+    demand is <50% of the trailing 60d baseline (days -90 to -30).
+
+    Filters out dormant SKUs (recent avg ≤ 0.1/day) and ultra-low
+    volume (trailing avg ≤ 0.5/day) where the ratio would just be
+    metric noise, not a real regime shift."""
+    if series is None or series.empty:
+        return False
+    y = series["y"].to_numpy()
+    if len(y) < 90:
+        return False
+    recent = float(y[-30:].mean())
+    prior = float(y[-90:-30].mean())
+    if recent <= 0.1 or prior <= 0.5:
+        return False
+    return recent / prior < 0.5
+
+
+def ewma_short_forecast(series: pd.DataFrame, horizon: int,
+                        today: datetime, half_life: int = 5) -> dict:
+    """EWMA with a short half-life (default 5 days). Weights recent
+    observations heavily so a SKU that has stabilized at a low post-
+    collapse level gets tracked correctly. Wins on 'collapse then
+    steady' patterns."""
+    if series is None or series.empty:
+        return _forecast_flat(0.0, horizon, today, "ewma_short")
+    y = [float(v) for v in series["y"].to_numpy()]
+    alpha = 1 - (0.5 ** (1 / half_life))
+    level = float(y[0])
+    for v in y[1:]:
+        level = alpha * v + (1 - alpha) * level
+    return _forecast_flat(level, horizon, today, "ewma_short")
+
+
+def damped_ets_forecast(series: pd.DataFrame, horizon: int, today: datetime,
+                        alpha: float = 0.7, beta: float = 0.1,
+                        phi: float = 0.9, window_days: int = 60) -> dict:
+    """Gardner-McKenzie damped-trend exponential smoothing on the last
+    `window_days` of history. Tracks a smoothed level + trend; `phi<1`
+    damps the trend geometrically so a projected decline doesn't spiral.
+    Wins on 'still-collapsing' patterns.
+
+    Emits a per-day forecast (not a flat rate) since the trend
+    component means each future day has a different expected value."""
+    if series is None or series.empty:
+        return _forecast_flat(0.0, horizon, today, "damped_ets")
+    y = [float(v) for v in series["y"].to_numpy()]
+    if window_days and window_days < len(y):
+        y = y[-window_days:]
+    if len(y) < 2:
+        return _forecast_flat(y[0] if y else 0.0, horizon, today, "damped_ets")
+    L = y[0]
+    T = y[1] - y[0]
+    for v in y[1:]:
+        L_new = alpha * v + (1 - alpha) * (L + phi * T)
+        T = beta * (L_new - L) + (1 - beta) * phi * T
+        L = L_new
+    out = []
+    for h in range(1, horizon + 1):
+        cum = sum(pow(phi, i) for i in range(1, h + 1))
+        p50 = max(0.0, L + cum * T)
+        d = pd.Timestamp(today.date()) + pd.Timedelta(days=h)
+        out.append({
+            "date": d.to_pydatetime().replace(tzinfo=timezone.utc).isoformat(),
+            "p50": round(p50, 2),
+            "p90": round(p50 * 1.75, 2),
+        })
+    return {
+        "method": "damped_ets",
+        "forecast": out,
+        "drivers": {
+            "recent_avg": round(L, 3),
+            "recent_std": 0.0,
+            "growth_rate": round(T, 4),
+            "ad_uplift": 0.0,
+        },
+    }

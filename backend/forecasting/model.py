@@ -819,10 +819,48 @@ def _multimodel_forecast(
     # obsolescence-aware update runs every period, not just on nonzero
     # days). Prophet/DeepAR beat these on structured series; they only
     # win when the target is genuinely sparse.
-    from .intermittent import croston_forecast, tsb_forecast
+    from .intermittent import (
+        croston_forecast, tsb_forecast,
+        is_regime_shift, ewma_short_forecast, damped_ets_forecast,
+    )
     for kind_key, fn in (("croston", croston_forecast), ("tsb", tsb_forecast)):
         try:
             bt_result = fn(train_fit, horizon=BACKTEST_HOLDOUT_DAYS, today=cutoff)
+            _apply_recovery_bump(bt_result, train_rows, cutoff)
+            bt_days, bt_metrics = _score_forecast_days(
+                bt_result.get("forecast") or [], holdout_by_day,
+            )
+            candidates[kind_key] = {
+                "method_label": kind_key,
+                "backtest_days": bt_days,
+                "backtest_metrics": bt_metrics,
+            }
+        except Exception as e:
+            log.warning("%s backtest failed for sku=%s: %s", kind_key, sku, e)
+
+    # ── Regime-shift rescue methods (always tried) ──────────────
+    # ewma_short + damped_ets get to compete on every SKU. They're
+    # cheap (closed-form smoothing) and the picker only switches to
+    # them when their accuracy beats the current winner. On healthy
+    # SKUs where Prophet/DeepAR is doing 90%+, these will score lower
+    # and get ignored. On declining SKUs where every other model over-
+    # forecasts by 2-6x, these often win. The ensemble ≥30% filter
+    # keeps them out of the ensemble mean when they perform poorly.
+    #
+    # NOTE: uses _build_series_full (dense daily with 0-fill for
+    # missing dates), NOT train_series (drops zero/stockout days) nor
+    # train_fit (imputes zero days with trailing DOW mean). The full
+    # dense series correctly represents actual demand pattern for
+    # declining SKUs — zero-days ARE the signal — and ETS with
+    # alpha=0.7 relies on the true trailing values to update the level
+    # correctly.
+    train_full = _build_series_full(train_rows, cutoff)
+    for kind_key, fn in (
+        ("ewma_short", ewma_short_forecast),
+        ("damped_ets", damped_ets_forecast),
+    ):
+        try:
+            bt_result = fn(train_full, horizon=BACKTEST_HOLDOUT_DAYS, today=cutoff)
             _apply_recovery_bump(bt_result, train_rows, cutoff)
             bt_days, bt_metrics = _score_forecast_days(
                 bt_result.get("forecast") or [], holdout_by_day,
@@ -1030,12 +1068,28 @@ def _multimodel_forecast(
                         "falling back to naive", sku, e)
             refit_choice = "naive"
             fwd = _naive_forecast(full_fit, horizon, today)
-    elif refit_choice in ("croston", "tsb"):
-        # Croston/TSB refit is free — they're closed-form smoothing.
-        from .intermittent import croston_forecast, tsb_forecast
-        fn = croston_forecast if refit_choice == "croston" else tsb_forecast
+    elif refit_choice in ("croston", "tsb", "ewma_short", "damped_ets"):
+        # All intermittent + regime-rescue methods are closed-form —
+        # refit is free.
+        from .intermittent import (
+            croston_forecast, tsb_forecast,
+            ewma_short_forecast, damped_ets_forecast,
+        )
+        fn = {
+            "croston": croston_forecast,
+            "tsb": tsb_forecast,
+            "ewma_short": ewma_short_forecast,
+            "damped_ets": damped_ets_forecast,
+        }[refit_choice]
+        # For ewma_short/damped_ets use dense daily (0-fill) NOT the
+        # imputed series — matches how they were scored in the backtest
+        # candidate above so the forward forecast trends consistently.
+        if refit_choice in ("ewma_short", "damped_ets"):
+            forecast_input = _build_series_full(rows, today)
+        else:
+            forecast_input = full_fit
         try:
-            fwd = fn(full_fit, horizon, today)
+            fwd = fn(forecast_input, horizon, today)
         except Exception as e:
             log.warning("%s forward-forecast failed for sku=%s: %s — "
                         "falling back to naive", refit_choice, sku, e)
