@@ -1956,8 +1956,8 @@
     </header>
 
     <nav id="tab-nav">
-      <button class="tab-btn active" data-tab="chat">Chat</button>
-      <button class="tab-btn" data-tab="restock">Restock</button>
+      <button class="tab-btn" data-tab="chat">Chat</button>
+      <button class="tab-btn active" data-tab="restock">Restock</button>
       <button class="tab-btn" data-tab="orders">Orders</button>
       <button class="tab-btn" data-tab="campaigns">Campaigns</button>
       <button class="tab-btn" data-tab="profit">Profitability</button>
@@ -3114,7 +3114,12 @@
     const kwErrorEl = document.getElementById('kw-error');
     let kwPollTimer = null;
 
+    // Tabs the UI currently exposes. Everything else stays built but hidden —
+    // add a key back to this list to bring its tab back.
+    const VISIBLE_TABS = ['restock', 'profit', 'listings'];
+
     function setActiveTab(tab) {
+      if (!VISIBLE_TABS.includes(tab)) tab = VISIBLE_TABS[0];
       document.body.classList.toggle('ai-show-sidebar', tab === 'chat');
       document.querySelectorAll('.tab-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
@@ -3168,9 +3173,16 @@
       }
     }
     document.querySelectorAll('.tab-btn').forEach(b => {
+      if (!VISIBLE_TABS.includes(b.dataset.tab)) b.style.display = 'none';
       b.addEventListener('click', () => setActiveTab(b.dataset.tab));
     });
-    setActiveTab('chat');
+    // Chat is hidden, so its sidebar controls go with it. The COGS panel stays —
+    // Profitability depends on those uploads.
+    ['new-chat-btn', 'session-list'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.style.display = 'none';
+    });
+    setActiveTab(VISIBLE_TABS[0]);
 
     // ── Listing Optimizer ───────────────────────────────
     let loListLoaded = false;
@@ -3842,7 +3854,7 @@
             const MODEL_LABELS = {
               naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
               xgb: 'XGBoost', ensemble: 'Ensemble',
-              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
             };
             const name = row.best_model_name;
             const acc = row.best_model_accuracy_pct;
@@ -3856,7 +3868,7 @@
             const MODEL_LABELS = {
               naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
               xgb: 'XGBoost', ensemble: 'Ensemble',
-              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
             };
             const acc = row.q4_accuracy_pct;
             const name = row.q4_best_name;
@@ -5728,7 +5740,7 @@
             const MODEL_LABELS = {
               naive: 'Naive (velocity)', prophet: 'Prophet', lgbm: 'LightGBM',
               ensemble: 'Ensemble',
-              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
               xgb: 'XGBoost', catboost: 'CatBoost', chronos: 'Chronos',
             };
             let bestKey = null;
@@ -5798,6 +5810,10 @@
               deepar:   { label: 'DeepAR',   color: '#7c3aed' },
               tft:      { label: 'TFT',      color: '#db2777' },
               xgb:      { label: 'XGBoost',  color: '#3b82f6' },
+              croston:  { label: 'Croston',  color: '#0891b2' },
+              tsb:      { label: 'TSB',      color: '#65a30d' },
+              ewma_short: { label: 'EWMA',        color: '#f97316' },
+              damped_ets: { label: 'Damped-ETS',  color: '#a855f7' },
               catboost: { label: 'CatBoost', color: '#ec4899' },
               chronos:  { label: 'Chronos',  color: '#0ea5e9' },
             };
@@ -5807,6 +5823,7 @@
               lgbm: compare.lgbm, ensemble: compare.ensemble,
               deepar: compare.deepar, tft: compare.tft,
               xgb: compare.xgb,
+              croston: compare.croston, tsb: compare.tsb,
               catboost: compare.catboost, chronos: compare.chronos,
             };
             const rows = Object.entries(modelsObj)
@@ -5931,6 +5948,10 @@
           deepar:   { label: 'DeepAR',   color: '#7c3aed' },
           tft:      { label: 'TFT',      color: '#db2777' },
           xgb:      { label: 'XGBoost',  color: '#3b82f6' },
+          croston:  { label: 'Croston',  color: '#0891b2' },
+          tsb:      { label: 'TSB',      color: '#65a30d' },
+          ewma_short: { label: 'EWMA',        color: '#f97316' },
+          damped_ets: { label: 'Damped-ETS',  color: '#a855f7' },
           catboost: { label: 'CatBoost', color: '#ec4899' },
           chronos:  { label: 'Chronos',  color: '#0ea5e9' },
         };
@@ -5939,6 +5960,7 @@
           lgbm: compare.lgbm, ensemble: compare.ensemble,
           deepar: compare.deepar, tft: compare.tft,
           xgb: compare.xgb,
+          croston: compare.croston, tsb: compare.tsb,
           catboost: compare.catboost, chronos: compare.chronos,
         });
         const compareOverlays = chartModelsObj
@@ -6040,7 +6062,7 @@
       const MODEL_LABELS = {
         naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
         xgb: 'XGBoost', ensemble: 'Ensemble',
-        deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+        deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
       };
       const url = scope === 'sku'
         ? `/forecasting/q4-backtest/${encodeURIComponent(sku)}`
@@ -6134,7 +6156,7 @@
                 const MODEL_LABELS = {
                   naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
                   xgb: 'XGBoost', ensemble: 'Ensemble',
-                  deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+                  deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
                 };
                 const modelLabel = (n) => MODEL_LABELS[n] || n || '—';
                 const renderRow = (r, labelFn) => `
@@ -6244,7 +6266,7 @@
       const MODEL_LABELS = {
         naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
         xgb: 'XGBoost', ensemble: 'Ensemble',
-        deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+        deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
       };
       const url = scope === 'sku'
         ? `/forecasting/history-comparison/${encodeURIComponent(sku)}`
@@ -6360,6 +6382,7 @@
 
     async function startApp() {
       userEmailEl.textContent = localStorage.getItem('user_email') || '';
+      setActiveTab(VISIBLE_TABS[0]);
       const saved = localStorage.getItem('session_id');
       if (saved) {
         currentSessionId = saved;
