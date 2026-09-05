@@ -693,6 +693,10 @@ async def forecasting_restock(
         reorder = c.get("reorder") or {}
         forecast = c.get("forecast") or []
         next30 = sum(float(r.get("p50", 0)) for r in forecast[:30])
+        # Daily p50 series, capped at the cached 90-day horizon. Shipped as-is
+        # so the Future sales column can sum an arbitrary window client-side
+        # without a refetch; next_30_day_forecast stays for older frontends.
+        forecast_p50_daily = [round(float(r.get("p50", 0) or 0), 2) for r in forecast[:90]]
 
         # Prefer the fresh Aurora snapshot for the 5 SP-API-sourced counts;
         # fall back to the forecast cache when the SKU isn't in `inv_map`
@@ -841,6 +845,7 @@ async def forecasting_restock(
         if wv > 0:
             scale = min(1.0, wv_net / wv) if wv_net >= 0 else 0.0
             returns_view["next_30_day_forecast"] = round(next30 * scale, 1)
+            returns_view["forecast_scale"] = round(scale, 4)
             if wv_net > 0:
                 days_of_cover_net = round(stock_forward / wv_net, 1)
                 stockout_date_net_obj = today + timedelta(days=int(stock_forward / wv_net))
@@ -862,6 +867,7 @@ async def forecasting_restock(
                 returns_view["reorder_by_date_ocean"] = None
         else:
             returns_view["next_30_day_forecast"] = round(next30, 1)
+            returns_view["forecast_scale"] = 1.0
             returns_view["days_of_cover"] = days_of_cover_val
             returns_view["stockout_date"] = stockout_date_iso
             returns_view["reorder_by_date_air"] = reorder_by_date_air_iso
@@ -924,6 +930,7 @@ async def forecasting_restock(
             "orders_30d": int(orders_30d_by_sku.get(sku, 0)),
             "orders_60d": int(orders_60d_by_sku.get(sku, 0)),
             "next_30_day_forecast": round(next30, 1),
+            "forecast_p50_daily": forecast_p50_daily,
             "days_of_cover": days_of_cover_val,
             "stockout_date": stockout_date_iso,
             "returns_view": returns_view,
