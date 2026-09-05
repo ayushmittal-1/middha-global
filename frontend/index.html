@@ -1938,8 +1938,8 @@
     </header>
 
     <nav id="tab-nav">
-      <button class="tab-btn active" data-tab="chat">Chat</button>
-      <button class="tab-btn" data-tab="restock">Restock</button>
+      <button class="tab-btn" data-tab="chat">Chat</button>
+      <button class="tab-btn active" data-tab="restock">Restock</button>
       <button class="tab-btn" data-tab="orders">Orders</button>
       <button class="tab-btn" data-tab="campaigns">Campaigns</button>
       <button class="tab-btn" data-tab="profit">Profitability</button>
@@ -3101,7 +3101,12 @@
     const kwErrorEl = document.getElementById('kw-error');
     let kwPollTimer = null;
 
+    // Tabs the UI currently exposes. Everything else stays built but hidden —
+    // add a key back to this list to bring its tab back.
+    const VISIBLE_TABS = ['restock', 'profit', 'listings'];
+
     function setActiveTab(tab) {
+      if (!VISIBLE_TABS.includes(tab)) tab = VISIBLE_TABS[0];
       document.querySelectorAll('.tab-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
       });
@@ -3154,7 +3159,14 @@
       }
     }
     document.querySelectorAll('.tab-btn').forEach(b => {
+      if (!VISIBLE_TABS.includes(b.dataset.tab)) b.style.display = 'none';
       b.addEventListener('click', () => setActiveTab(b.dataset.tab));
+    });
+    // Chat is hidden, so its sidebar controls go with it. The COGS panel stays —
+    // Profitability depends on those uploads.
+    ['new-chat-btn', 'session-list'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.style.display = 'none';
     });
 
     // ── Listing Optimizer ───────────────────────────────
@@ -6355,6 +6367,7 @@
 
     async function startApp() {
       userEmailEl.textContent = localStorage.getItem('user_email') || '';
+      setActiveTab(VISIBLE_TABS[0]);
       const saved = localStorage.getItem('session_id');
       if (saved) {
         currentSessionId = saved;
