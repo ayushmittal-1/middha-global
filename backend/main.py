@@ -512,6 +512,23 @@ async def update_forecasting_settings_endpoint(
     return await update_forecast_settings(body or {})
 
 
+def _q4_predictions_all_zero(q4_doc: dict) -> bool:
+    """True when every model and every weight config in a Q4 result predicted
+    exactly zero units.
+
+    Used only as a fallback for result docs written before `not_scorable`
+    existed. A candidate set that unanimously predicts nothing had no signal
+    to work from — in practice a SKU whose first recorded sale lands inside
+    the holdout — so its 0% is a missing measurement, not a model verdict.
+    Verified against the stored fleet: it selects exactly the SKUs with no
+    pre-cutoff sales rows and none of the SKUs with real history.
+    """
+    preds = [m.get("predicted_q4") for m in (q4_doc.get("models") or {}).values()]
+    preds += [c.get("predicted_q4") for c in (q4_doc.get("per_config") or [])]
+    preds = [p for p in preds if p is not None]
+    return bool(preds) and all(float(p) == 0.0 for p in preds)
+
+
 @app.get("/forecasting/restock")
 async def forecasting_restock(
     user: dict = Depends(protect),
@@ -897,6 +914,21 @@ async def forecasting_restock(
         q4_accuracy_pct = _q4_winner.get("accuracy_pct")
         q4_actual_units = _q4.get("actual_q4_units")
         q4_year = _q4.get("year")
+        # Why there is no score, when there is no score. Result docs written
+        # before `not_scorable` existed still describe the zero-demand case
+        # well enough to derive it here, so those blanks get an explanation
+        # without waiting for a re-run.
+        q4_not_scorable = _q4.get("not_scorable")
+        if q4_not_scorable is None and _q4:
+            if _q4.get("skipped"):
+                q4_not_scorable = "no_pre_q4_history"
+            elif not _q4_winner and q4_actual_units == 0:
+                q4_not_scorable = "no_q4_demand"
+            elif (
+                _q4_winner.get("accuracy_pct") == 0
+                and _q4_predictions_all_zero(_q4)
+            ):
+                q4_not_scorable = "no_pre_q4_history"
 
         rows.append({
             "sku": sku,
@@ -910,6 +942,7 @@ async def forecasting_restock(
             "q4_accuracy_pct": q4_accuracy_pct,
             "q4_actual_units": q4_actual_units,
             "q4_year": q4_year,
+            "q4_not_scorable": q4_not_scorable,  # null | "no_pre_q4_history" | "no_q4_demand"
             "is_buyable": is_buyable,
             "status": inv_row.get("status"),
             "listing_status": inv_row.get("listing_status"),
