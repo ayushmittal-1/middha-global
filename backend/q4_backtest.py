@@ -136,6 +136,8 @@ async def _q4_backtest_one_sku(
             "sku": sku, "year": year,
             "actual_q4_units": 0,
             "n_history_days": 0,
+            "n_pre_cutoff_days": 0,
+            "not_scorable": "no_pre_q4_history",
             "skipped": "no sales history",
         }
 
@@ -149,6 +151,22 @@ async def _q4_backtest_one_sku(
         if q4_start.date().isoformat() <= d <= q4_end.date().isoformat()
     }
     actual_q4_units = sum(q4_days.values())
+
+    # Two conditions make a Q4 score meaningless rather than merely bad.
+    # Flag them so the UI can say "not scorable" instead of printing a
+    # number that reads like a verdict on the model:
+    #   no_pre_q4_history — the SKU's first sale falls inside the holdout,
+    #     so there is nothing to train on. Every model correctly predicts 0
+    #     and the volume-error formula turns that into 0%.
+    #   no_q4_demand — actual is 0, so accuracy divides by zero and every
+    #     candidate scores None, leaving an unexplained blank.
+    n_pre_cutoff_days = len(train_rows)
+    if n_pre_cutoff_days == 0:
+        not_scorable = "no_pre_q4_history"
+    elif actual_q4_units == 0:
+        not_scorable = "no_q4_demand"
+    else:
+        not_scorable = None
 
     candidates: dict[str, dict] = {}
 
@@ -300,6 +318,11 @@ async def _q4_backtest_one_sku(
             })
     all_scored.sort(key=lambda r: -r["accuracy_pct"])
     winner = all_scored[0] if all_scored else None
+    if not_scorable == "no_pre_q4_history":
+        # Every candidate here scored 0% off an empty training series.
+        # Crowning one of them would report a model failure that never
+        # happened, so leave the winner empty and let the reason speak.
+        winner = None
 
     return {
         "sku": sku,
@@ -309,6 +332,8 @@ async def _q4_backtest_one_sku(
         "holdout_end": q4_end.date().isoformat(),
         "actual_q4_units": actual_q4_units,
         "low_volume": actual_q4_units < LOW_VOLUME_ACTUAL,
+        "n_pre_cutoff_days": n_pre_cutoff_days,
+        "not_scorable": not_scorable,
         "models": {
             name: {
                 "predicted_q4": m.get("predicted_total"),

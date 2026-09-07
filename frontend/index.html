@@ -3888,6 +3888,14 @@
             const acc = row.q4_accuracy_pct;
             const name = row.q4_best_name;
             const year = row.q4_year;
+            // Distinguish "we could not score this" from "the model scored
+            // badly" — both used to render as a bare dash or a 0%.
+            if (row.q4_not_scorable) {
+              const why = row.q4_not_scorable === 'no_pre_q4_history'
+                ? `No sales signal before Q4${year ? ' ' + year : ''} — no recorded pre-window sales, so no model had anything to train on. Not a model failure.`
+                : `No recorded sales in Q4${year ? ' ' + year : ''} — accuracy is undefined when actual units are zero.`;
+              return `<span style="color:#888;" title="${escapeHtml(why)}">n/a</span>`;
+            }
             if (acc == null) return '<span style="color:#888;">—</span>';
             const label = row.q4_best_source === 'model'
               ? (MODEL_LABELS[name] || name || '—')
