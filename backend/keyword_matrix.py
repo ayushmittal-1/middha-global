@@ -555,6 +555,29 @@ def _meta_seeds(title: str) -> list[str]:
     return seeds
 
 
+def _meta_error_summary(exc: Exception) -> tuple[str, str]:
+    """Return (dedupe_key, human_detail) for a failed Meta call.
+
+    The key deliberately holds only the status or exception type. Meta embeds
+    a live clock in some messages ("The current time is ... 04:11:38"), so
+    keying on the full text would put two otherwise-identical failures a
+    second apart into separate buckets and defeat the collapsing.
+
+    The detail prefers Meta's own error body ("Session has expired on ...")
+    over httpx's generic message, since that is what tells you what to do
+    about it, and unlike httpx's message it carries no request URL.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        detail = ""
+        try:
+            detail = ((resp.json() or {}).get("error", {}) or {}).get("message") or ""
+        except Exception:
+            detail = ""
+        return f"HTTP {resp.status_code}", detail or f"HTTP {resp.status_code}"
+    return type(exc).__name__, f"{type(exc).__name__}: {exc}"
+
+
 def _meta_interest_matches_seed(seed: str, name: str) -> bool:
     """True when the interest name contains the seed as a whole word.
 
@@ -585,6 +608,8 @@ async def _source_meta(titles: list[str]) -> dict:
     keywords: list[str] = []
     notes: list[str] = []
     queried: set[str] = set()
+    failures: dict[str, list] = {}  # key -> [count, first detail seen]
+    ok_queries = 0
     dropped = 0
     async with httpx.AsyncClient(timeout=15) as client:
         for title in titles:
@@ -620,8 +645,11 @@ async def _source_meta(titles: list[str]) -> dict:
                     resp.raise_for_status()
                     data = resp.json()
                 except Exception as e:
-                    notes.append(_redact(f"meta lookup failed for '{seed}': {e}"))
+                    key, detail = _meta_error_summary(e)
+                    slot = failures.setdefault(key, [0, _redact(detail)])
+                    slot[0] += 1
                     continue
+                ok_queries += 1
                 for item in data.get("data", []):
                     name = (item.get("name") or "").strip()
                     if not name:
@@ -637,7 +665,13 @@ async def _source_meta(titles: list[str]) -> dict:
                     if lowered not in seen:
                         seen.add(lowered)
                         keywords.append(lowered)
-    if queried and not keywords:
+    for _key, (count, detail) in sorted(failures.items(), key=lambda kv: -kv[1][0]):
+        seed_word = "seed" if count == 1 else "seeds"
+        notes.append(f"Meta lookup failed for {count} {seed_word} — {detail}")
+    if ok_queries and not keywords:
+        # Only a claim we can support: every query that actually reached Meta
+        # came back with nothing usable. If the calls errored we know nothing
+        # about the taxonomy, so this must not fire on a pure auth failure.
         notes.append(
             f"Meta returned no interests matching {sorted(queried)} — "
             "its taxonomy has no entry for this product"
