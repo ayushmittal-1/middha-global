@@ -22,9 +22,9 @@ Given a list of ASINs, this module:
 
 The flow is a job, not a single request. `start_job` kicks off the pipeline
 as a background task and returns a job_id; `get_job` returns the current
-step and any partial results collected so far. Storage is an in-memory
-dict — dies with the process. Fine for now; move to Mongo later if we need
-persistence across restarts.
+step and any partial results collected so far. Jobs live in Mongo, so a
+client can keep polling across a redeploy or a spin-down, and any worker can
+serve a poll for a job another worker is running.
 
 Edge cases (title missing, autocomplete returns nothing, Brand Analytics
 misses a keyword, source has fewer than 15 scorable keywords) are noted in
@@ -38,7 +38,6 @@ import os
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
 
 import httpx
 
@@ -52,9 +51,34 @@ from auth import _db, require_user
 from keywords import fetch_amazon_keywords
 
 # ── Job store ───────────────────────────────────────────────────────────────
-# Single-process, in-memory. Keys: job_id -> job dict. Enough for the
-# dashboard's polling UX; nothing here needs to survive a restart.
-_JOBS: dict[str, dict[str, Any]] = {}
+# Mongo-backed, one doc per job keyed by `_id = job_id`. It used to be a
+# process-local dict, which broke the polling UX in two ways on Render: a
+# redeploy or idle spin-down wiped every in-flight job (the client's next
+# poll 404'd), and with more than one worker the POST that starts a job and
+# the GET that polls it can land on different processes. Mongo makes the job
+# visible to whichever worker serves the poll, and survives the restart.
+_JOBS_COLLECTION = "keywordMatrixJobs"
+
+# Job docs are disposable — keep a week of history for debugging, then let
+# Mongo's TTL monitor reap them.
+_JOB_TTL_SECONDS = 7 * 24 * 3600
+
+# A running job bumps `updated_at` every `_JOB_HEARTBEAT_SECONDS`. If a poll
+# finds a "running" job whose heartbeat stopped longer ago than
+# `_JOB_STALE_SECONDS`, the worker that owned it died mid-flight and nothing
+# will ever finish it — report that instead of letting the client poll a
+# job that will never move. The gap is deliberately several heartbeats wide
+# so a slow step or a briefly overloaded event loop doesn't trip it.
+_JOB_HEARTBEAT_SECONDS = 30
+_JOB_STALE_SECONDS = 180
+
+_JOB_INDEXES_ENSURED = False
+
+# Strong refs to in-flight pipeline tasks. asyncio only keeps a weak reference
+# to the result of `create_task`, so a job with no other referent can be
+# garbage-collected mid-run — the same disappearing-job symptom from a
+# different cause.
+_RUNNING: set[asyncio.Task] = set()
 
 SOURCES = ("amazon_asin", "meta", "amazon_searchbar", "google")
 _SOURCE_LABELS = {
@@ -69,15 +93,20 @@ STEPS = ("sourcing", "brand_analytics", "cpc", "scoring", "done")
 # ── Public API ──────────────────────────────────────────────────────────────
 
 
-def start_job(
+async def start_job(
     asins: list[str],
     ad_group_id: str | None = None,
     campaign_id: str | None = None,
 ) -> str:
     """Kick off a matrix job and return its id.
 
-    Runs in the background so the endpoint can return immediately. The user's
-    auth ContextVar is copied into the task automatically by asyncio.
+    The job doc is written to Mongo *before* this returns, so the client's
+    first poll always finds it — even if that poll is served by a different
+    worker than the one running the pipeline.
+
+    The pipeline itself runs in the background so the endpoint can return
+    immediately. The user's auth ContextVar is copied into the task
+    automatically by asyncio.
 
     CPC enrichment needs BOTH `ad_group_id` AND `campaign_id` — Amazon's v4
     bid-recommendations endpoint rejects a request that's missing either.
@@ -86,34 +115,140 @@ def start_job(
     asins = [a.strip().upper() for a in asins if a and a.strip()]
     if not asins:
         raise ValueError("At least one ASIN is required.")
+    now = datetime.now(timezone.utc)
     job_id = uuid.uuid4().hex[:12]
-    _JOBS[job_id] = {
+    job = {
         "job_id": job_id,
+        "user_id": _user_key(),
         "status": "running",
         "step": "sourcing",
         "asins": asins,
         "ad_group_id": ad_group_id,
         "campaign_id": campaign_id,
         "ad_group_source": "user" if (ad_group_id and campaign_id) else None,
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": now.isoformat(),
+        "created_at": now,
         "sources": {s: {"keywords": [], "notes": []} for s in SOURCES},
         "titles": {},
         "matrix": None,
         "error": None,
     }
-    asyncio.create_task(_run_job(job_id))
+    await _ensure_job_indexes()
+    # Not wrapped in the tolerant `_save` — if the very first write fails the
+    # job would be unpollable, so surface it as a 500 rather than handing back
+    # an id that will 404 forever.
+    await _jobs_coll().insert_one({**job, "_id": job_id, "updated_at": now})
+    task = asyncio.create_task(_run_job(job))
+    _RUNNING.add(task)
+    task.add_done_callback(_RUNNING.discard)
     return job_id
 
 
-def get_job(job_id: str) -> dict | None:
-    return _JOBS.get(job_id)
+async def get_job(job_id: str) -> dict | None:
+    """Load a job, scoped to the calling user.
+
+    Returns None for both "no such job" and "someone else's job" — the
+    caller turns either into a 404, which is also what we want a probe of a
+    guessed id to see.
+    """
+    await _ensure_job_indexes()
+    job = await _jobs_coll().find_one(
+        {"_id": job_id, "user_id": _user_key()}, {"_id": 0}
+    )
+    if not job:
+        return None
+    return _mark_if_stale(job)
+
+
+# ── Job persistence ─────────────────────────────────────────────────────────
+
+
+def _user_key() -> str:
+    user = require_user()
+    return str(user.get("_id") or user.get("email") or "anon")
+
+
+def _jobs_coll():
+    return _db()[_JOBS_COLLECTION]
+
+
+async def _ensure_job_indexes() -> None:
+    """Create the TTL index once per process."""
+    global _JOB_INDEXES_ENSURED
+    if _JOB_INDEXES_ENSURED:
+        return
+    await _jobs_coll().create_index(
+        "created_at",
+        name="created_at_ttl",
+        expireAfterSeconds=_JOB_TTL_SECONDS,
+        background=True,
+    )
+    _JOB_INDEXES_ENSURED = True
+
+
+async def _save(job: dict) -> None:
+    """Flush the whole job doc. Tolerant by design — a write that fails at a
+    step boundary costs the client some progress detail on its next poll, but
+    must not abort a pipeline that's otherwise running fine."""
+    try:
+        await _jobs_coll().replace_one(
+            {"_id": job["job_id"]},
+            {**job, "_id": job["job_id"], "updated_at": datetime.now(timezone.utc)},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[keyword_matrix] job save failed for {job.get('job_id')}: {e}")
+
+
+async def _heartbeat(job_id: str) -> None:
+    """Bump `updated_at` while the job runs so `_mark_if_stale` can tell a
+    slow step apart from a worker that died. Steps are coarse — a Brand
+    Analytics report download is a single long await — so without this the
+    liveness signal would only refresh at step boundaries."""
+    while True:
+        await asyncio.sleep(_JOB_HEARTBEAT_SECONDS)
+        try:
+            await _jobs_coll().update_one(
+                {"_id": job_id},
+                {"$set": {"updated_at": datetime.now(timezone.utc)}},
+            )
+        except Exception as e:
+            print(f"[keyword_matrix] heartbeat failed for {job_id}: {e}")
+
+
+def _mark_if_stale(job: dict) -> dict:
+    """Turn an abandoned job into a terminal error for the caller.
+
+    Derived, not written back: a genuinely slow job whose heartbeat is merely
+    delayed will keep running on its own worker and report `done` on a later
+    poll. Overwriting the stored status here would throw that result away.
+    """
+    if job.get("status") != "running":
+        return job
+    updated = job.get("updated_at")
+    if not isinstance(updated, datetime):
+        return job
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - updated).total_seconds()
+    if age < _JOB_STALE_SECONDS:
+        return job
+    return {
+        **job,
+        "status": "error",
+        "error": (
+            "The worker running this job stopped responding "
+            f"({int(age // 60)} min since its last update) — most likely a "
+            "server restart or redeploy. Run it again."
+        ),
+    }
 
 
 # ── Orchestrator ────────────────────────────────────────────────────────────
 
 
-async def _run_job(job_id: str) -> None:
-    job = _JOBS[job_id]
+async def _run_job(job: dict) -> None:
+    heart = asyncio.create_task(_heartbeat(job["job_id"]))
     try:
         # Titles are needed by both Meta and Amazon Searchbar sourcing, so
         # resolve them once upfront rather than twice inside those functions.
@@ -143,7 +278,8 @@ async def _run_job(job_id: str) -> None:
                 job["sources"][name]["notes"].extend(res.get("notes", []))
 
         job["step"] = "brand_analytics"
-        user_key = _ba_user_key()
+        await _save(job)
+        user_key = _user_key()
         ba_week = await _ensure_ba_week(user_key)
         # Union all sourced keywords into a single Mongo $in lookup so we hit
         # the database once regardless of how many sources produced keywords.
@@ -171,6 +307,7 @@ async def _run_job(job_id: str) -> None:
             src["ba_coverage"] = coverage
 
         job["step"] = "cpc"
+        await _save(job)
         ad_group_id = job.get("ad_group_id")
         campaign_id = job.get("campaign_id")
         # Auto-discover an ad group when the caller didn't supply one. One call
@@ -209,6 +346,7 @@ async def _run_job(job_id: str) -> None:
                 )
 
         job["step"] = "scoring"
+        await _save(job)
         for source in SOURCES:
             src = job["sources"][source]
             src["scored"] = _score(src["enriched"])
@@ -221,6 +359,12 @@ async def _run_job(job_id: str) -> None:
         job["status"] = "error"
         job["error"] = str(e)
         job["finished_at"] = datetime.now(timezone.utc).isoformat()
+    finally:
+        # Stop the heartbeat before the final flush, so a terminal status can
+        # never be followed by a liveness bump that makes a finished job look
+        # like it is still running.
+        heart.cancel()
+        await _save(job)
 
 
 # ── Title resolution (SP-API catalog) ───────────────────────────────────────
@@ -480,11 +624,6 @@ _BA_WRITE_BATCH = 5000
 # waits on the same fetch instead of triggering a duplicate 500 MB download.
 _BA_LOCKS: dict[str, asyncio.Lock] = {}
 _BA_INDEXES_ENSURED = False
-
-
-def _ba_user_key() -> str:
-    user = require_user()
-    return str(user.get("_id") or user.get("email") or "anon")
 
 
 def _ba_coll():

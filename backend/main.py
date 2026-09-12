@@ -2227,7 +2227,7 @@ async def start_keyword_matrix(
     user: dict = Depends(protect),
 ):
     try:
-        job_id = keyword_matrix.start_job(
+        job_id = await keyword_matrix.start_job(
             asins=request.asins,
             ad_group_id=request.ad_group_id,
             campaign_id=request.campaign_id,
@@ -2292,7 +2292,7 @@ async def meta_interests(q: str, limit: int = 25, user: dict = Depends(protect))
 
 @app.get("/keyword-matrix/{job_id}")
 async def get_keyword_matrix(job_id: str, user: dict = Depends(protect)):
-    job = keyword_matrix.get_job(job_id)
+    job = await keyword_matrix.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     return job
