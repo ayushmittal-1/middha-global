@@ -101,9 +101,9 @@ def main() -> int:
         import datetime
         when = ""
         try:
-            when = datetime.datetime.utcfromtimestamp(int(exp)).strftime(
-                " (%Y-%m-%d %H:%M UTC)"
-            )
+            when = datetime.datetime.fromtimestamp(
+                int(exp), datetime.timezone.utc
+            ).strftime(" (%Y-%m-%d %H:%M UTC)")
         except Exception:
             pass
         print(f"{BAD} expires_at={exp}{when}")
