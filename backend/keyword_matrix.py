@@ -80,12 +80,14 @@ _JOB_INDEXES_ENSURED = False
 # different cause.
 _RUNNING: set[asyncio.Task] = set()
 
-SOURCES = ("amazon_asin", "meta", "amazon_searchbar", "google")
+# Sources the matrix currently exposes. `_source_google_autocomplete` stays
+# built but uncalled — add "google" back here and restore its leg in the
+# `asyncio.gather` below to bring the column back.
+SOURCES = ("amazon_asin", "meta", "amazon_searchbar")
 _SOURCE_LABELS = {
     "amazon_asin": "Amazon (ASIN)",
     "meta": "Meta",
     "amazon_searchbar": "Amazon Searchbar",
-    "google": "Google",
 }
 STEPS = ("sourcing", "brand_analytics", "cpc", "scoring", "done")
 
@@ -257,18 +259,16 @@ async def _run_job(job: dict) -> None:
 
         # Fan out the sourcing paths concurrently — none of them share
         # state and each hits a different API.
-        asin_res, meta_res, sb_res, google_res = await asyncio.gather(
+        asin_res, meta_res, sb_res = await asyncio.gather(
             _source_amazon_asin(job["asins"]),
             _source_meta(list(job["titles"].values())),
             _source_amazon_searchbar(list(job["titles"].values())),
-            _source_google_autocomplete(list(job["titles"].values())),
             return_exceptions=True,
         )
         for name, res in (
             ("amazon_asin", asin_res),
             ("meta", meta_res),
             ("amazon_searchbar", sb_res),
-            ("google", google_res),
         ):
             if isinstance(res, Exception):
                 job["sources"][name]["notes"].append(_redact(f"error: {res}"))
