@@ -601,7 +601,27 @@ async def _source_google_autocomplete(titles: list[str]) -> dict:
 # ── Brand Analytics enrichment ──────────────────────────────────────────────
 
 
-_BA_MAX_WEEKS_BACK = 3
+# How far back `_ensure_ba_week` will walk looking for a usable BA week.
+#
+# Was 3, which meant any account whose newest cached week was older than that
+# fell through to `fetch_brand_analytics_search_terms` on every single job.
+# That call holds the whole weekly report in memory twice — once as the raw
+# response string, once as the parsed list — which OOM-kills a 512 MB Render
+# instance roughly 30s in, taking the job and the web process down with it
+# (the client sees a 502 mid-poll).
+#
+# The walk is newest-first and returns on the first cache HIT, so a wider
+# window never picks an older week than a narrower one would have; it only
+# changes what happens when nothing recent is cached — reach further back for
+# a week we already have, instead of attempting a download that cannot
+# currently succeed. Stale-but-present beats crashing: `_score` ranks
+# keywords relatively within a source pool, so an older demand snapshot still
+# produces a sensible ordering.
+#
+# This is a stopgap. The real fix is streaming the report into Mongo so peak
+# memory stops scaling with report size; until then no BA week can be
+# imported on this instance at all.
+_BA_MAX_WEEKS_BACK = 26
 
 # BA data is cached in Mongo as ONE DOC PER TERM in the `brand_analytics_terms`
 # collection. Doc shape:
