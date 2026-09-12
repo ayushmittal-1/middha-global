@@ -271,11 +271,13 @@ async def _run_job(job: dict) -> None:
             ("google", google_res),
         ):
             if isinstance(res, Exception):
-                job["sources"][name]["notes"].append(f"error: {res}")
+                job["sources"][name]["notes"].append(_redact(f"error: {res}"))
                 job["sources"][name]["keywords"] = []
             else:
                 job["sources"][name]["keywords"] = res["keywords"]
-                job["sources"][name]["notes"].extend(res.get("notes", []))
+                job["sources"][name]["notes"].extend(
+                    _redact(n) for n in res.get("notes", [])
+                )
 
         job["step"] = "brand_analytics"
         await _save(job)
@@ -357,7 +359,7 @@ async def _run_job(job: dict) -> None:
         job["finished_at"] = datetime.now(timezone.utc).isoformat()
     except Exception as e:
         job["status"] = "error"
-        job["error"] = str(e)
+        job["error"] = _redact(e)
         job["finished_at"] = datetime.now(timezone.utc).isoformat()
     finally:
         # Stop the heartbeat before the final flush, so a terminal status can
@@ -446,6 +448,42 @@ async def _source_amazon_asin(asins: list[str]) -> dict:
 
 _META_GRAPH_URL = "https://graph.facebook.com/v19.0/search"
 
+# Query-string credentials, for scrubbing text that is headed into a job note.
+_SECRET_QS_RE = re.compile(
+    r"((?:access_token|client_secret|refresh_token|api_key)=)[^&\s'\"]+",
+    re.IGNORECASE,
+)
+
+# Env vars whose *values* must never appear in a note, even outside a URL.
+_SECRET_ENV_VARS = (
+    "META_ACCESS_TOKEN",
+    "ADS_LWA_CLIENT_SECRET",
+    "LWA_CLIENT_SECRET",
+    "JWT_SECRET",
+    "MONGO_URI",
+)
+
+
+def _redact(text: object) -> str:
+    """Strip credentials from text before it becomes a job note.
+
+    Notes are persisted to Mongo and rendered in the keyword tab, so anything
+    that reaches one is visible to everyone who can open the page. httpx puts
+    the full request URL into its error messages, which is exactly how a live
+    Meta access token ended up stored in a job doc and displayed in the UI.
+
+    Callers should also keep secrets out of URLs in the first place (see
+    `_source_meta`, which sends its token as an Authorization header). This is
+    the backstop for everything that still slips through.
+    """
+    out = _SECRET_QS_RE.sub(r"\1<redacted>", str(text))
+    for var in _SECRET_ENV_VARS:
+        val = (os.getenv(var) or "").strip()
+        # Short values would match far too much; a real credential is long.
+        if len(val) >= 8:
+            out = out.replace(val, "<redacted>")
+    return out
+
 
 async def _source_meta(titles: list[str]) -> dict:
     """Ad-interest suggestions seeded by each ASIN's product title.
@@ -470,19 +508,23 @@ async def _source_meta(titles: list[str]) -> dict:
                 continue
             query = title.split(",")[0].strip()[:100]
             try:
+                # Token goes in the Authorization header, NOT the query
+                # string: httpx echoes the full URL in its error messages, and
+                # those messages land in notes that are stored in Mongo and
+                # rendered in the UI.
                 resp = await client.get(
                     _META_GRAPH_URL,
                     params={
                         "type": "adinterest",
                         "q": query,
                         "limit": 25,
-                        "access_token": token,
                     },
+                    headers={"Authorization": f"Bearer {token}"},
                 )
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as e:
-                notes.append(f"meta lookup failed for '{query}': {e}")
+                notes.append(_redact(f"meta lookup failed for '{query}': {e}"))
                 continue
             for item in data.get("data", []):
                 name = (item.get("name") or "").strip().lower()

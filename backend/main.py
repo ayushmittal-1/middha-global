@@ -2261,14 +2261,16 @@ async def meta_interests(q: str, limit: int = 25, user: dict = Depends(protect))
         raise HTTPException(status_code=400, detail="q required")
     limit = max(1, min(int(limit), 100))
     async with _httpx.AsyncClient(timeout=15) as client:
+        # Authorization header, not a query param — keeps the token out of
+        # URLs that get echoed into exception messages, logs and proxies.
         resp = await client.get(
             "https://graph.facebook.com/v19.0/search",
             params={
                 "type": "adinterest",
                 "q": query[:100],
                 "limit": limit,
-                "access_token": token,
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
     if resp.is_error:
         raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
