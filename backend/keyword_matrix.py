@@ -485,12 +485,95 @@ def _redact(text: object) -> str:
     return out
 
 
+# Title tokens that are never a useful Meta seed: marketing adjectives,
+# packaging/unit nouns, and filler. Measured against the live API — these
+# either return nothing or return interests about something else entirely
+# ("sticks" -> Mozzarella sticks, "box" -> Xbox).
+_META_STOPWORDS = {
+    "and", "assorted", "best", "box", "boxes", "combo", "count", "for",
+    "fragrance", "free", "hand", "include", "including", "kit", "large",
+    "made", "medium", "mesmerizing", "natural", "new", "organic", "original",
+    "pack", "packs", "piece", "pieces", "premium", "pure", "quality",
+    "rolled", "scented", "set", "sets", "size", "small", "stick", "sticks",
+    "the", "value", "variety", "with",
+}
+
+# Meta tags each interest with a `topic`. These ones are about films, bands,
+# athletes and celebrities that merely share a word with a product term —
+# "steel" pulls Real Steel and Danielle Steel, "bottle" pulls Message in a
+# Bottle. No ecommerce keyword set wants them.
+# Note "None" is NOT blockable: the single most relevant interest we get
+# ("Incense") is itself untagged, so dropping untagged entries would throw the
+# good result away along with the noise.
+_META_BLOCKED_TOPICS = {
+    "news and entertainment",   # Dragon Ball Z, True Blood, Real Steel
+    "sports and outdoors",      # Pittsburgh Steelers
+    "people",                   # G-Dragon, Little Dragon
+    "travel, places and events",  # Dragon Con, Lightning in a Bottle
+}
+
+_META_TOKEN_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
+_META_HAS_DIGIT_RE = re.compile(r"\d")
+
+# Meta returns at most a handful of usable interests per product; this caps
+# the request count per title so a long title can't fan out unboundedly.
+_META_MAX_SEEDS_PER_TITLE = 8
+
+
+def _meta_seeds(title: str) -> list[str]:
+    """Single-word Meta seeds derived from a product title.
+
+    Meta's ad-interest search only matches its own interest taxonomy, and
+    measurement against the live API shows multi-word queries essentially
+    never hit: the full title, every `_seed_candidates` fragment and every
+    adjacent word pair all returned zero interests, while single words
+    returned results. So this deliberately does NOT reuse `_seed_candidates`
+    (which is tuned for Amazon autocomplete and only emits 2+ word seeds).
+
+    Tokens are dropped when they are short, numeric ("6x20", "15g"), or
+    marketing/packaging filler — each of those matches wildly unrelated
+    interests. The leading token goes too: Amazon titles start with the brand,
+    and a brand token pulls in interests about unrelated famous people
+    ("Satya" -> Satya Nadella, Microsoft). That does mean a genuinely
+    targetable brand interest is missed for big-name brands; worth revisiting
+    if this ever runs over a catalogue where that matters.
+    """
+    words = _META_TOKEN_SPLIT_RE.split(title or "")
+    seeds: list[str] = []
+    for raw in words[1:]:  # skip the brand
+        w = raw.strip().lower()
+        if (
+            len(w) < 4
+            or w in _META_STOPWORDS
+            or _META_HAS_DIGIT_RE.search(w)
+            or w in seeds
+        ):
+            continue
+        seeds.append(w)
+        if len(seeds) >= _META_MAX_SEEDS_PER_TITLE:
+            break
+    return seeds
+
+
+def _meta_interest_matches_seed(seed: str, name: str) -> bool:
+    """True when the interest name contains the seed as a whole word.
+
+    Meta matches on substrings, so a bare seed pulls in unrelated interests
+    that merely share a prefix — "hand" -> Handball, "box" -> Boxing,
+    "champa" -> Champagne, "nag" -> Nagasaki. Requiring a whole-word hit
+    removed 27 of 30 such results for one test title while keeping every
+    genuinely relevant one.
+    """
+    return seed in _META_TOKEN_SPLIT_RE.split(name.lower())
+
+
 async def _source_meta(titles: list[str]) -> dict:
     """Ad-interest suggestions seeded by each ASIN's product title.
 
-    TODO: fill META_ACCESS_TOKEN. Until then this returns an empty set with a
-    note so the pipeline can still complete and the UI can show the empty
-    column with an explanation.
+    Seeds are single words (see `_meta_seeds`) and results are filtered to
+    interests that actually contain the seed as a word. Meta's taxonomy is
+    genuinely sparse for niche products, so a small, relevant set here is the
+    expected outcome rather than a failure.
     """
     token = os.getenv("META_ACCESS_TOKEN", "").strip()
     if not token:
@@ -501,36 +584,68 @@ async def _source_meta(titles: list[str]) -> dict:
     seen: set[str] = set()
     keywords: list[str] = []
     notes: list[str] = []
+    queried: set[str] = set()
+    dropped = 0
     async with httpx.AsyncClient(timeout=15) as client:
         for title in titles:
             if not title:
                 notes.append("empty title — skipped Meta lookup for one ASIN")
                 continue
-            query = title.split(",")[0].strip()[:100]
-            try:
-                # Token goes in the Authorization header, NOT the query
-                # string: httpx echoes the full URL in its error messages, and
-                # those messages land in notes that are stored in Mongo and
-                # rendered in the UI.
-                resp = await client.get(
-                    _META_GRAPH_URL,
-                    params={
-                        "type": "adinterest",
-                        "q": query,
-                        "limit": 25,
-                    },
-                    headers={"Authorization": f"Bearer {token}"},
+            seeds = _meta_seeds(title)
+            if not seeds:
+                notes.append(
+                    f"no usable Meta seed in title '{title[:40]}' — "
+                    "all tokens were brand, filler or numeric"
                 )
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as e:
-                notes.append(_redact(f"meta lookup failed for '{query}': {e}"))
                 continue
-            for item in data.get("data", []):
-                name = (item.get("name") or "").strip().lower()
-                if name and name not in seen:
-                    seen.add(name)
-                    keywords.append(name)
+            for seed in seeds:
+                # Titles in one job often share tokens; only ask once.
+                if seed in queried:
+                    continue
+                queried.add(seed)
+                try:
+                    # Token goes in the Authorization header, NOT the query
+                    # string: httpx echoes the full URL in its error messages,
+                    # and those messages land in notes that are stored in
+                    # Mongo and rendered in the UI.
+                    resp = await client.get(
+                        _META_GRAPH_URL,
+                        params={
+                            "type": "adinterest",
+                            "q": seed,
+                            "limit": 25,
+                        },
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                except Exception as e:
+                    notes.append(_redact(f"meta lookup failed for '{seed}': {e}"))
+                    continue
+                for item in data.get("data", []):
+                    name = (item.get("name") or "").strip()
+                    if not name:
+                        continue
+                    if not _meta_interest_matches_seed(seed, name):
+                        dropped += 1
+                        continue
+                    topic = (item.get("topic") or "").strip().lower()
+                    if topic in _META_BLOCKED_TOPICS:
+                        dropped += 1
+                        continue
+                    lowered = name.lower()
+                    if lowered not in seen:
+                        seen.add(lowered)
+                        keywords.append(lowered)
+    if queried and not keywords:
+        notes.append(
+            f"Meta returned no interests matching {sorted(queried)} — "
+            "its taxonomy has no entry for this product"
+        )
+    elif dropped:
+        notes.append(
+            f"{dropped} Meta interest(s) dropped as unrelated to the seed word"
+        )
     return {"keywords": keywords, "notes": notes}
 
 
