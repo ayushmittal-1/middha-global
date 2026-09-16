@@ -512,28 +512,30 @@
     }
     table.restock {
       width: 100%;
+      min-width: 0;
       table-layout: fixed;
       border-collapse: separate;
       border-spacing: 0;
-      font-size: 11px;
-      min-width: 0;
+      font-size: 12px;
     }
     table.restock thead th {
       background: #f1f5f9;
       color: #334155;
       text-align: left;
-      padding: 6px 4px;
+      padding: 8px 5px;
       font-weight: 600;
-      font-size: 9px;
-      text-transform: uppercase;
-      letter-spacing: 0.02em;
+      font-size: 11px;
+      text-transform: none;
+      letter-spacing: 0;
       border-bottom: 2px solid #e2e8f0;
       position: sticky;
       top: 0;
       z-index: 2;
       white-space: normal;
-      line-height: 1.2;
-      word-break: break-word;
+      line-height: 1.25;
+      overflow-wrap: normal;
+      word-break: normal;
+      hyphens: none;
     }
     table.restock thead th:first-child {
       left: 0;
@@ -551,23 +553,24 @@
        so the total number remains the eye-catcher when scanning. */
     .reserved-brk {
       display: block;
-      font-size: 9px;
+      font-size: 10px;
       color: #6b7280;
       margin-left: 0;
       white-space: nowrap;
     }
     table.restock td {
-      padding: 5px 4px;
+      padding: 7px 5px;
       color: #0f172a;
       vertical-align: middle;
-      line-height: 1.25;
+      line-height: 1.3;
       overflow: hidden;
       text-overflow: ellipsis;
+      white-space: nowrap;
     }
     table.restock td.sku-cell {
       width: 11%;
-      max-width: none;
       min-width: 0;
+      max-width: none;
       position: sticky;
       left: 0;
       z-index: 1;
@@ -590,7 +593,7 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       color: #1e293b;
       white-space: nowrap;
-      font-size: 10px;
+      font-size: 12px;
     }
     table.restock .num-strong {
       font-weight: 700;
@@ -599,7 +602,7 @@
     table.restock .date-cell {
       color: #475569;
       white-space: nowrap;
-      font-size: 10px;
+      font-size: 12px;
     }
     table.restock .next-arrival {
       font-size: 12px;
@@ -614,9 +617,9 @@
     }
     .urgency-pill {
       display: inline-block;
-      padding: 2px 5px;
+      padding: 2px 6px;
       border-radius: 999px;
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 600;
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
@@ -632,9 +635,9 @@
        sellers see the same green/amber/red at a glance across views. */
     .best-model-cell {
       display: inline-block;
-      padding: 1px 4px;
+      padding: 2px 6px;
       border-radius: 6px;
-      font-size: 10px;
+      font-size: 11px;
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }
@@ -1396,6 +1399,9 @@
       background: #0f172a;
       color: #e2e8f0;
     }
+    body:not(.ai-show-sidebar) #sidebar {
+      display: none;
+    }
     body.embedded-in-aurora #sidebar {
       width: 240px;
       background: #0b1220;
@@ -2059,29 +2065,29 @@
               <th title="Fulfillment Network SKU — Amazon's internal barcode ID for FBA units">FNSKU</th>
               <th class="num" title="Seller Central On-hand (FBA) = Available + FC Transfer (pendingTransshipment). Reserved / Unfulfillable / Inbound are separate columns.">On hand</th>
               <th class="num" title="Units set aside by Amazon — not sellable right now.&#10;&#10;Bifurcation shown as 'total (cust + fc)':&#10;  cust = pendingCustomerOrder → allocated to open orders that haven't shipped yet&#10;  fc   = fcProcessing → at an FC being moved/inspected&#10;&#10;(pendingTransshipment / units in transit between FCs is counted in On hand, not here.)">Reserved</th>
-              <th class="num" title="Units Amazon has received into the network but not yet checked into the destination FC (inboundShippedQuantity)">Sent</th>
-              <th class="num" title="Units on an inbound shipment plan you've created but not yet shipped (inboundWorkingQuantity)">Inbound</th>
-              <th class="num" title="Units physically at Amazon but currently in transit between fulfillment centers (pendingTransshipment). Not sellable during the transfer but included in days-of-cover since they usually return to sellable within days.">FC xfer</th>
-              <th class="num" title="Units on in-flight shipments to Amazon Warehousing & Distribution (AWD bulk storage). Not sellable until replenished to FBA — excluded from days-of-cover math.">AWD</th>
-              <th class="num" title="Damaged or customer-returned units currently unsellable">Unfulf.</th>
-              <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next in</th>
-              <th class="num" title="Weighted sales velocity across the 3/7/30/60/180-day windows (out-of-stock days excluded). Default weights are recent-biased (0.4×v3d + 0.3×v7d + 0.2×v30d + 0.1×v60d + 0×v180d); override per-SKU in Actions → Forecast tab.">Velocity</th>
-              <th title="Winning forecast model (from the nightly picker's 30-day holdout backtest) and its accuracy_pct. Any of prophet / naive / lgbm / xgb / ensemble / deepar / tft may win depending on the SKU's demand pattern.">Model</th>
-              <th title="Q4 accuracy — how accurate the best model/config would have been for last Q4 (Oct-Dec). Populated after clicking 'Test on Q4' in the drawer, or from a fleet Q4 backtest run.">Q4</th>
-              <th class="num" title="Average units sold per day over the selected window (units sold ÷ window size; Aurora orders, cancelled/pending excluded)"><span id="restock-orders-header">Ord/d</span></th>
-              <th class="num" title="30-day unit forecast">30d fcst</th>
-              <th title="Days of cover remaining">Cover</th>
-              <th class="num" title="Amazon's own metric: ratio of avg. daily sellable on-hand inventory to avg. daily shipped units (max of 30d and 90d ratios). Low-inventory-level fee doesn't apply when HDOS > 28. Source: FBA Inventory Planning report.">HDOS</th>
-              <th title="Projected stockout date given on-hand + inbound shipments − daily demand">Stockout</th>
-              <th title="Latest date to dispatch a shipment via air freight (~10d transit to Amazon FC)">Air</th>
-              <th title="Latest date to dispatch a shipment via ocean freight (~45d transit to Amazon FC)">Ocean</th>
-              <th class="num" title="Days until you need to dispatch by air (delta from today to Ship by Air). Negative = you're late.">Days to PO</th>
-              <th class="num" title="Suggested restock quantity">Suggest</th>
+              <th class="num" title="Units Amazon has received into the network but not yet checked into the destination FC (inboundShippedQuantity)">Sent to<br>FBA</th>
+              <th class="num" title="Units on an inbound shipment plan you've created but not yet shipped (inboundWorkingQuantity)">Inbound<br>working</th>
+              <th class="num" title="Units physically at Amazon but currently in transit between fulfillment centers (pendingTransshipment). Not sellable during the transfer but included in days-of-cover since they usually return to sellable within days.">FC<br>transfer</th>
+              <th class="num" title="Units on in-flight shipments to Amazon Warehousing & Distribution (AWD bulk storage). Not sellable until replenished to FBA — excluded from days-of-cover math.">AWD<br>inbound</th>
+              <th class="num" title="Damaged or customer-returned units currently unsellable">Unful&shy;fillable</th>
+              <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next<br>arrival</th>
+              <th class="num" title="Weighted sales velocity across the 3/7/30/60/180-day windows (out-of-stock days excluded). Default weights are recent-biased (0.4×v3d + 0.3×v7d + 0.2×v30d + 0.1×v60d + 0×v180d); override per-SKU in Actions → Forecast tab.">Orders<br>velocity</th>
+              <th title="Winning forecast model (from the nightly picker's 30-day holdout backtest) and its accuracy_pct. Any of prophet / naive / lgbm / xgb / ensemble / deepar / tft may win depending on the SKU's demand pattern.">Best<br>model</th>
+              <th title="Q4 accuracy — how accurate the best model/config would have been for last Q4 (Oct-Dec). Populated after clicking 'Test on Q4' in the drawer, or from a fleet Q4 backtest run.">Q4<br>accuracy</th>
+              <th class="num" title="Average units sold per day over the selected window (units sold ÷ window size; Aurora orders, cancelled/pending excluded)"><span id="restock-orders-header">Orders/day</span></th>
+              <th class="num" title="30-day unit forecast">30-day<br>forecast</th>
+              <th title="Days of cover remaining">Days of<br>cover</th>
+              <th class="num" title="Amazon's own metric: ratio of avg. daily sellable on-hand inventory to avg. daily shipped units (max of 30d and 90d ratios). Low-inventory-level fee doesn't apply when HDOS > 28. Source: FBA Inventory Planning report.">Historical<br>DoS</th>
+              <th title="Projected stockout date given on-hand + inbound shipments − daily demand">Stockout<br>on</th>
+              <th title="Latest date to dispatch a shipment via air freight (~10d transit to Amazon FC)">Ship by<br>(Air)</th>
+              <th title="Latest date to dispatch a shipment via ocean freight (~45d transit to Amazon FC)">Ship by<br>(Ocean)</th>
+              <th class="num" title="Days until you need to dispatch by air (delta from today to Ship by Air). Negative = you're late.">Days until<br>next order</th>
+              <th class="num" title="Suggested restock quantity">Suggested<br>qty</th>
               <th class="num" title="Units on your open purchase orders that haven't arrived at your warehouse / prep center yet">Ordered</th>
-              <th class="num" title="(Available to sell + Reserved + Sent to FBA + Inbound working) × landed cost from your COGS">Value</th>
-              <th class="num" title="Rough estimate of profit lost during stockout days over the last 90d, using ~25% margin on landed cost">Missed $</th>
-              <th title="Free-text notes for this SKU (set via the Actions menu)">Note</th>
-              <th title="Per-SKU manufacturing / forecast / packing / supplier settings">⋯</th>
+              <th class="num" title="(Available to sell + Reserved + Sent to FBA + Inbound working) × landed cost from your COGS">Stock<br>value</th>
+              <th class="num" title="Rough estimate of profit lost during stockout days over the last 90d, using ~25% margin on landed cost">Missed<br>profit</th>
+              <th title="Free-text notes for this SKU (set via the Actions menu)">Notes</th>
+              <th title="Per-SKU manufacturing / forecast / packing / supplier settings">Actions</th>
             </tr>
           </thead>
           <tbody id="restock-body"></tbody>
@@ -2435,40 +2441,85 @@
     // ── Auth ───────────────────────────────────────────
     // Login is handled by THIS backend's POST /api/auth/login — same origin,
     // so no CORS. It verifies the password against the shared Mongo users
-    // collection and issues a JWT signed with Aurora's JWT_SECRET, so the
-    // resulting token works against Aurora as well.
+    // collection and issues a JWT signed with Aurora's JWT_SECRET.
     //
-    // When embedded in Aurora (`?token=<jwt>&embedded=1`), we accept the
-    // parent app's session and skip the login overlay.
+    // When embedded in Aurora (`?code=<one-time>&embedded=1`), we exchange
+    // the code via this backend (server-side secret) — never accept JWTs
+    // from the query string.
+    //
+    // Auth tokens stay in memory only (never localStorage/sessionStorage)
+    // and WebSocket auth uses Sec-WebSocket-Protocol — never ?token=.
     const urlParams = new URLSearchParams(location.search);
     const isEmbedded = urlParams.get('embedded') === '1' || window.self !== window.top;
 
-    function bootstrapTokenFromAurora() {
-      const tokenFromQuery = (urlParams.get('token') || '').trim();
-      if (tokenFromQuery) {
-        localStorage.setItem('auth_token', tokenFromQuery);
-        const emailFromQuery = (urlParams.get('email') || '').trim();
-        if (emailFromQuery) localStorage.setItem('user_email', emailFromQuery);
-        // Strip secrets from the address bar while keeping embedded mode.
-        const clean = new URL(location.href);
-        clean.searchParams.delete('token');
-        clean.searchParams.delete('email');
-        if (isEmbedded) clean.searchParams.set('embedded', '1');
-        history.replaceState({}, '', clean.pathname + clean.search + clean.hash);
-      }
+    let memoryAuthToken = '';
+    let memoryUserEmail = '';
+
+    function clearLegacyAuthStorage() {
+      try {
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('user_email');
+      } catch (_) {}
     }
-    bootstrapTokenFromAurora();
+
+    function setAuthSession(token, email) {
+      memoryAuthToken = String(token || '').trim();
+      if (email != null && String(email).trim()) {
+        memoryUserEmail = String(email).trim();
+      }
+      clearLegacyAuthStorage();
+    }
+
+    function clearAuthSession() {
+      memoryAuthToken = '';
+      memoryUserEmail = '';
+      clearLegacyAuthStorage();
+    }
+
+    function stripEmbedSecretsFromUrl() {
+      const clean = new URL(location.href);
+      clean.searchParams.delete('token');
+      clean.searchParams.delete('email');
+      clean.searchParams.delete('code');
+      if (isEmbedded) clean.searchParams.set('embedded', '1');
+      history.replaceState({}, '', clean.pathname + clean.search + clean.hash);
+    }
+
+    async function bootstrapTokenFromAurora() {
+      clearLegacyAuthStorage();
+      const codeFromQuery = (urlParams.get('code') || '').trim();
+      // Reject legacy JWT-in-URL immediately (security).
+      if ((urlParams.get('token') || '').trim()) {
+        stripEmbedSecretsFromUrl();
+      }
+      if (!codeFromQuery) {
+        stripEmbedSecretsFromUrl();
+        return;
+      }
+
+      stripEmbedSecretsFromUrl();
+
+      const res = await fetch('/api/auth/aurora-embed-exchange', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ code: codeFromQuery }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.token) {
+        throw new Error(data.error || `Embed exchange failed (${res.status})`);
+      }
+      setAuthSession(data.token, data.email || '');
+    }
 
     function getAuthToken() {
-      return (localStorage.getItem('auth_token') || '').trim();
+      return memoryAuthToken;
     }
     function authHeaders(extra = {}) {
       const t = getAuthToken();
       return t ? { ...extra, Authorization: `Bearer ${t}` } : extra;
     }
     function logout() {
-      localStorage.removeItem('auth_token');
-      localStorage.removeItem('user_email');
+      clearAuthSession();
       localStorage.removeItem('session_id');
       if (ws) { try { ws.close(); } catch (_) {} ws = null; }
       if (isEmbedded) {
@@ -2495,8 +2546,7 @@
       if (!data.token) {
         throw new Error('Login response had no token');
       }
-      localStorage.setItem('auth_token', data.token);
-      if (data.email) localStorage.setItem('user_email', data.email);
+      setAuthSession(data.token, data.email || email);
       return data;
     }
 
@@ -2509,7 +2559,8 @@
         return;
       }
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${proto}://${location.host}/ws/chat?token=${encodeURIComponent(token)}`);
+      // Prefer Sec-WebSocket-Protocol so the JWT never appears in URLs or access logs.
+      ws = new WebSocket(`${proto}://${location.host}/ws/chat`, ['bearer', token]);
 
       ws.onopen = () => console.log('[ws] connected');
 
@@ -2525,7 +2576,7 @@
       ws.onclose = (evt) => {
         if (evt.code === 4401) {
           console.warn('[ws] auth rejected — clearing token and showing login');
-          localStorage.removeItem('auth_token');
+          clearAuthSession();
           showLogin();
           return;
         }
@@ -2813,7 +2864,7 @@
         loginSubmit.disabled = true;
         return;
       }
-      const savedEmail = localStorage.getItem('user_email');
+      const savedEmail = memoryUserEmail;
       if (savedEmail) loginEmail.value = savedEmail;
       setTimeout(() => (savedEmail ? loginPassword : loginEmail).focus(), 50);
     }
@@ -3711,7 +3762,7 @@
       });
     }
 
-    function truncateSku(sku, maxLen = 22) {
+    function truncateSku(sku, maxLen = 40) {
       const s = String(sku || '');
       if (s.length <= maxLen) return s;
       return `${s.slice(0, maxLen - 1)}…`;
@@ -3738,7 +3789,7 @@
       const q = (restockSearchEl.value || '').trim().toLowerCase();
       const ordersWindow = parseInt(restockOrdersWindowEl.value, 10) || 30;
       const ordersField = `orders_${ordersWindow}d`;
-      if (restockOrdersHeaderEl) restockOrdersHeaderEl.textContent = `Ord/d (${ordersWindow}d)`;
+      if (restockOrdersHeaderEl) restockOrdersHeaderEl.textContent = `Orders/day (${ordersWindow}d)`;
 
       let visible = showAll
         ? restockCache
@@ -6359,7 +6410,7 @@
     // ── Init ───────────────────────────────────────────
 
     async function startApp() {
-      userEmailEl.textContent = localStorage.getItem('user_email') || '';
+      userEmailEl.textContent = memoryUserEmail || '';
       const saved = localStorage.getItem('session_id');
       if (saved) {
         currentSessionId = saved;
@@ -6374,6 +6425,17 @@
     }
 
     (async () => {
+      try {
+        await bootstrapTokenFromAurora();
+      } catch (err) {
+        console.error('[embed] bootstrap failed', err);
+        if (isEmbedded) {
+          showLogin();
+          loginError.textContent =
+            (err && err.message) || 'Aurora embed session failed. Reload AI Assistant from Aurora.';
+          return;
+        }
+      }
       if (!getAuthToken()) {
         showLogin();
       } else {
