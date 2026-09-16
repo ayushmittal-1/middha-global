@@ -406,11 +406,12 @@
 
     #restock-view {
       flex: 1;
-      overflow-y: auto;
-      padding: 24px;
+      overflow: hidden;
+      padding: 12px;
       display: none;
       flex-direction: column;
-      gap: 16px;
+      gap: 10px;
+      min-height: 0;
     }
     #restock-view.visible { display: flex; }
 
@@ -502,31 +503,39 @@
       background: #fff;
       border-radius: 12px;
       border: 1px solid #e2e8f0;
-      overflow: auto;
-      max-height: calc(100vh - 280px);
+      overflow-x: hidden;
+      overflow-y: auto;
+      flex: 1;
+      min-height: 0;
+      max-height: none;
       box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
     }
     table.restock {
       width: 100%;
+      min-width: 0;
+      table-layout: fixed;
       border-collapse: separate;
       border-spacing: 0;
-      font-size: 13px;
-      min-width: 1100px;
+      font-size: 12px;
     }
     table.restock thead th {
       background: #f1f5f9;
       color: #334155;
       text-align: left;
-      padding: 12px 14px;
+      padding: 8px 5px;
       font-weight: 600;
       font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
+      text-transform: none;
+      letter-spacing: 0;
       border-bottom: 2px solid #e2e8f0;
       position: sticky;
       top: 0;
       z-index: 2;
-      white-space: nowrap;
+      white-space: normal;
+      line-height: 1.25;
+      overflow-wrap: normal;
+      word-break: normal;
+      hyphens: none;
     }
     table.restock thead th:first-child {
       left: 0;
@@ -543,20 +552,25 @@
     /* Reserved-column bifurcation: (cust + fc) sub-text, small + muted
        so the total number remains the eye-catcher when scanning. */
     .reserved-brk {
+      display: block;
       font-size: 10px;
       color: #6b7280;
-      margin-left: 4px;
+      margin-left: 0;
       white-space: nowrap;
     }
     table.restock td {
-      padding: 12px 14px;
+      padding: 7px 5px;
       color: #0f172a;
       vertical-align: middle;
-      line-height: 1.45;
+      line-height: 1.3;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     table.restock td.sku-cell {
-      max-width: 240px;
-      min-width: 180px;
+      width: 11%;
+      min-width: 0;
+      max-width: none;
       position: sticky;
       left: 0;
       z-index: 1;
@@ -579,6 +593,7 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       color: #1e293b;
       white-space: nowrap;
+      font-size: 12px;
     }
     table.restock .num-strong {
       font-weight: 700;
@@ -602,9 +617,9 @@
     }
     .urgency-pill {
       display: inline-block;
-      padding: 4px 10px;
+      padding: 2px 6px;
       border-radius: 999px;
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 600;
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
@@ -620,9 +635,9 @@
        sellers see the same green/amber/red at a glance across views. */
     .best-model-cell {
       display: inline-block;
-      padding: 3px 8px;
+      padding: 2px 6px;
       border-radius: 6px;
-      font-size: 12px;
+      font-size: 11px;
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }
@@ -1532,10 +1547,16 @@
       background: #0f172a;
       color: #e2e8f0;
     }
+    body:not(.ai-show-sidebar) #sidebar {
+      display: none;
+    }
     body.embedded-in-aurora #sidebar {
       width: 240px;
       background: #0b1220;
       border-right: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    body.embedded-in-aurora:not(.ai-show-sidebar) #sidebar {
+      display: none;
     }
     body.embedded-in-aurora #sidebar-header { padding: 12px; }
     body.embedded-in-aurora #new-chat-btn {
@@ -1586,6 +1607,9 @@
       background: rgba(30, 139, 255, 0.1) !important;
     }
     body.embedded-in-aurora #chat-container,
+    body.embedded-in-aurora #restock-view {
+      padding: 8px 10px;
+    }
     body.embedded-in-aurora #restock-view,
     body.embedded-in-aurora #orders-view,
     body.embedded-in-aurora #campaigns-view,
@@ -2093,7 +2117,7 @@
       <button class="tab-btn" data-tab="profit">Profitability</button>
       <button class="tab-btn" data-tab="cogs">COGS</button>
       <button class="tab-btn" data-tab="keywords">Keywords</button>
-      <button class="tab-btn" data-tab="listings">Listings</button>
+      <button class="tab-btn" data-tab="listings">Listing optimiser</button>
       <button class="tab-btn" data-tab="deals">Deals</button>
     </nav>
 
@@ -2367,7 +2391,7 @@
       <!-- List view: paginated products with compliance scores -->
       <div id="lo-list-panel">
         <div id="lo-toolbar">
-          <h2>Listings</h2>
+          <h2>Listing optimiser</h2>
           <input id="lo-search" type="text" placeholder="Search title / ASIN / SKU">
           <button id="lo-refresh-btn" style="padding:6px 12px;font-size:13px;background:#e5e7eb;border:none;border-radius:4px;cursor:pointer;">Refresh</button>
           <span id="lo-list-status" style="font-size:12px;color:#666;"></span>
@@ -2395,7 +2419,7 @@
       <div id="lo-optimizer-panel" style="display:none;">
       <div id="lo-toolbar">
         <button id="lo-back-btn" style="padding:6px 10px;font-size:13px;background:#e5e7eb;border:none;border-radius:4px;cursor:pointer;">← Back to listings</button>
-        <h2>Listing Optimizer</h2>
+        <h2>Listing optimiser</h2>
         <input id="lo-asin" type="text" placeholder="ASIN — e.g. B0ABC12345">
         <button id="lo-prefill-btn" style="padding:6px 12px;font-size:13px;background:#e5e7eb;border:none;border-radius:4px;cursor:pointer;">Pre-fill from DB</button>
         <button id="lo-analyze-btn">Analyze &amp; rewrite</button>
@@ -2552,40 +2576,85 @@
     // ── Auth ───────────────────────────────────────────
     // Login is handled by THIS backend's POST /api/auth/login — same origin,
     // so no CORS. It verifies the password against the shared Mongo users
-    // collection and issues a JWT signed with Aurora's JWT_SECRET, so the
-    // resulting token works against Aurora as well.
+    // collection and issues a JWT signed with Aurora's JWT_SECRET.
     //
-    // When embedded in Aurora (`?token=<jwt>&embedded=1`), we accept the
-    // parent app's session and skip the login overlay.
+    // When embedded in Aurora (`?code=<one-time>&embedded=1`), we exchange
+    // the code via this backend (server-side secret) — never accept JWTs
+    // from the query string.
+    //
+    // Auth tokens stay in memory only (never localStorage/sessionStorage)
+    // and WebSocket auth uses Sec-WebSocket-Protocol — never ?token=.
     const urlParams = new URLSearchParams(location.search);
     const isEmbedded = urlParams.get('embedded') === '1' || window.self !== window.top;
 
-    function bootstrapTokenFromAurora() {
-      const tokenFromQuery = (urlParams.get('token') || '').trim();
-      if (tokenFromQuery) {
-        localStorage.setItem('auth_token', tokenFromQuery);
-        const emailFromQuery = (urlParams.get('email') || '').trim();
-        if (emailFromQuery) localStorage.setItem('user_email', emailFromQuery);
-        // Strip secrets from the address bar while keeping embedded mode.
-        const clean = new URL(location.href);
-        clean.searchParams.delete('token');
-        clean.searchParams.delete('email');
-        if (isEmbedded) clean.searchParams.set('embedded', '1');
-        history.replaceState({}, '', clean.pathname + clean.search + clean.hash);
-      }
+    let memoryAuthToken = '';
+    let memoryUserEmail = '';
+
+    function clearLegacyAuthStorage() {
+      try {
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('user_email');
+      } catch (_) {}
     }
-    bootstrapTokenFromAurora();
+
+    function setAuthSession(token, email) {
+      memoryAuthToken = String(token || '').trim();
+      if (email != null && String(email).trim()) {
+        memoryUserEmail = String(email).trim();
+      }
+      clearLegacyAuthStorage();
+    }
+
+    function clearAuthSession() {
+      memoryAuthToken = '';
+      memoryUserEmail = '';
+      clearLegacyAuthStorage();
+    }
+
+    function stripEmbedSecretsFromUrl() {
+      const clean = new URL(location.href);
+      clean.searchParams.delete('token');
+      clean.searchParams.delete('email');
+      clean.searchParams.delete('code');
+      if (isEmbedded) clean.searchParams.set('embedded', '1');
+      history.replaceState({}, '', clean.pathname + clean.search + clean.hash);
+    }
+
+    async function bootstrapTokenFromAurora() {
+      clearLegacyAuthStorage();
+      const codeFromQuery = (urlParams.get('code') || '').trim();
+      // Reject legacy JWT-in-URL immediately (security).
+      if ((urlParams.get('token') || '').trim()) {
+        stripEmbedSecretsFromUrl();
+      }
+      if (!codeFromQuery) {
+        stripEmbedSecretsFromUrl();
+        return;
+      }
+
+      stripEmbedSecretsFromUrl();
+
+      const res = await fetch('/api/auth/aurora-embed-exchange', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ code: codeFromQuery }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.token) {
+        throw new Error(data.error || `Embed exchange failed (${res.status})`);
+      }
+      setAuthSession(data.token, data.email || '');
+    }
 
     function getAuthToken() {
-      return (localStorage.getItem('auth_token') || '').trim();
+      return memoryAuthToken;
     }
     function authHeaders(extra = {}) {
       const t = getAuthToken();
       return t ? { ...extra, Authorization: `Bearer ${t}` } : extra;
     }
     function logout() {
-      localStorage.removeItem('auth_token');
-      localStorage.removeItem('user_email');
+      clearAuthSession();
       localStorage.removeItem('session_id');
       if (ws) { try { ws.close(); } catch (_) {} ws = null; }
       if (isEmbedded) {
@@ -2612,8 +2681,7 @@
       if (!data.token) {
         throw new Error('Login response had no token');
       }
-      localStorage.setItem('auth_token', data.token);
-      if (data.email) localStorage.setItem('user_email', data.email);
+      setAuthSession(data.token, data.email || email);
       return data;
     }
 
@@ -2626,7 +2694,8 @@
         return;
       }
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${proto}://${location.host}/ws/chat?token=${encodeURIComponent(token)}`);
+      // Prefer Sec-WebSocket-Protocol so the JWT never appears in URLs or access logs.
+      ws = new WebSocket(`${proto}://${location.host}/ws/chat`, ['bearer', token]);
 
       ws.onopen = () => console.log('[ws] connected');
 
@@ -2642,7 +2711,7 @@
       ws.onclose = (evt) => {
         if (evt.code === 4401) {
           console.warn('[ws] auth rejected — clearing token and showing login');
-          localStorage.removeItem('auth_token');
+          clearAuthSession();
           showLogin();
           return;
         }
@@ -2930,7 +2999,7 @@
         loginSubmit.disabled = true;
         return;
       }
-      const savedEmail = localStorage.getItem('user_email');
+      const savedEmail = memoryUserEmail;
       if (savedEmail) loginEmail.value = savedEmail;
       setTimeout(() => (savedEmail ? loginPassword : loginEmail).focus(), 50);
     }
@@ -3856,7 +3925,7 @@
       });
     }
 
-    function truncateSku(sku, maxLen = 44) {
+    function truncateSku(sku, maxLen = 40) {
       const s = String(sku || '');
       if (s.length <= maxLen) return s;
       return `${s.slice(0, maxLen - 1)}…`;
@@ -7011,6 +7080,17 @@
     }
 
     (async () => {
+      try {
+        await bootstrapTokenFromAurora();
+      } catch (err) {
+        console.error('[embed] bootstrap failed', err);
+        if (isEmbedded) {
+          showLogin();
+          loginError.textContent =
+            (err && err.message) || 'Aurora embed session failed. Reload AI Assistant from Aurora.';
+          return;
+        }
+      }
       if (!getAuthToken()) {
         showLogin();
       } else {

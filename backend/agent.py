@@ -1160,6 +1160,33 @@ def usd_fba_price_band(price: float) -> str:
     return "gt50"
 
 
+# Same physical size-tier: listing FBA is usually the under-$10 card, and
+# $10–$50 is the published jump (Revenue Calculator). Live Product Fees
+# API is today's quote and can be 10¢ off (Blink $14.86 → API $3.42 vs
+# calculator base $3.32 + fuel $0.12).
+_SIZE_TIER_FBA_LT10_10_50 = (
+    (2.43, 3.32),  # small standard (B0037W5Y2W Blink)
+    (3.38, 4.20),  # standard (UNO / Phase Card)
+)
+
+
+def fba_base_for_sale_band(listing_fba: float, band: str) -> float | None:
+    """US FBA base for ``band`` from this listing's size-tier card.
+
+    Match ``listing_fba`` to either the under-$10 or $10–$50 published
+    base (within 2¢). Returns None when the listing is not a known tier
+    so the caller can keep a live Fees API quote.
+    """
+    listing = round(float(listing_fba or 0), 2)
+    target = str(band or "")
+    if listing <= 0 or target not in {"lt10", "10_50"}:
+        return None
+    for lt10, mid in _SIZE_TIER_FBA_LT10_10_50:
+        if abs(listing - lt10) <= 0.02 or abs(listing - mid) <= 0.02:
+            return float(lt10 if target == "lt10" else mid)
+    return None
+
+
 def referral_price_tier(price: float) -> str:
     """US referral breakpoints that are not the FBA $10 / $50 cuts.
 
@@ -1331,6 +1358,17 @@ def apply_sale_price_fba(
         fuel_u = float(fuel_u or 0)
         if include_fuel:
             return fba_u
+        # Pre-April: live Fees API is today's quote. Prefer the published
+        # size-tier card (calculator $3.32 at $14.86, not API $3.42).
+        inferred = fba_base_for_sale_band(catalog_fba, band)
+        if inferred and inferred > 0:
+            bundled_guess = round(float(fba_u) + fuel_u, 2) if fuel_u else float(fba_u)
+            if (
+                abs(float(fba_u) - inferred) <= 0.20
+                or abs(bundled_guess - round(inferred * 1.035, 2)) <= 0.20
+                or abs(float(fba_u) - round(inferred * 1.035, 2)) <= 0.03
+            ):
+                return inferred
         # Pre-April: a live quote of the *same* size-tier is today's
         # bundle (catalog $5.42 + 3.5% = $5.61). Do not treat that as a
         # new FBA band ($3.32 vs $2.43 is a real $10/$50 jump).
@@ -1597,16 +1635,28 @@ async def fetch_fba_rates_by_sale_price(
                     float(catalog_band[0]), float(catalog_band[1]), 0.0,
                 )
             else:
-                dest[fba_band] = pair
+                pf = pf_all.get(sku) or pf_lower.get(str(sku).lower()) or {}
+                inferred = fba_base_for_sale_band(
+                    float(pf.get("fba_per_unit") or 0), fba_band,
+                )
+                dest[fba_band] = (
+                    (inferred, 0.0, 0.0) if inferred else pair
+                )
             continue
         # Fees API miss: another listing of this ASIN already in that
         # $10/$50 band (under-$10 card vs units sold at $11–$15).
         if listing_fba and fba_band == listing_fba:
             continue
         band_pair = (listing_bands.get(str(asin).upper()) or {}).get(fba_band)
-        if not band_pair:
+        if band_pair:
+            dest[fba_band] = (float(band_pair[0]), float(band_pair[1]), 0.0)
             continue
-        dest[fba_band] = (float(band_pair[0]), float(band_pair[1]), 0.0)
+        pf = pf_all.get(sku) or pf_lower.get(str(sku).lower()) or {}
+        inferred = fba_base_for_sale_band(
+            float(pf.get("fba_per_unit") or 0), fba_band,
+        )
+        if inferred:
+            dest[fba_band] = (inferred, 0.0, 0.0)
     # Every SKU in the window — not only those that queued a live quote.
     for sku, d in (sku_data or {}).items():
         pf = pf_all.get(sku) or pf_lower.get(str(sku).lower()) or {}

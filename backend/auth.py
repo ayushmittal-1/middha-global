@@ -62,6 +62,9 @@ async def _load_user(user_id: Optional[str]) -> dict:
     user = await _db().users.find_one({"_id": oid}, {"password": 0})
     if not user:
         raise HTTPException(status_code=401, detail="Not authorized, user not found")
+    status = user.get("accountStatus")
+    if status and status != "active":
+        raise HTTPException(status_code=403, detail="Account is not active")
     return hydrate_user_tokens(user)
 
 
@@ -80,19 +83,15 @@ async def protect(authorization: Optional[str] = Header(default=None)) -> dict:
 
 
 async def authenticate_ws(websocket: WebSocket) -> tuple[Optional[dict], Optional[str]]:
-    """WebSocket auth. Token resolution order (audit H1):
+    """WebSocket auth. Token resolution order (audit H1 / H-03):
       1. `Authorization: Bearer <jwt>` header  — preferred; not logged.
       2. `Sec-WebSocket-Protocol: bearer, <jwt>` subprotocol — preferred
          for browsers, since the JS WebSocket API can't set arbitrary
          headers but does support subprotocols.
-      3. `?token=<jwt>` query string — DISCOURAGED. Query strings are
-         written to server access logs, reverse-proxy logs, and browser
-         history, so a leaked log file leaks a live session token. Kept
-         for backward compatibility; emits a warning log per use so ops
-         can watch clients migrate off it.
 
-    Returns (user, error_message). On success user is set; on failure
-    it's None and error_message describes which check failed."""
+    Query-string `?token=` is rejected — tokens in URLs end up in access
+    logs, reverse-proxy logs, and browser history.
+    """
     import logging
     _log = logging.getLogger("auth.ws")
 
@@ -110,21 +109,20 @@ async def authenticate_ws(websocket: WebSocket) -> tuple[Optional[dict], Optiona
         if len(parts) >= 2 and parts[0].lower() == "bearer":
             token = parts[1]
             token_source = "subprotocol"
-    if not token:
-        # Query-string fallback (audit H1: discouraged path).
-        token = websocket.query_params.get("token")
-        if token:
-            token_source = "query"
-            _log.warning(
-                "WebSocket auth via query-string token — this ends up in "
-                "access logs. Migrate the client to the Authorization "
-                "header or Sec-WebSocket-Protocol subprotocol."
+    if websocket.query_params.get("token"):
+        _log.warning(
+            "WebSocket auth attempted via query-string token — rejected. "
+            "Use Authorization header or Sec-WebSocket-Protocol (bearer, <jwt>)."
+        )
+        if not token:
+            return None, (
+                "Query-string token auth is disabled. Send Authorization: "
+                "Bearer <jwt> or Sec-WebSocket-Protocol: bearer, <jwt>."
             )
     if not token:
         return None, (
             "No token provided. Send Authorization: Bearer <jwt> or the "
-            "Sec-WebSocket-Protocol subprotocol (query-string fallback "
-            "is deprecated)."
+            "Sec-WebSocket-Protocol subprotocol (bearer, <jwt>)."
         )
     try:
         decoded = _verify_token(token)
@@ -262,6 +260,9 @@ async def authenticate_credentials(email: str, password: str) -> dict:
     except Exception:
         pass
     user.pop("password", None)
+    status = user.get("accountStatus")
+    if status and status != "active":
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     return hydrate_user_tokens(user)
 
 

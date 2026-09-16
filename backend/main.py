@@ -90,6 +90,10 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class AuroraEmbedExchangeRequest(BaseModel):
+    code: str
+
+
 # ── Production-audit hardening (C3, C4, H2, C1 startup check) ────────────
 
 
@@ -103,6 +107,8 @@ PRODUCTION_BASELINE_ORIGINS = (
     "https://middha-global.onrender.com",
     "https://www.auroratest.in",
     "https://auroratest.in",
+    "https://www.aurora-ai.io",
+    "https://aurora-ai.io",
 )
 
 
@@ -305,10 +311,81 @@ async def login(request: Request, body: LoginRequest):
     return {**user, "token": token}
 
 
+@app.post("/api/auth/aurora-embed-exchange")
+@limiter.limit(os.getenv("AURORA_LOGIN_RATE_LIMIT", "5/minute"))
+async def aurora_embed_exchange(request: Request, body: AuroraEmbedExchangeRequest):
+    """Exchange Aurora's one-time iframe embed code for a short-lived JWT.
+
+    The shared secret stays on this server — the browser only ever sees
+    `?code=…`, never a JWT in the URL and never the exchange secret.
+    """
+    import httpx
+
+    code = (body.code or "").strip()
+    if not code or len(code) < 16:
+        raise HTTPException(status_code=400, detail="Invalid or expired embed code")
+
+    aurora_base = (
+        os.getenv("AURORA_BACKEND_URL")
+        or os.getenv("AURORA_API_BASE")
+        or "https://aurorabackend-is4p.onrender.com"
+    ).rstrip("/")
+    exchange_secret = (os.getenv("AI_EMBED_EXCHANGE_SECRET") or "").strip()
+    if not exchange_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="AI_EMBED_EXCHANGE_SECRET is not configured on the AI host",
+        )
+
+    url = f"{aurora_base}/api/auth/ai-embed-exchange"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                url,
+                json={"code": code},
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Aurora-AI-Secret": exchange_secret,
+                },
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Aurora exchange unreachable: {exc}") from exc
+
+    data = {}
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+
+    if resp.status_code != 200 or not data.get("token"):
+        raise HTTPException(
+            status_code=400 if resp.status_code < 500 else 502,
+            detail=data.get("error") or "Invalid or expired embed code",
+        )
+
+    return {
+        "success": True,
+        "token": data["token"],
+        "email": data.get("email"),
+        "expiresIn": data.get("expiresIn"),
+        "userId": data.get("userId"),
+    }
+
+
 @app.websocket("/ws/chat")
 async def ws_chat(websocket: WebSocket):
-    await websocket.accept()
+    # Authenticate from handshake headers/subprotocol before accepting so we
+    # can negotiate Sec-WebSocket-Protocol: bearer (required by browsers when
+    # the client offers subprotocols). Never read tokens from the query string.
     user, auth_error = await authenticate_ws(websocket)
+
+    proto_header = websocket.headers.get("sec-websocket-protocol", "")
+    proto_parts = [p.strip() for p in proto_header.split(",") if p.strip()]
+    accept_kwargs = {}
+    if proto_parts and proto_parts[0].lower() == "bearer":
+        accept_kwargs["subprotocol"] = "bearer"
+
+    await websocket.accept(**accept_kwargs)
     if not user:
         print(f"[ws_chat] auth failed: {auth_error}")
         await websocket.send_json({"type": "error", "content": auth_error or "Not authorized"})
