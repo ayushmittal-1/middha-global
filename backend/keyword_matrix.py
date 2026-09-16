@@ -22,9 +22,9 @@ Given a list of ASINs, this module:
 
 The flow is a job, not a single request. `start_job` kicks off the pipeline
 as a background task and returns a job_id; `get_job` returns the current
-step and any partial results collected so far. Storage is an in-memory
-dict — dies with the process. Fine for now; move to Mongo later if we need
-persistence across restarts.
+step and any partial results collected so far. Jobs live in Mongo, so a
+client can keep polling across a redeploy or a spin-down, and any worker can
+serve a poll for a job another worker is running.
 
 Edge cases (title missing, autocomplete returns nothing, Brand Analytics
 misses a keyword, source has fewer than 15 scorable keywords) are noted in
@@ -38,7 +38,6 @@ import os
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
 
 import httpx
 
@@ -52,16 +51,43 @@ from auth import _db, require_user
 from keywords import fetch_amazon_keywords
 
 # ── Job store ───────────────────────────────────────────────────────────────
-# Single-process, in-memory. Keys: job_id -> job dict. Enough for the
-# dashboard's polling UX; nothing here needs to survive a restart.
-_JOBS: dict[str, dict[str, Any]] = {}
+# Mongo-backed, one doc per job keyed by `_id = job_id`. It used to be a
+# process-local dict, which broke the polling UX in two ways on Render: a
+# redeploy or idle spin-down wiped every in-flight job (the client's next
+# poll 404'd), and with more than one worker the POST that starts a job and
+# the GET that polls it can land on different processes. Mongo makes the job
+# visible to whichever worker serves the poll, and survives the restart.
+_JOBS_COLLECTION = "keywordMatrixJobs"
 
-SOURCES = ("amazon_asin", "meta", "amazon_searchbar", "google")
+# Job docs are disposable — keep a week of history for debugging, then let
+# Mongo's TTL monitor reap them.
+_JOB_TTL_SECONDS = 7 * 24 * 3600
+
+# A running job bumps `updated_at` every `_JOB_HEARTBEAT_SECONDS`. If a poll
+# finds a "running" job whose heartbeat stopped longer ago than
+# `_JOB_STALE_SECONDS`, the worker that owned it died mid-flight and nothing
+# will ever finish it — report that instead of letting the client poll a
+# job that will never move. The gap is deliberately several heartbeats wide
+# so a slow step or a briefly overloaded event loop doesn't trip it.
+_JOB_HEARTBEAT_SECONDS = 30
+_JOB_STALE_SECONDS = 180
+
+_JOB_INDEXES_ENSURED = False
+
+# Strong refs to in-flight pipeline tasks. asyncio only keeps a weak reference
+# to the result of `create_task`, so a job with no other referent can be
+# garbage-collected mid-run — the same disappearing-job symptom from a
+# different cause.
+_RUNNING: set[asyncio.Task] = set()
+
+# Sources the matrix currently exposes. `_source_google_autocomplete` stays
+# built but uncalled — add "google" back here and restore its leg in the
+# `asyncio.gather` below to bring the column back.
+SOURCES = ("amazon_asin", "meta", "amazon_searchbar")
 _SOURCE_LABELS = {
     "amazon_asin": "Amazon (ASIN)",
     "meta": "Meta",
     "amazon_searchbar": "Amazon Searchbar",
-    "google": "Google",
 }
 STEPS = ("sourcing", "brand_analytics", "cpc", "scoring", "done")
 
@@ -69,15 +95,20 @@ STEPS = ("sourcing", "brand_analytics", "cpc", "scoring", "done")
 # ── Public API ──────────────────────────────────────────────────────────────
 
 
-def start_job(
+async def start_job(
     asins: list[str],
     ad_group_id: str | None = None,
     campaign_id: str | None = None,
 ) -> str:
     """Kick off a matrix job and return its id.
 
-    Runs in the background so the endpoint can return immediately. The user's
-    auth ContextVar is copied into the task automatically by asyncio.
+    The job doc is written to Mongo *before* this returns, so the client's
+    first poll always finds it — even if that poll is served by a different
+    worker than the one running the pipeline.
+
+    The pipeline itself runs in the background so the endpoint can return
+    immediately. The user's auth ContextVar is copied into the task
+    automatically by asyncio.
 
     CPC enrichment needs BOTH `ad_group_id` AND `campaign_id` — Amazon's v4
     bid-recommendations endpoint rejects a request that's missing either.
@@ -86,34 +117,140 @@ def start_job(
     asins = [a.strip().upper() for a in asins if a and a.strip()]
     if not asins:
         raise ValueError("At least one ASIN is required.")
+    now = datetime.now(timezone.utc)
     job_id = uuid.uuid4().hex[:12]
-    _JOBS[job_id] = {
+    job = {
         "job_id": job_id,
+        "user_id": _user_key(),
         "status": "running",
         "step": "sourcing",
         "asins": asins,
         "ad_group_id": ad_group_id,
         "campaign_id": campaign_id,
         "ad_group_source": "user" if (ad_group_id and campaign_id) else None,
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": now.isoformat(),
+        "created_at": now,
         "sources": {s: {"keywords": [], "notes": []} for s in SOURCES},
         "titles": {},
         "matrix": None,
         "error": None,
     }
-    asyncio.create_task(_run_job(job_id))
+    await _ensure_job_indexes()
+    # Not wrapped in the tolerant `_save` — if the very first write fails the
+    # job would be unpollable, so surface it as a 500 rather than handing back
+    # an id that will 404 forever.
+    await _jobs_coll().insert_one({**job, "_id": job_id, "updated_at": now})
+    task = asyncio.create_task(_run_job(job))
+    _RUNNING.add(task)
+    task.add_done_callback(_RUNNING.discard)
     return job_id
 
 
-def get_job(job_id: str) -> dict | None:
-    return _JOBS.get(job_id)
+async def get_job(job_id: str) -> dict | None:
+    """Load a job, scoped to the calling user.
+
+    Returns None for both "no such job" and "someone else's job" — the
+    caller turns either into a 404, which is also what we want a probe of a
+    guessed id to see.
+    """
+    await _ensure_job_indexes()
+    job = await _jobs_coll().find_one(
+        {"_id": job_id, "user_id": _user_key()}, {"_id": 0}
+    )
+    if not job:
+        return None
+    return _mark_if_stale(job)
+
+
+# ── Job persistence ─────────────────────────────────────────────────────────
+
+
+def _user_key() -> str:
+    user = require_user()
+    return str(user.get("_id") or user.get("email") or "anon")
+
+
+def _jobs_coll():
+    return _db()[_JOBS_COLLECTION]
+
+
+async def _ensure_job_indexes() -> None:
+    """Create the TTL index once per process."""
+    global _JOB_INDEXES_ENSURED
+    if _JOB_INDEXES_ENSURED:
+        return
+    await _jobs_coll().create_index(
+        "created_at",
+        name="created_at_ttl",
+        expireAfterSeconds=_JOB_TTL_SECONDS,
+        background=True,
+    )
+    _JOB_INDEXES_ENSURED = True
+
+
+async def _save(job: dict) -> None:
+    """Flush the whole job doc. Tolerant by design — a write that fails at a
+    step boundary costs the client some progress detail on its next poll, but
+    must not abort a pipeline that's otherwise running fine."""
+    try:
+        await _jobs_coll().replace_one(
+            {"_id": job["job_id"]},
+            {**job, "_id": job["job_id"], "updated_at": datetime.now(timezone.utc)},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[keyword_matrix] job save failed for {job.get('job_id')}: {e}")
+
+
+async def _heartbeat(job_id: str) -> None:
+    """Bump `updated_at` while the job runs so `_mark_if_stale` can tell a
+    slow step apart from a worker that died. Steps are coarse — a Brand
+    Analytics report download is a single long await — so without this the
+    liveness signal would only refresh at step boundaries."""
+    while True:
+        await asyncio.sleep(_JOB_HEARTBEAT_SECONDS)
+        try:
+            await _jobs_coll().update_one(
+                {"_id": job_id},
+                {"$set": {"updated_at": datetime.now(timezone.utc)}},
+            )
+        except Exception as e:
+            print(f"[keyword_matrix] heartbeat failed for {job_id}: {e}")
+
+
+def _mark_if_stale(job: dict) -> dict:
+    """Turn an abandoned job into a terminal error for the caller.
+
+    Derived, not written back: a genuinely slow job whose heartbeat is merely
+    delayed will keep running on its own worker and report `done` on a later
+    poll. Overwriting the stored status here would throw that result away.
+    """
+    if job.get("status") != "running":
+        return job
+    updated = job.get("updated_at")
+    if not isinstance(updated, datetime):
+        return job
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - updated).total_seconds()
+    if age < _JOB_STALE_SECONDS:
+        return job
+    return {
+        **job,
+        "status": "error",
+        "error": (
+            "The worker running this job stopped responding "
+            f"({int(age // 60)} min since its last update) — most likely a "
+            "server restart or redeploy. Run it again."
+        ),
+    }
 
 
 # ── Orchestrator ────────────────────────────────────────────────────────────
 
 
-async def _run_job(job_id: str) -> None:
-    job = _JOBS[job_id]
+async def _run_job(job: dict) -> None:
+    heart = asyncio.create_task(_heartbeat(job["job_id"]))
     try:
         # Titles are needed by both Meta and Amazon Searchbar sourcing, so
         # resolve them once upfront rather than twice inside those functions.
@@ -122,28 +259,29 @@ async def _run_job(job_id: str) -> None:
 
         # Fan out the sourcing paths concurrently — none of them share
         # state and each hits a different API.
-        asin_res, meta_res, sb_res, google_res = await asyncio.gather(
+        asin_res, meta_res, sb_res = await asyncio.gather(
             _source_amazon_asin(job["asins"]),
             _source_meta(list(job["titles"].values())),
             _source_amazon_searchbar(list(job["titles"].values())),
-            _source_google_autocomplete(list(job["titles"].values())),
             return_exceptions=True,
         )
         for name, res in (
             ("amazon_asin", asin_res),
             ("meta", meta_res),
             ("amazon_searchbar", sb_res),
-            ("google", google_res),
         ):
             if isinstance(res, Exception):
-                job["sources"][name]["notes"].append(f"error: {res}")
+                job["sources"][name]["notes"].append(_redact(f"error: {res}"))
                 job["sources"][name]["keywords"] = []
             else:
                 job["sources"][name]["keywords"] = res["keywords"]
-                job["sources"][name]["notes"].extend(res.get("notes", []))
+                job["sources"][name]["notes"].extend(
+                    _redact(n) for n in res.get("notes", [])
+                )
 
         job["step"] = "brand_analytics"
-        user_key = _ba_user_key()
+        await _save(job)
+        user_key = _user_key()
         ba_week = await _ensure_ba_week(user_key)
         # Union all sourced keywords into a single Mongo $in lookup so we hit
         # the database once regardless of how many sources produced keywords.
@@ -171,6 +309,7 @@ async def _run_job(job_id: str) -> None:
             src["ba_coverage"] = coverage
 
         job["step"] = "cpc"
+        await _save(job)
         ad_group_id = job.get("ad_group_id")
         campaign_id = job.get("campaign_id")
         # Auto-discover an ad group when the caller didn't supply one. One call
@@ -209,6 +348,7 @@ async def _run_job(job_id: str) -> None:
                 )
 
         job["step"] = "scoring"
+        await _save(job)
         for source in SOURCES:
             src = job["sources"][source]
             src["scored"] = _score(src["enriched"])
@@ -219,8 +359,14 @@ async def _run_job(job_id: str) -> None:
         job["finished_at"] = datetime.now(timezone.utc).isoformat()
     except Exception as e:
         job["status"] = "error"
-        job["error"] = str(e)
+        job["error"] = _redact(e)
         job["finished_at"] = datetime.now(timezone.utc).isoformat()
+    finally:
+        # Stop the heartbeat before the final flush, so a terminal status can
+        # never be followed by a liveness bump that makes a finished job look
+        # like it is still running.
+        heart.cancel()
+        await _save(job)
 
 
 # ── Title resolution (SP-API catalog) ───────────────────────────────────────
@@ -302,13 +448,155 @@ async def _source_amazon_asin(asins: list[str]) -> dict:
 
 _META_GRAPH_URL = "https://graph.facebook.com/v19.0/search"
 
+# Query-string credentials, for scrubbing text that is headed into a job note.
+_SECRET_QS_RE = re.compile(
+    r"((?:access_token|client_secret|refresh_token|api_key)=)[^&\s'\"]+",
+    re.IGNORECASE,
+)
+
+# Env vars whose *values* must never appear in a note, even outside a URL.
+_SECRET_ENV_VARS = (
+    "META_ACCESS_TOKEN",
+    "ADS_LWA_CLIENT_SECRET",
+    "LWA_CLIENT_SECRET",
+    "JWT_SECRET",
+    "MONGO_URI",
+)
+
+
+def _redact(text: object) -> str:
+    """Strip credentials from text before it becomes a job note.
+
+    Notes are persisted to Mongo and rendered in the keyword tab, so anything
+    that reaches one is visible to everyone who can open the page. httpx puts
+    the full request URL into its error messages, which is exactly how a live
+    Meta access token ended up stored in a job doc and displayed in the UI.
+
+    Callers should also keep secrets out of URLs in the first place (see
+    `_source_meta`, which sends its token as an Authorization header). This is
+    the backstop for everything that still slips through.
+    """
+    out = _SECRET_QS_RE.sub(r"\1<redacted>", str(text))
+    for var in _SECRET_ENV_VARS:
+        val = (os.getenv(var) or "").strip()
+        # Short values would match far too much; a real credential is long.
+        if len(val) >= 8:
+            out = out.replace(val, "<redacted>")
+    return out
+
+
+# Title tokens that are never a useful Meta seed: marketing adjectives,
+# packaging/unit nouns, and filler. Measured against the live API — these
+# either return nothing or return interests about something else entirely
+# ("sticks" -> Mozzarella sticks, "box" -> Xbox).
+_META_STOPWORDS = {
+    "and", "assorted", "best", "box", "boxes", "combo", "count", "for",
+    "fragrance", "free", "hand", "include", "including", "kit", "large",
+    "made", "medium", "mesmerizing", "natural", "new", "organic", "original",
+    "pack", "packs", "piece", "pieces", "premium", "pure", "quality",
+    "rolled", "scented", "set", "sets", "size", "small", "stick", "sticks",
+    "the", "value", "variety", "with",
+}
+
+# Meta tags each interest with a `topic`. These ones are about films, bands,
+# athletes and celebrities that merely share a word with a product term —
+# "steel" pulls Real Steel and Danielle Steel, "bottle" pulls Message in a
+# Bottle. No ecommerce keyword set wants them.
+# Note "None" is NOT blockable: the single most relevant interest we get
+# ("Incense") is itself untagged, so dropping untagged entries would throw the
+# good result away along with the noise.
+_META_BLOCKED_TOPICS = {
+    "news and entertainment",   # Dragon Ball Z, True Blood, Real Steel
+    "sports and outdoors",      # Pittsburgh Steelers
+    "people",                   # G-Dragon, Little Dragon
+    "travel, places and events",  # Dragon Con, Lightning in a Bottle
+}
+
+_META_TOKEN_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
+_META_HAS_DIGIT_RE = re.compile(r"\d")
+
+# Meta returns at most a handful of usable interests per product; this caps
+# the request count per title so a long title can't fan out unboundedly.
+_META_MAX_SEEDS_PER_TITLE = 8
+
+
+def _meta_seeds(title: str) -> list[str]:
+    """Single-word Meta seeds derived from a product title.
+
+    Meta's ad-interest search only matches its own interest taxonomy, and
+    measurement against the live API shows multi-word queries essentially
+    never hit: the full title, every `_seed_candidates` fragment and every
+    adjacent word pair all returned zero interests, while single words
+    returned results. So this deliberately does NOT reuse `_seed_candidates`
+    (which is tuned for Amazon autocomplete and only emits 2+ word seeds).
+
+    Tokens are dropped when they are short, numeric ("6x20", "15g"), or
+    marketing/packaging filler — each of those matches wildly unrelated
+    interests. The leading token goes too: Amazon titles start with the brand,
+    and a brand token pulls in interests about unrelated famous people
+    ("Satya" -> Satya Nadella, Microsoft). That does mean a genuinely
+    targetable brand interest is missed for big-name brands; worth revisiting
+    if this ever runs over a catalogue where that matters.
+    """
+    words = _META_TOKEN_SPLIT_RE.split(title or "")
+    seeds: list[str] = []
+    for raw in words[1:]:  # skip the brand
+        w = raw.strip().lower()
+        if (
+            len(w) < 4
+            or w in _META_STOPWORDS
+            or _META_HAS_DIGIT_RE.search(w)
+            or w in seeds
+        ):
+            continue
+        seeds.append(w)
+        if len(seeds) >= _META_MAX_SEEDS_PER_TITLE:
+            break
+    return seeds
+
+
+def _meta_error_summary(exc: Exception) -> tuple[str, str]:
+    """Return (dedupe_key, human_detail) for a failed Meta call.
+
+    The key deliberately holds only the status or exception type. Meta embeds
+    a live clock in some messages ("The current time is ... 04:11:38"), so
+    keying on the full text would put two otherwise-identical failures a
+    second apart into separate buckets and defeat the collapsing.
+
+    The detail prefers Meta's own error body ("Session has expired on ...")
+    over httpx's generic message, since that is what tells you what to do
+    about it, and unlike httpx's message it carries no request URL.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        detail = ""
+        try:
+            detail = ((resp.json() or {}).get("error", {}) or {}).get("message") or ""
+        except Exception:
+            detail = ""
+        return f"HTTP {resp.status_code}", detail or f"HTTP {resp.status_code}"
+    return type(exc).__name__, f"{type(exc).__name__}: {exc}"
+
+
+def _meta_interest_matches_seed(seed: str, name: str) -> bool:
+    """True when the interest name contains the seed as a whole word.
+
+    Meta matches on substrings, so a bare seed pulls in unrelated interests
+    that merely share a prefix — "hand" -> Handball, "box" -> Boxing,
+    "champa" -> Champagne, "nag" -> Nagasaki. Requiring a whole-word hit
+    removed 27 of 30 such results for one test title while keeping every
+    genuinely relevant one.
+    """
+    return seed in _META_TOKEN_SPLIT_RE.split(name.lower())
+
 
 async def _source_meta(titles: list[str]) -> dict:
     """Ad-interest suggestions seeded by each ASIN's product title.
 
-    TODO: fill META_ACCESS_TOKEN. Until then this returns an empty set with a
-    note so the pipeline can still complete and the UI can show the empty
-    column with an explanation.
+    Seeds are single words (see `_meta_seeds`) and results are filtered to
+    interests that actually contain the seed as a word. Meta's taxonomy is
+    genuinely sparse for niche products, so a small, relevant set here is the
+    expected outcome rather than a failure.
     """
     token = os.getenv("META_ACCESS_TOKEN", "").strip()
     if not token:
@@ -319,32 +607,79 @@ async def _source_meta(titles: list[str]) -> dict:
     seen: set[str] = set()
     keywords: list[str] = []
     notes: list[str] = []
+    queried: set[str] = set()
+    failures: dict[str, list] = {}  # key -> [count, first detail seen]
+    ok_queries = 0
+    dropped = 0
     async with httpx.AsyncClient(timeout=15) as client:
         for title in titles:
             if not title:
                 notes.append("empty title — skipped Meta lookup for one ASIN")
                 continue
-            query = title.split(",")[0].strip()[:100]
-            try:
-                resp = await client.get(
-                    _META_GRAPH_URL,
-                    params={
-                        "type": "adinterest",
-                        "q": query,
-                        "limit": 25,
-                        "access_token": token,
-                    },
+            seeds = _meta_seeds(title)
+            if not seeds:
+                notes.append(
+                    f"no usable Meta seed in title '{title[:40]}' — "
+                    "all tokens were brand, filler or numeric"
                 )
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as e:
-                notes.append(f"meta lookup failed for '{query}': {e}")
                 continue
-            for item in data.get("data", []):
-                name = (item.get("name") or "").strip().lower()
-                if name and name not in seen:
-                    seen.add(name)
-                    keywords.append(name)
+            for seed in seeds:
+                # Titles in one job often share tokens; only ask once.
+                if seed in queried:
+                    continue
+                queried.add(seed)
+                try:
+                    # Token goes in the Authorization header, NOT the query
+                    # string: httpx echoes the full URL in its error messages,
+                    # and those messages land in notes that are stored in
+                    # Mongo and rendered in the UI.
+                    resp = await client.get(
+                        _META_GRAPH_URL,
+                        params={
+                            "type": "adinterest",
+                            "q": seed,
+                            "limit": 25,
+                        },
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                except Exception as e:
+                    key, detail = _meta_error_summary(e)
+                    slot = failures.setdefault(key, [0, _redact(detail)])
+                    slot[0] += 1
+                    continue
+                ok_queries += 1
+                for item in data.get("data", []):
+                    name = (item.get("name") or "").strip()
+                    if not name:
+                        continue
+                    if not _meta_interest_matches_seed(seed, name):
+                        dropped += 1
+                        continue
+                    topic = (item.get("topic") or "").strip().lower()
+                    if topic in _META_BLOCKED_TOPICS:
+                        dropped += 1
+                        continue
+                    lowered = name.lower()
+                    if lowered not in seen:
+                        seen.add(lowered)
+                        keywords.append(lowered)
+    for _key, (count, detail) in sorted(failures.items(), key=lambda kv: -kv[1][0]):
+        seed_word = "seed" if count == 1 else "seeds"
+        notes.append(f"Meta lookup failed for {count} {seed_word} — {detail}")
+    if ok_queries and not keywords:
+        # Only a claim we can support: every query that actually reached Meta
+        # came back with nothing usable. If the calls errored we know nothing
+        # about the taxonomy, so this must not fire on a pure auth failure.
+        notes.append(
+            f"Meta returned no interests matching {sorted(queried)} — "
+            "its taxonomy has no entry for this product"
+        )
+    elif dropped:
+        notes.append(
+            f"{dropped} Meta interest(s) dropped as unrelated to the seed word"
+        )
     return {"keywords": keywords, "notes": notes}
 
 
@@ -457,7 +792,27 @@ async def _source_google_autocomplete(titles: list[str]) -> dict:
 # ── Brand Analytics enrichment ──────────────────────────────────────────────
 
 
-_BA_MAX_WEEKS_BACK = 3
+# How far back `_ensure_ba_week` will walk looking for a usable BA week.
+#
+# Was 3, which meant any account whose newest cached week was older than that
+# fell through to `fetch_brand_analytics_search_terms` on every single job.
+# That call holds the whole weekly report in memory twice — once as the raw
+# response string, once as the parsed list — which OOM-kills a 512 MB Render
+# instance roughly 30s in, taking the job and the web process down with it
+# (the client sees a 502 mid-poll).
+#
+# The walk is newest-first and returns on the first cache HIT, so a wider
+# window never picks an older week than a narrower one would have; it only
+# changes what happens when nothing recent is cached — reach further back for
+# a week we already have, instead of attempting a download that cannot
+# currently succeed. Stale-but-present beats crashing: `_score` ranks
+# keywords relatively within a source pool, so an older demand snapshot still
+# produces a sensible ordering.
+#
+# This is a stopgap. The real fix is streaming the report into Mongo so peak
+# memory stops scaling with report size; until then no BA week can be
+# imported on this instance at all.
+_BA_MAX_WEEKS_BACK = 26
 
 # BA data is cached in Mongo as ONE DOC PER TERM in the `brand_analytics_terms`
 # collection. Doc shape:
@@ -480,11 +835,6 @@ _BA_WRITE_BATCH = 5000
 # waits on the same fetch instead of triggering a duplicate 500 MB download.
 _BA_LOCKS: dict[str, asyncio.Lock] = {}
 _BA_INDEXES_ENSURED = False
-
-
-def _ba_user_key() -> str:
-    user = require_user()
-    return str(user.get("_id") or user.get("email") or "anon")
 
 
 def _ba_coll():

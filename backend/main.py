@@ -90,6 +90,10 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class AuroraEmbedExchangeRequest(BaseModel):
+    code: str
+
+
 # ── Production-audit hardening (C3, C4, H2, C1 startup check) ────────────
 
 
@@ -307,10 +311,81 @@ async def login(request: Request, body: LoginRequest):
     return {**user, "token": token}
 
 
+@app.post("/api/auth/aurora-embed-exchange")
+@limiter.limit(os.getenv("AURORA_LOGIN_RATE_LIMIT", "5/minute"))
+async def aurora_embed_exchange(request: Request, body: AuroraEmbedExchangeRequest):
+    """Exchange Aurora's one-time iframe embed code for a short-lived JWT.
+
+    The shared secret stays on this server — the browser only ever sees
+    `?code=…`, never a JWT in the URL and never the exchange secret.
+    """
+    import httpx
+
+    code = (body.code or "").strip()
+    if not code or len(code) < 16:
+        raise HTTPException(status_code=400, detail="Invalid or expired embed code")
+
+    aurora_base = (
+        os.getenv("AURORA_BACKEND_URL")
+        or os.getenv("AURORA_API_BASE")
+        or "https://aurorabackend-is4p.onrender.com"
+    ).rstrip("/")
+    exchange_secret = (os.getenv("AI_EMBED_EXCHANGE_SECRET") or "").strip()
+    if not exchange_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="AI_EMBED_EXCHANGE_SECRET is not configured on the AI host",
+        )
+
+    url = f"{aurora_base}/api/auth/ai-embed-exchange"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                url,
+                json={"code": code},
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Aurora-AI-Secret": exchange_secret,
+                },
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Aurora exchange unreachable: {exc}") from exc
+
+    data = {}
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+
+    if resp.status_code != 200 or not data.get("token"):
+        raise HTTPException(
+            status_code=400 if resp.status_code < 500 else 502,
+            detail=data.get("error") or "Invalid or expired embed code",
+        )
+
+    return {
+        "success": True,
+        "token": data["token"],
+        "email": data.get("email"),
+        "expiresIn": data.get("expiresIn"),
+        "userId": data.get("userId"),
+    }
+
+
 @app.websocket("/ws/chat")
 async def ws_chat(websocket: WebSocket):
-    await websocket.accept()
+    # Authenticate from handshake headers/subprotocol before accepting so we
+    # can negotiate Sec-WebSocket-Protocol: bearer (required by browsers when
+    # the client offers subprotocols). Never read tokens from the query string.
     user, auth_error = await authenticate_ws(websocket)
+
+    proto_header = websocket.headers.get("sec-websocket-protocol", "")
+    proto_parts = [p.strip() for p in proto_header.split(",") if p.strip()]
+    accept_kwargs = {}
+    if proto_parts and proto_parts[0].lower() == "bearer":
+        accept_kwargs["subprotocol"] = "bearer"
+
+    await websocket.accept(**accept_kwargs)
     if not user:
         print(f"[ws_chat] auth failed: {auth_error}")
         await websocket.send_json({"type": "error", "content": auth_error or "Not authorized"})
@@ -2229,7 +2304,7 @@ async def start_keyword_matrix(
     user: dict = Depends(protect),
 ):
     try:
-        job_id = keyword_matrix.start_job(
+        job_id = await keyword_matrix.start_job(
             asins=request.asins,
             ad_group_id=request.ad_group_id,
             campaign_id=request.campaign_id,
@@ -2263,14 +2338,16 @@ async def meta_interests(q: str, limit: int = 25, user: dict = Depends(protect))
         raise HTTPException(status_code=400, detail="q required")
     limit = max(1, min(int(limit), 100))
     async with _httpx.AsyncClient(timeout=15) as client:
+        # Authorization header, not a query param — keeps the token out of
+        # URLs that get echoed into exception messages, logs and proxies.
         resp = await client.get(
             "https://graph.facebook.com/v19.0/search",
             params={
                 "type": "adinterest",
                 "q": query[:100],
                 "limit": limit,
-                "access_token": token,
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
     if resp.is_error:
         raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
@@ -2294,7 +2371,7 @@ async def meta_interests(q: str, limit: int = 25, user: dict = Depends(protect))
 
 @app.get("/keyword-matrix/{job_id}")
 async def get_keyword_matrix(job_id: str, user: dict = Depends(protect)):
-    job = keyword_matrix.get_job(job_id)
+    job = await keyword_matrix.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     return job

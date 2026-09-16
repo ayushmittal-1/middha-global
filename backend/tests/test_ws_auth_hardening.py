@@ -1,9 +1,8 @@
-"""WebSocket auth token resolution — audit H1.
+"""WebSocket auth token resolution — audit H1 / H-03.
 
-Pre-fix, tokens were read from `websocket.query_params` first, which
-means every WS connection ended up with the live JWT in server access
-logs and browser history. Post-fix, header + subprotocol are preferred
-and the query fallback logs a warning."""
+Tokens must not be read from `websocket.query_params` (access logs /
+browser history). Header + Sec-WebSocket-Protocol are the only accepted
+sources; query-string attempts are rejected."""
 
 import os
 
@@ -75,15 +74,14 @@ async def test_subprotocol_bearer_is_accepted():
 
 
 @pytest.mark.asyncio
-async def test_query_string_still_works_as_deprecated_fallback(caplog):
+async def test_query_string_token_is_rejected(caplog):
     token = _valid_jwt()
     ws = _FakeWebSocket(query_params={"token": token})
     with caplog.at_level("WARNING", logger="auth.ws"):
-        with patch("auth._load_user", return_value={"_id": "u", "email": "x@y"}):
-            user, err = await auth.authenticate_ws(ws)
-    assert err is None
-    assert user["_token_source"] == "query"
-    # Deprecation warning must be logged so ops can watch clients migrate off.
+        user, err = await auth.authenticate_ws(ws)
+    assert user is None
+    assert err is not None
+    assert "query-string" in err.lower() or "Query-string" in err
     assert any("query-string" in rec.message for rec in caplog.records)
 
 

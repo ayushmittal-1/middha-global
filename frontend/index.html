@@ -512,28 +512,30 @@
     }
     table.restock {
       width: 100%;
+      min-width: 0;
       table-layout: fixed;
       border-collapse: separate;
       border-spacing: 0;
-      font-size: 11px;
-      min-width: 0;
+      font-size: 12px;
     }
     table.restock thead th {
       background: #f1f5f9;
       color: #334155;
       text-align: left;
-      padding: 6px 4px;
+      padding: 8px 5px;
       font-weight: 600;
-      font-size: 9px;
-      text-transform: uppercase;
-      letter-spacing: 0.02em;
+      font-size: 11px;
+      text-transform: none;
+      letter-spacing: 0;
       border-bottom: 2px solid #e2e8f0;
       position: sticky;
       top: 0;
       z-index: 2;
       white-space: normal;
-      line-height: 1.2;
-      word-break: break-word;
+      line-height: 1.25;
+      overflow-wrap: normal;
+      word-break: normal;
+      hyphens: none;
     }
     table.restock thead th:first-child {
       left: 0;
@@ -551,23 +553,24 @@
        so the total number remains the eye-catcher when scanning. */
     .reserved-brk {
       display: block;
-      font-size: 9px;
+      font-size: 10px;
       color: #6b7280;
       margin-left: 0;
       white-space: nowrap;
     }
     table.restock td {
-      padding: 5px 4px;
+      padding: 7px 5px;
       color: #0f172a;
       vertical-align: middle;
-      line-height: 1.25;
+      line-height: 1.3;
       overflow: hidden;
       text-overflow: ellipsis;
+      white-space: nowrap;
     }
     table.restock td.sku-cell {
       width: 11%;
-      max-width: none;
       min-width: 0;
+      max-width: none;
       position: sticky;
       left: 0;
       z-index: 1;
@@ -590,7 +593,7 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       color: #1e293b;
       white-space: nowrap;
-      font-size: 10px;
+      font-size: 12px;
     }
     table.restock .num-strong {
       font-weight: 700;
@@ -614,9 +617,9 @@
     }
     .urgency-pill {
       display: inline-block;
-      padding: 2px 5px;
+      padding: 2px 6px;
       border-radius: 999px;
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 600;
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
@@ -632,9 +635,9 @@
        sellers see the same green/amber/red at a glance across views. */
     .best-model-cell {
       display: inline-block;
-      padding: 1px 4px;
+      padding: 2px 6px;
       border-radius: 6px;
-      font-size: 10px;
+      font-size: 11px;
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }
@@ -1123,6 +1126,154 @@
       background: rgba(30, 139, 255, 0.12);
       outline-color: #1e8bff;
     }
+
+    /* Restock column manager — same panel/drag affordances as Profitability. */
+    #restock-columns-wrap {
+      position: relative;
+      flex: 0 0 auto;
+      z-index: 50;
+    }
+    #restock-toolbar #restock-columns-btn {
+      background: #f1f5f9;
+      color: #0f172a;
+      border: 1px solid #cbd5e1;
+    }
+    #restock-columns-panel {
+      display: none;
+      position: absolute;
+      right: 0;
+      left: auto;
+      top: calc(100% + 6px);
+      z-index: 60;
+      width: 300px;
+      min-width: 260px;
+      max-height: min(420px, 70vh);
+      overflow-x: hidden;
+      overflow-y: auto;
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      box-shadow: 0 12px 32px rgba(15, 23, 42, 0.14);
+      padding: 10px;
+      box-sizing: border-box;
+      text-align: left;
+    }
+    #restock-columns-panel.open { display: block; }
+    #restock-columns-panel .profit-col-panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #0f172a;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    #restock-columns-panel .profit-col-reset {
+      padding: 4px 8px !important;
+      font-size: 11px !important;
+      background: transparent !important;
+      color: #1e8bff !important;
+      border: none !important;
+      border-radius: 4px !important;
+      cursor: pointer;
+      box-shadow: none !important;
+    }
+    #restock-columns-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    #restock-columns-list li {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      cursor: grab;
+      font-size: 12px;
+      color: #0f172a;
+      user-select: none;
+      box-sizing: border-box;
+    }
+    #restock-columns-list li.dragging { opacity: 0.55; cursor: grabbing; }
+    #restock-columns-list li.drag-over {
+      outline: 1px dashed #93c5fd;
+      background: #eff6ff;
+    }
+    #restock-columns-list .profit-col-handle {
+      color: #94a3b8;
+      font-size: 14px;
+      line-height: 1;
+      cursor: grab;
+      flex: 0 0 auto;
+    }
+    #restock-columns-list label {
+      display: flex !important;
+      flex-direction: row !important;
+      align-items: center;
+      gap: 8px !important;
+      flex: 1 1 auto;
+      min-width: 0;
+      margin: 0;
+      cursor: pointer;
+      text-transform: none !important;
+      letter-spacing: 0 !important;
+      font-size: 12px !important;
+      font-weight: 500;
+      color: inherit !important;
+    }
+    #restock-columns-list label span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #restock-columns-list input[type="checkbox"] {
+      width: 14px !important;
+      min-width: 14px !important;
+      height: 14px !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      flex: 0 0 auto;
+      accent-color: #1e8bff;
+      border: none !important;
+      border-radius: 2px !important;
+      background: transparent !important;
+      box-shadow: none !important;
+    }
+    #restock-table-wrap thead th[draggable="true"] { cursor: grab; }
+    #restock-table-wrap thead th.profit-th-dragging { opacity: 0.5; }
+    #restock-table-wrap thead th.profit-th-drag-over {
+      box-shadow: inset 3px 0 0 #1e8bff;
+    }
+    body.embedded-in-aurora #restock-toolbar #restock-columns-btn {
+      background: #1e293b;
+      color: #e2e8f0;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
+    body.embedded-in-aurora #restock-columns-panel {
+      background: #1e293b;
+      border-color: rgba(255, 255, 255, 0.12);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+    }
+    body.embedded-in-aurora #restock-columns-panel .profit-col-panel-head { color: #f8fafc; }
+    body.embedded-in-aurora #restock-columns-list li {
+      background: #0f172a;
+      border-color: rgba(255, 255, 255, 0.1);
+      color: #e2e8f0;
+    }
+    body.embedded-in-aurora #restock-columns-list li.drag-over {
+      background: rgba(30, 139, 255, 0.12);
+      outline-color: #1e8bff;
+    }
     #profit-table-wrap tfoot .profit-totals-label {
       font-weight: 700;
       color: #0f172a;
@@ -1395,6 +1546,9 @@
       min-height: 100%;
       background: #0f172a;
       color: #e2e8f0;
+    }
+    body:not(.ai-show-sidebar) #sidebar {
+      display: none;
     }
     body.embedded-in-aurora #sidebar {
       width: 240px;
@@ -2020,6 +2174,16 @@
         </label>
         -->
 
+        <div id="restock-columns-wrap">
+          <button type="button" id="restock-columns-btn" class="secondary" title="Show, hide, and reorder columns">Columns</button>
+          <div id="restock-columns-panel" role="dialog" aria-label="Restock columns">
+            <div class="profit-col-panel-head">
+              <span>Columns</span>
+              <button type="button" class="profit-col-reset" id="restock-columns-reset">Reset</button>
+            </div>
+            <ul id="restock-columns-list"></ul>
+          </div>
+        </div>
         <button id="restock-settings-toggle" class="secondary">Settings</button>
         <button id="restock-refresh">Refresh forecasts</button>
         <button id="restock-q4-fleet" class="secondary" title="Train every model with data ≤ Sep 30 last year and score against actual Q4 sales. Populates the Q4 accuracy column for every SKU. ~1-3 min (or ~15-25 min with DEEPTS_ENABLED=1).">Test all on Q4</button>
@@ -2057,37 +2221,9 @@
       <div id="restock-table-wrap">
         <table class="restock">
           <thead>
-            <tr>
-              <th>SKU</th>
-              <th title="Amazon Standard Identification Number">ASIN</th>
-              <th title="Fulfillment Network SKU — Amazon's internal barcode ID for FBA units">FNSKU</th>
-              <th class="num" title="Seller Central On-hand (FBA) = Available + FC Transfer (pendingTransshipment). Reserved / Unfulfillable / Inbound are separate columns.">On hand</th>
-              <th class="num" title="Units set aside by Amazon — not sellable right now.&#10;&#10;Bifurcation shown as 'total (cust + fc)':&#10;  cust = pendingCustomerOrder → allocated to open orders that haven't shipped yet&#10;  fc   = fcProcessing → at an FC being moved/inspected&#10;&#10;(pendingTransshipment / units in transit between FCs is counted in On hand, not here.)">Reserved</th>
-              <th class="num" title="Units Amazon has received into the network but not yet checked into the destination FC (inboundShippedQuantity)">Sent</th>
-              <th class="num" title="Units on an inbound shipment plan you've created but not yet shipped (inboundWorkingQuantity)">Inbound</th>
-              <th class="num" title="Units physically at Amazon but currently in transit between fulfillment centers (pendingTransshipment). Not sellable during the transfer but included in days-of-cover since they usually return to sellable within days.">FC xfer</th>
-              <th class="num" title="Units on in-flight shipments to Amazon Warehousing & Distribution (AWD bulk storage). Not sellable until replenished to FBA — excluded from days-of-cover math.">AWD</th>
-              <th class="num" title="Damaged or customer-returned units currently unsellable">Unfulf.</th>
-              <th title="Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock">Next in</th>
-              <th class="num" title="Weighted sales velocity across the 3/7/30/60/180-day windows (out-of-stock days excluded). Default weights are recent-biased (0.4×v3d + 0.3×v7d + 0.2×v30d + 0.1×v60d + 0×v180d); override per-SKU in Actions → Forecast tab.">Velocity</th>
-              <th title="Winning forecast model (from the nightly picker's 30-day holdout backtest) and its accuracy_pct. Any of prophet / naive / lgbm / xgb / ensemble / deepar / tft may win depending on the SKU's demand pattern.">Model</th>
-              <th title="Q4 accuracy — how accurate the best model/config would have been for last Q4 (Oct-Dec). Populated after clicking 'Test on Q4' in the drawer, or from a fleet Q4 backtest run.">Q4</th>
-              <th class="num" title="Average units sold per day over the selected window (units sold ÷ window size; Aurora orders, cancelled/pending excluded)"><span id="restock-orders-header">Ord/d</span></th>
-              <th class="num" title="30-day unit forecast">30d fcst</th>
-              <th class="num" title="Predicted units sold over the next N days — sum of the winning model's daily p50 forecast. Set N with the &quot;Future sales (days)&quot; box in the toolbar."><span id="restock-future-header">Future sales</span></th>
-              <th title="Days of cover remaining">Cover</th>
-              <th class="num" title="Amazon's own metric: ratio of avg. daily sellable on-hand inventory to avg. daily shipped units (max of 30d and 90d ratios). Low-inventory-level fee doesn't apply when HDOS > 28. Source: FBA Inventory Planning report.">HDOS</th>
-              <th title="Projected stockout date given on-hand + inbound shipments − daily demand">Stockout</th>
-              <th title="Latest date to dispatch a shipment via air freight (~10d transit to Amazon FC)">Air</th>
-              <th title="Latest date to dispatch a shipment via ocean freight (~45d transit to Amazon FC)">Ocean</th>
-              <th class="num" title="Days until you need to dispatch by air (delta from today to Ship by Air). Negative = you're late.">Days to PO</th>
-              <th class="num" title="Suggested restock quantity">Suggest</th>
-              <th class="num" title="Units on your open purchase orders that haven't arrived at your warehouse / prep center yet">Ordered</th>
-              <th class="num" title="(Available to sell + Reserved + Sent to FBA + Inbound working) × landed cost from your COGS">Value</th>
-              <th class="num" title="Rough estimate of profit lost during stockout days over the last 90d, using ~25% margin on landed cost">Missed $</th>
-              <th title="Free-text notes for this SKU (set via the Actions menu)">Note</th>
-              <th title="Per-SKU manufacturing / forecast / packing / supplier settings">⋯</th>
-            </tr>
+            <!-- Header cells are rendered from RESTOCK_COLUMNS so the
+                 Columns panel can show/hide/reorder them. -->
+            <tr id="restock-head-row"></tr>
           </thead>
           <tbody id="restock-body"></tbody>
         </table>
@@ -2440,40 +2576,85 @@
     // ── Auth ───────────────────────────────────────────
     // Login is handled by THIS backend's POST /api/auth/login — same origin,
     // so no CORS. It verifies the password against the shared Mongo users
-    // collection and issues a JWT signed with Aurora's JWT_SECRET, so the
-    // resulting token works against Aurora as well.
+    // collection and issues a JWT signed with Aurora's JWT_SECRET.
     //
-    // When embedded in Aurora (`?token=<jwt>&embedded=1`), we accept the
-    // parent app's session and skip the login overlay.
+    // When embedded in Aurora (`?code=<one-time>&embedded=1`), we exchange
+    // the code via this backend (server-side secret) — never accept JWTs
+    // from the query string.
+    //
+    // Auth tokens stay in memory only (never localStorage/sessionStorage)
+    // and WebSocket auth uses Sec-WebSocket-Protocol — never ?token=.
     const urlParams = new URLSearchParams(location.search);
     const isEmbedded = urlParams.get('embedded') === '1' || window.self !== window.top;
 
-    function bootstrapTokenFromAurora() {
-      const tokenFromQuery = (urlParams.get('token') || '').trim();
-      if (tokenFromQuery) {
-        localStorage.setItem('auth_token', tokenFromQuery);
-        const emailFromQuery = (urlParams.get('email') || '').trim();
-        if (emailFromQuery) localStorage.setItem('user_email', emailFromQuery);
-        // Strip secrets from the address bar while keeping embedded mode.
-        const clean = new URL(location.href);
-        clean.searchParams.delete('token');
-        clean.searchParams.delete('email');
-        if (isEmbedded) clean.searchParams.set('embedded', '1');
-        history.replaceState({}, '', clean.pathname + clean.search + clean.hash);
-      }
+    let memoryAuthToken = '';
+    let memoryUserEmail = '';
+
+    function clearLegacyAuthStorage() {
+      try {
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('user_email');
+      } catch (_) {}
     }
-    bootstrapTokenFromAurora();
+
+    function setAuthSession(token, email) {
+      memoryAuthToken = String(token || '').trim();
+      if (email != null && String(email).trim()) {
+        memoryUserEmail = String(email).trim();
+      }
+      clearLegacyAuthStorage();
+    }
+
+    function clearAuthSession() {
+      memoryAuthToken = '';
+      memoryUserEmail = '';
+      clearLegacyAuthStorage();
+    }
+
+    function stripEmbedSecretsFromUrl() {
+      const clean = new URL(location.href);
+      clean.searchParams.delete('token');
+      clean.searchParams.delete('email');
+      clean.searchParams.delete('code');
+      if (isEmbedded) clean.searchParams.set('embedded', '1');
+      history.replaceState({}, '', clean.pathname + clean.search + clean.hash);
+    }
+
+    async function bootstrapTokenFromAurora() {
+      clearLegacyAuthStorage();
+      const codeFromQuery = (urlParams.get('code') || '').trim();
+      // Reject legacy JWT-in-URL immediately (security).
+      if ((urlParams.get('token') || '').trim()) {
+        stripEmbedSecretsFromUrl();
+      }
+      if (!codeFromQuery) {
+        stripEmbedSecretsFromUrl();
+        return;
+      }
+
+      stripEmbedSecretsFromUrl();
+
+      const res = await fetch('/api/auth/aurora-embed-exchange', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ code: codeFromQuery }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.token) {
+        throw new Error(data.error || `Embed exchange failed (${res.status})`);
+      }
+      setAuthSession(data.token, data.email || '');
+    }
 
     function getAuthToken() {
-      return (localStorage.getItem('auth_token') || '').trim();
+      return memoryAuthToken;
     }
     function authHeaders(extra = {}) {
       const t = getAuthToken();
       return t ? { ...extra, Authorization: `Bearer ${t}` } : extra;
     }
     function logout() {
-      localStorage.removeItem('auth_token');
-      localStorage.removeItem('user_email');
+      clearAuthSession();
       localStorage.removeItem('session_id');
       if (ws) { try { ws.close(); } catch (_) {} ws = null; }
       if (isEmbedded) {
@@ -2500,8 +2681,7 @@
       if (!data.token) {
         throw new Error('Login response had no token');
       }
-      localStorage.setItem('auth_token', data.token);
-      if (data.email) localStorage.setItem('user_email', data.email);
+      setAuthSession(data.token, data.email || email);
       return data;
     }
 
@@ -2514,7 +2694,8 @@
         return;
       }
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${proto}://${location.host}/ws/chat?token=${encodeURIComponent(token)}`);
+      // Prefer Sec-WebSocket-Protocol so the JWT never appears in URLs or access logs.
+      ws = new WebSocket(`${proto}://${location.host}/ws/chat`, ['bearer', token]);
 
       ws.onopen = () => console.log('[ws] connected');
 
@@ -2530,7 +2711,7 @@
       ws.onclose = (evt) => {
         if (evt.code === 4401) {
           console.warn('[ws] auth rejected — clearing token and showing login');
-          localStorage.removeItem('auth_token');
+          clearAuthSession();
           showLogin();
           return;
         }
@@ -2818,7 +2999,7 @@
         loginSubmit.disabled = true;
         return;
       }
-      const savedEmail = localStorage.getItem('user_email');
+      const savedEmail = memoryUserEmail;
       if (savedEmail) loginEmail.value = savedEmail;
       setTimeout(() => (savedEmail ? loginPassword : loginEmail).focus(), 50);
     }
@@ -2905,9 +3086,7 @@
     }
     const restockSearchEl = document.getElementById('restock-search');
     const restockOrdersWindowEl = document.getElementById('restock-orders-window');
-    const restockOrdersHeaderEl = document.getElementById('restock-orders-header');
     const restockFutureDaysEl = document.getElementById('restock-future-days');
-    const restockFutureHeaderEl = document.getElementById('restock-future-header');
     const RESTOCK_FUTURE_MAX_DAYS = 90;  // the cached forecast horizon
 
     // Predicted units over the next `days` — sums the winning model's daily
@@ -3141,7 +3320,7 @@
 
     // Tabs the UI currently exposes. Everything else stays built but hidden —
     // add a key back to this list to bring its tab back.
-    const VISIBLE_TABS = ['restock', 'profit', 'listings'];
+    const VISIBLE_TABS = ['restock', 'profit', 'listings', 'keywords'];
 
     function setActiveTab(tab) {
       if (!VISIBLE_TABS.includes(tab)) tab = VISIBLE_TABS[0];
@@ -3748,7 +3927,7 @@
       });
     }
 
-    function truncateSku(sku, maxLen = 22) {
+    function truncateSku(sku, maxLen = 40) {
       const s = String(sku || '');
       if (s.length <= maxLen) return s;
       return `${s.slice(0, maxLen - 1)}…`;
@@ -3768,19 +3947,570 @@
         && (!row.recommended_po_qty || row.recommended_po_qty === 0);
     }
 
-    function renderRestockRows() {
-      restockBodyEl.innerHTML = '';
-      const showAll = restockShowNoDemandEl.checked;
-      const hideNonBuyable = restockHideNonBuyableEl.checked;
-      const q = (restockSearchEl.value || '').trim().toLowerCase();
+    // ── Restock columns: show / hide / reorder ──────────
+    // Mirrors the Profitability tab's column manager: a Columns button in
+    // the toolbar opens a panel of checkboxes, and both the panel rows and
+    // the table headers are drag-reorderable. Prefs persist in localStorage.
+    const RESTOCK_COL_PREFS_KEY = 'aurora.restock.columns.v1';
+    const restockHeadRowEl = document.getElementById('restock-head-row');
+    const restockColumnsBtn = document.getElementById('restock-columns-btn');
+    const restockColumnsPanel = document.getElementById('restock-columns-panel');
+    const restockColumnsList = document.getElementById('restock-columns-list');
+    const restockColumnsReset = document.getElementById('restock-columns-reset');
+    let restockColumnPrefs = null;
+
+    const RESTOCK_MODEL_LABELS = {
+      naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
+      xgb: 'XGBoost', ensemble: 'Ensemble',
+      deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB',
+      ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
+    };
+
+    const RESTOCK_COLUMNS = [
+      {
+        id: 'sku',
+        label: 'SKU',
+        pinned: true,
+        defaultVisible: true,
+        cell: (row, c) => `
+          <td class="sku-cell" title="${escapeHtml(row.sku)}${c.notBuyableTip ? '\n' + escapeHtml(c.notBuyableTip) : ''}">
+            <span class="sku-name">${escapeHtml(truncateSku(row.sku))}</span>${c.notBuyableBadge}
+          </td>`,
+      },
+      {
+        id: 'asin',
+        label: 'ASIN',
+        title: 'Amazon Standard Identification Number',
+        defaultVisible: true,
+        cell: (row) => `<td title="${escapeHtml(row.asin || '')}">${escapeHtml(row.asin || '—')}</td>`,
+      },
+      {
+        id: 'fnsku',
+        label: 'FNSKU',
+        title: "Fulfillment Network SKU — Amazon's internal barcode ID for FBA units",
+        defaultVisible: true,
+        cell: (row) => `<td title="${escapeHtml(row.fnsku || '')}">${escapeHtml(row.fnsku || '—')}</td>`,
+      },
+      {
+        id: 'on_hand',
+        label: 'On hand',
+        num: true,
+        defaultVisible: true,
+        title: 'Seller Central On-hand (FBA) = Available + FC Transfer (pendingTransshipment). Reserved / Unfulfillable / Inbound are separate columns.',
+        cell: (row) => `<td class="num">${fmtRestockNum(row.on_hand ?? 0)}</td>`,
+      },
+      {
+        id: 'reserved',
+        label: 'Reserved',
+        num: true,
+        defaultVisible: true,
+        title: "Units set aside by Amazon — not sellable right now.\n\nBifurcation shown as 'total (cust + fc)':\n  cust = pendingCustomerOrder → allocated to open orders that haven't shipped yet\n  fc   = fcProcessing → at an FC being moved/inspected\n\n(pendingTransshipment / units in transit between FCs is counted in On hand, not here.)",
+        cell: (row) => {
+          const cust = Number(row.reserved_customer_order || 0);
+          const fc = Number(row.reserved_fc_processing || 0);
+          const total = Number(row.reserved || 0);
+          const unaccounted = Math.max(0, total - cust - fc);
+          const lines = [
+            `Total reserved: ${total}`,
+            `  Pending customer order: ${cust}`,
+            `  FC processing: ${fc}`,
+          ];
+          if (unaccounted > 0) lines.push(`  Other / uncategorised: ${unaccounted}`);
+          // Show inline bifurcation as "total (cust + fc)". Total stays the
+          // primary number so sort order + eye scan don't shift. Falls back
+          // to a plain total when the bifurcation fields are missing (older
+          // cached response) or the total is 0 (no need to clutter with 0+0).
+          let body;
+          if (total === 0) body = fmtRestockNum(0);
+          else if (cust === 0 && fc === 0) body = fmtRestockNum(total);
+          else body = `${fmtRestockNum(total)} <span class="reserved-brk">(${fmtRestockNum(cust)}+${fmtRestockNum(fc)})</span>`;
+          return `<td class="num" title="${escapeHtml(lines.join('\n'))}">${body}</td>`;
+        },
+      },
+      {
+        id: 'sent_to_fba',
+        label: 'Sent to FBA',
+        num: true,
+        defaultVisible: true,
+        title: 'Units Amazon has received into the network but not yet checked into the destination FC (inboundShippedQuantity)',
+        cell: (row) => `<td class="num">${fmtRestockNum(row.sent_to_fba ?? 0)}</td>`,
+      },
+      {
+        id: 'inbound_working',
+        label: 'Inbound working',
+        num: true,
+        defaultVisible: true,
+        title: "Units on an inbound shipment plan you've created but not yet shipped (inboundWorkingQuantity)",
+        cell: (row) => `<td class="num">${fmtRestockNum(row.inbound_working ?? 0)}</td>`,
+      },
+      {
+        id: 'fc_transfer',
+        label: 'FC transfer',
+        num: true,
+        defaultVisible: true,
+        title: 'Units physically at Amazon but currently in transit between fulfillment centers (pendingTransshipment). Not sellable during the transfer but included in days-of-cover since they usually return to sellable within days.',
+        cell: (row) => `<td class="num">${fmtRestockNum(row.fc_transfer ?? 0)}</td>`,
+      },
+      {
+        id: 'awd_inbound',
+        label: 'AWD inbound',
+        num: true,
+        defaultVisible: true,
+        title: 'Units on in-flight shipments to Amazon Warehousing & Distribution (AWD bulk storage). Not sellable until replenished to FBA — excluded from days-of-cover math.',
+        cell: (row) => `<td class="num">${fmtRestockNum(row.awd_inbound ?? 0)}</td>`,
+      },
+      {
+        id: 'unfulfillable',
+        label: 'Unfulfillable',
+        num: true,
+        defaultVisible: true,
+        title: 'Damaged or customer-returned units currently unsellable',
+        cell: (row) => `<td class="num">${fmtRestockNum(row.unfulfillable ?? 0)}</td>`,
+      },
+      {
+        id: 'next_arrival',
+        label: 'Next arrival',
+        defaultVisible: true,
+        title: "Next inbound shipment's outstanding qty and ETA — proof the projection is factoring in your in-flight stock",
+        cell: (row, c) => `<td title="${escapeHtml(c.inboundTip)}">${c.nextArrivalCell}</td>`,
+      },
+      {
+        id: 'velocity',
+        label: 'Orders Velocity',
+        num: true,
+        defaultVisible: true,
+        title: 'Weighted sales velocity across the 3/7/30/60/180-day windows (out-of-stock days excluded). Default weights are recent-biased (0.4×v3d + 0.3×v7d + 0.2×v30d + 0.1×v60d + 0×v180d); override per-SKU in Actions → Forecast tab.',
+        cell: (row) => `<td class="num">${fmtRestockNum(row.weighted_velocity ?? 0, 2)}</td>`,
+      },
+      {
+        id: 'best_model',
+        label: 'Best model',
+        defaultVisible: true,
+        title: "Winning forecast model (from the nightly picker's 30-day holdout backtest) and its accuracy_pct. Any of prophet / naive / lgbm / xgb / ensemble / deepar / tft may win depending on the SKU's demand pattern.",
+        cell: (row) => {
+          const name = row.best_model_name;
+          const acc = row.best_model_accuracy_pct;
+          if (!name && acc == null) return '<td><span style="color:#888;">—</span></td>';
+          const label = RESTOCK_MODEL_LABELS[name] || name || '—';
+          const accStr = acc == null ? '—' : `${acc}%`;
+          const cls = acc == null ? 'low' : (acc >= 75 ? 'ok' : acc >= 40 ? 'mid' : 'low');
+          return `<td><span class="best-model-cell best-model-${cls}"><strong>${escapeHtml(label)}</strong> ${accStr}</span></td>`;
+        },
+      },
+      {
+        id: 'q4_accuracy',
+        label: 'Q4 accuracy',
+        defaultVisible: true,
+        title: "Q4 accuracy — how accurate the best model/config would have been for last Q4 (Oct-Dec). Populated after clicking 'Test on Q4' in the drawer, or from a fleet Q4 backtest run.",
+        cell: (row) => {
+          const acc = row.q4_accuracy_pct;
+          const name = row.q4_best_name;
+          const year = row.q4_year;
+          const open = `<td data-q4-sku="${escapeHtml(row.sku)}">`;
+          // Distinguish "we could not score this" from "the model scored
+          // badly" — both used to render as a bare dash or a 0%.
+          if (row.q4_not_scorable) {
+            const why = row.q4_not_scorable === 'no_pre_q4_history'
+              ? `No sales signal before Q4${year ? ' ' + year : ''} — no recorded pre-window sales, so no model had anything to train on. Not a model failure.`
+              : `No recorded sales in Q4${year ? ' ' + year : ''} — accuracy is undefined when actual units are zero.`;
+            return `${open}<span style="color:#888;" title="${escapeHtml(why)}">n/a</span></td>`;
+          }
+          if (acc == null) return `${open}<span style="color:#888;">—</span></td>`;
+          const label = row.q4_best_source === 'model'
+            ? (RESTOCK_MODEL_LABELS[name] || name || '—')
+            : `Cfg: ${name || '—'}`;
+          const cls = acc >= 75 ? 'ok' : acc >= 40 ? 'mid' : 'low';
+          return `${open}<span class="best-model-cell best-model-${cls}" title="Q4 ${year} · actual=${row.q4_actual_units} units"><strong>${escapeHtml(label)}</strong> ${acc}%</span></td>`;
+        },
+      },
+      {
+        id: 'orders_per_day',
+        label: (c) => `Orders/day (${c.ordersWindow}d)`,
+        panelLabel: 'Orders/day',
+        num: true,
+        defaultVisible: true,
+        title: 'Average units sold per day over the selected window (units sold ÷ window size; Aurora orders, cancelled/pending excluded)',
+        cell: (row, c) => `<td class="num">${fmtRestockNum((row[c.ordersField] ?? 0) / c.ordersWindow, 2)}</td>`,
+      },
+      {
+        id: 'forecast_30d',
+        label: '30-day forecast',
+        num: true,
+        defaultVisible: true,
+        cell: (row) => `<td class="num">${fmtRestockNum(row.next_30_day_forecast ?? 0, 1)}</td>`,
+      },
+      {
+        id: 'future_sales',
+        label: (c) => `Future sales (${c.futureDays}d)`,
+        panelLabel: 'Future sales',
+        num: true,
+        defaultVisible: true,
+        title: 'Predicted units sold over the next N days — sum of the winning model\'s daily p50 forecast. Set N with the "Future sales (days)" box in the toolbar.',
+        cell: (row, c) => {
+          const fs = futureSalesUnits(row, c.futureDays);
+          if (!fs) return '<td class="num"><span style="color:#888;" title="No daily forecast series on this row — click Refresh forecasts.">—</span></td>';
+          const val = fmtRestockNum(fs.units, 1);
+          if (fs.daysUsed < c.futureDays) {
+            return `<td class="num"><span style="color:#b45309;" title="Forecast only extends ${fs.daysUsed} days — this is the ${fs.daysUsed}d total, not ${c.futureDays}d.">${val}*</span></td>`;
+          }
+          return `<td class="num"><span title="Predicted units, next ${c.futureDays} days">${val}</span></td>`;
+        },
+      },
+      {
+        id: 'days_of_cover',
+        label: 'Days of cover',
+        defaultVisible: true,
+        cell: (row, c) => `<td><span class="urgency-pill ${c.docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>`,
+      },
+      {
+        id: 'historical_dos',
+        label: 'Historical DoS',
+        num: true,
+        defaultVisible: true,
+        title: "Amazon's own metric: ratio of avg. daily sellable on-hand inventory to avg. daily shipped units (max of 30d and 90d ratios). Low-inventory-level fee doesn't apply when HDOS > 28. Source: FBA Inventory Planning report.",
+        cell: (row) => `<td class="num" title="Historical days of supply (Amazon). Grey when the Inventory Planning report hasn't been generated in the last 24h — open the Profitability tab to warm the cache.">${row.historical_days_of_supply == null ? '<span style="color:#888;">—</span>' : fmtRestockNum(row.historical_days_of_supply, 1)}</td>`,
+      },
+      {
+        id: 'stockout_on',
+        label: 'Stockout on',
+        defaultVisible: true,
+        title: 'Projected stockout date given on-hand + inbound shipments − daily demand',
+        cell: (row) => `<td class="date-cell">${fmtRestockDate(row.stockout_date)}</td>`,
+      },
+      {
+        id: 'ship_by_air',
+        label: 'Ship by (Air)',
+        defaultVisible: true,
+        title: 'Latest date to dispatch a shipment via air freight (~10d transit to Amazon FC)',
+        cell: (row, c) => `<td class="date-cell" title="${escapeHtml(c.airTip)}">${fmtRestockDate(row.reorder_by_date_air)}</td>`,
+      },
+      {
+        id: 'ship_by_ocean',
+        label: 'Ship by (Ocean)',
+        defaultVisible: true,
+        title: 'Latest date to dispatch a shipment via ocean freight (~45d transit to Amazon FC)',
+        cell: (row, c) => `<td class="date-cell" title="${escapeHtml(c.oceanTip)}">${fmtRestockDate(row.reorder_by_date_ocean ?? row.reorder_by_date_sea)}</td>`,
+      },
+      {
+        id: 'days_until_next_order',
+        label: 'Days until next order',
+        num: true,
+        defaultVisible: true,
+        title: "Days until you need to dispatch by air (delta from today to Ship by Air). Negative = you're late.",
+        cell: (row) => `<td class="num">${fmtDaysUntil(row.days_until_next_order)}</td>`,
+      },
+      {
+        id: 'suggested_qty',
+        label: 'Suggested qty',
+        num: true,
+        defaultVisible: true,
+        cell: (row, c) => `<td class="num num-strong">${c.isBuyable ? fmtRestockNum(row.recommended_po_qty ?? 0) : '—'}</td>`,
+      },
+      {
+        id: 'ordered',
+        label: 'Ordered',
+        num: true,
+        defaultVisible: true,
+        title: "Units on your open purchase orders that haven't arrived at your warehouse / prep center yet",
+        cell: (row) => `<td class="num">${fmtRestockNum(row.ordered ?? 0)}</td>`,
+      },
+      {
+        id: 'stock_value',
+        label: 'Stock value',
+        num: true,
+        defaultVisible: true,
+        title: '(Available to sell + Reserved + Sent to FBA + Inbound working) × landed cost from your COGS',
+        cell: (row) => `<td class="num">${row.stock_value > 0 ? '$' + fmtRestockNum(row.stock_value, 2) : '—'}</td>`,
+      },
+      {
+        id: 'missed_profit',
+        label: 'Missed profit (est.)',
+        num: true,
+        defaultVisible: true,
+        title: 'Rough estimate of profit lost during stockout days over the last 90d, using ~25% margin on landed cost',
+        cell: (row) => `<td class="num">${row.missed_profit_est > 0 ? '$' + fmtRestockNum(row.missed_profit_est, 2) : '$0.00'}</td>`,
+      },
+      {
+        id: 'comment',
+        label: 'Comment',
+        defaultVisible: true,
+        title: 'Free-text notes for this SKU (set via the Actions menu)',
+        cell: (row) => `<td class="comment-cell" title="${escapeHtml(row.comment || '')}">${escapeHtml(row.comment ? (row.comment.length > 30 ? row.comment.slice(0, 30) + '…' : row.comment) : '—')}</td>`,
+      },
+      {
+        id: 'actions',
+        label: 'Actions',
+        pinned: true,
+        defaultVisible: true,
+        title: 'Per-SKU manufacturing / forecast / packing / supplier settings',
+        cell: (row) => `<td class="actions-cell"><button class="actions-btn" data-sku="${escapeHtml(row.sku)}" title="Product settings">⋯</button></td>`,
+      },
+    ];
+
+    const RESTOCK_COLUMN_BY_ID = Object.fromEntries(RESTOCK_COLUMNS.map((c) => [c.id, c]));
+    const RESTOCK_DEFAULT_ORDER = RESTOCK_COLUMNS.map((c) => c.id);
+    const RESTOCK_PINNED_FIRST = 'sku';
+    const RESTOCK_PINNED_LAST = 'actions';
+
+    function defaultRestockColumnPrefs() {
+      return {
+        order: [...RESTOCK_DEFAULT_ORDER],
+        visible: Object.fromEntries(RESTOCK_COLUMNS.map((c) => [c.id, !!c.defaultVisible])),
+      };
+    }
+
+    // Keep a saved order usable after we add columns: unknown ids are dropped
+    // and brand-new ones land at their default relative position instead of
+    // being dumped at the end.
+    function mergeRestockColumnOrder(savedOrder) {
+      const known = new Set(RESTOCK_DEFAULT_ORDER);
+      const order = [];
+      for (const id of savedOrder || []) {
+        if (known.has(id) && !order.includes(id)) order.push(id);
+      }
+      for (const id of RESTOCK_DEFAULT_ORDER) {
+        if (order.includes(id)) continue;
+        const defIdx = RESTOCK_DEFAULT_ORDER.indexOf(id);
+        let insertAt = order.length;
+        for (let i = defIdx - 1; i >= 0; i -= 1) {
+          const prevAt = order.indexOf(RESTOCK_DEFAULT_ORDER[i]);
+          if (prevAt >= 0) { insertAt = prevAt + 1; break; }
+        }
+        if (insertAt === order.length) {
+          for (let i = defIdx + 1; i < RESTOCK_DEFAULT_ORDER.length; i += 1) {
+            const nextAt = order.indexOf(RESTOCK_DEFAULT_ORDER[i]);
+            if (nextAt >= 0) { insertAt = nextAt; break; }
+          }
+        }
+        order.splice(insertAt, 0, id);
+      }
+      return normalizeRestockOrder(order);
+    }
+
+    function normalizeRestockOrder(order) {
+      const middle = (order || []).filter((id) => id !== RESTOCK_PINNED_FIRST && id !== RESTOCK_PINNED_LAST);
+      return [RESTOCK_PINNED_FIRST, ...middle, RESTOCK_PINNED_LAST];
+    }
+
+    function loadRestockColumnPrefs() {
+      try {
+        const raw = localStorage.getItem(RESTOCK_COL_PREFS_KEY);
+        if (!raw) return defaultRestockColumnPrefs();
+        const parsed = JSON.parse(raw);
+        const base = defaultRestockColumnPrefs();
+        const order = mergeRestockColumnOrder(parsed.order);
+        const visible = { ...base.visible, ...(parsed.visible || {}) };
+        visible[RESTOCK_PINNED_FIRST] = true;
+        visible[RESTOCK_PINNED_LAST] = true;
+        return { order, visible };
+      } catch {
+        return defaultRestockColumnPrefs();
+      }
+    }
+
+    function saveRestockColumnPrefs() {
+      try {
+        localStorage.setItem(RESTOCK_COL_PREFS_KEY, JSON.stringify(restockColumnPrefs));
+      } catch { /* ignore quota */ }
+    }
+
+    function getVisibleRestockColumns() {
+      if (!restockColumnPrefs) restockColumnPrefs = loadRestockColumnPrefs();
+      const cols = [];
+      for (const id of normalizeRestockOrder(restockColumnPrefs.order)) {
+        const col = RESTOCK_COLUMN_BY_ID[id];
+        if (!col) continue;
+        if (col.pinned || restockColumnPrefs.visible[id]) cols.push(col);
+      }
+      return cols;
+    }
+
+    function restockColspan() {
+      return Math.max(getVisibleRestockColumns().length, 1);
+    }
+
+    // Toolbar-derived values every cell renderer can read (orders window,
+    // future-sales horizon). Recomputed on each render so the selectors stay
+    // live without re-fetching.
+    function restockRenderCtx() {
       const ordersWindow = parseInt(restockOrdersWindowEl.value, 10) || 30;
-      const ordersField = `orders_${ordersWindow}d`;
-      if (restockOrdersHeaderEl) restockOrdersHeaderEl.textContent = `Ord/d (${ordersWindow}d)`;
       const futureDays = Math.max(1, Math.min(
         RESTOCK_FUTURE_MAX_DAYS,
         parseInt(restockFutureDaysEl && restockFutureDaysEl.value, 10) || 30,
       ));
-      if (restockFutureHeaderEl) restockFutureHeaderEl.textContent = `Future sales (${futureDays}d)`;
+      return { ordersWindow, ordersField: `orders_${ordersWindow}d`, futureDays };
+    }
+
+    function restockColLabel(col, ctx) {
+      return typeof col.label === 'function' ? col.label(ctx) : col.label;
+    }
+
+    function renderRestockHeader(ctx) {
+      if (!restockHeadRowEl) return;
+      const c = ctx || restockRenderCtx();
+      restockHeadRowEl.innerHTML = getVisibleRestockColumns().map((col) => {
+        const cls = col.num ? 'num' : '';
+        const drag = col.pinned ? '' : ' draggable="true"';
+        const title = col.title ? ` title="${escapeHtml(col.title)}"` : '';
+        return `<th class="${cls}" data-col-id="${col.id}"${drag}${title}>${escapeHtml(restockColLabel(col, c))}</th>`;
+      }).join('');
+      bindRestockHeaderDrag();
+    }
+
+    function moveRestockColumnOrder(fromId, toId) {
+      if (!fromId || !toId || fromId === toId) return;
+      if (fromId === RESTOCK_PINNED_FIRST || fromId === RESTOCK_PINNED_LAST) return;
+      if (toId === RESTOCK_PINNED_FIRST || toId === RESTOCK_PINNED_LAST) return;
+      if (!restockColumnPrefs) restockColumnPrefs = loadRestockColumnPrefs();
+      const order = restockColumnPrefs.order.filter(
+        (id) => id !== RESTOCK_PINNED_FIRST && id !== RESTOCK_PINNED_LAST,
+      );
+      const fromIdx = order.indexOf(fromId);
+      const toIdx = order.indexOf(toId);
+      if (fromIdx < 0 || toIdx < 0) return;
+      order.splice(fromIdx, 1);
+      order.splice(toIdx, 0, fromId);
+      restockColumnPrefs.order = normalizeRestockOrder(order);
+      saveRestockColumnPrefs();
+      renderRestockColumnsPanelList();
+      renderRestockRows();
+    }
+
+    function bindRestockHeaderDrag() {
+      let dragId = null;
+      restockHeadRowEl.querySelectorAll('th[data-col-id]').forEach((th) => {
+        const id = th.dataset.colId;
+        if (id === RESTOCK_PINNED_FIRST || id === RESTOCK_PINNED_LAST) return;
+        th.addEventListener('dragstart', (e) => {
+          dragId = id;
+          th.classList.add('profit-th-dragging');
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', dragId);
+        });
+        th.addEventListener('dragend', () => {
+          th.classList.remove('profit-th-dragging');
+          restockHeadRowEl.querySelectorAll('th').forEach((el) => el.classList.remove('profit-th-drag-over'));
+          dragId = null;
+        });
+        th.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          th.classList.add('profit-th-drag-over');
+        });
+        th.addEventListener('dragleave', () => th.classList.remove('profit-th-drag-over'));
+        th.addEventListener('drop', (e) => {
+          e.preventDefault();
+          th.classList.remove('profit-th-drag-over');
+          const from = e.dataTransfer.getData('text/plain') || dragId;
+          moveRestockColumnOrder(from, id);
+        });
+      });
+    }
+
+    function renderRestockColumnsPanelList() {
+      if (!restockColumnsList) return;
+      if (!restockColumnPrefs) restockColumnPrefs = loadRestockColumnPrefs();
+      const ctx = restockRenderCtx();
+      const order = restockColumnPrefs.order.filter(
+        (id) => id !== RESTOCK_PINNED_FIRST && id !== RESTOCK_PINNED_LAST,
+      );
+      restockColumnsList.innerHTML = order.map((id) => {
+        const col = RESTOCK_COLUMN_BY_ID[id];
+        if (!col) return '';
+        const checked = restockColumnPrefs.visible[id] ? 'checked' : '';
+        const label = col.panelLabel || restockColLabel(col, ctx);
+        return `
+          <li draggable="true" data-col-id="${col.id}">
+            <span class="profit-col-handle" aria-hidden="true">⋮⋮</span>
+            <label>
+              <input type="checkbox" data-col-id="${col.id}" ${checked}>
+              <span>${escapeHtml(label)}</span>
+            </label>
+          </li>`;
+      }).join('');
+
+      let dragId = null;
+      restockColumnsList.querySelectorAll('li').forEach((li) => {
+        li.addEventListener('dragstart', (e) => {
+          dragId = li.dataset.colId;
+          li.classList.add('dragging');
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', dragId);
+        });
+        li.addEventListener('dragend', () => {
+          li.classList.remove('dragging');
+          restockColumnsList.querySelectorAll('li').forEach((el) => el.classList.remove('drag-over'));
+          dragId = null;
+        });
+        li.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          li.classList.add('drag-over');
+        });
+        li.addEventListener('dragleave', () => li.classList.remove('drag-over'));
+        li.addEventListener('drop', (e) => {
+          e.preventDefault();
+          li.classList.remove('drag-over');
+          const from = e.dataTransfer.getData('text/plain') || dragId;
+          moveRestockColumnOrder(from, li.dataset.colId);
+        });
+      });
+
+      restockColumnsList.querySelectorAll('input[type="checkbox"]').forEach((input) => {
+        input.addEventListener('change', () => {
+          const id = input.dataset.colId;
+          if (!id || id === RESTOCK_PINNED_FIRST || id === RESTOCK_PINNED_LAST) return;
+          restockColumnPrefs.visible[id] = !!input.checked;
+          // Keep at least one unpinned column visible
+          const anyVisible = RESTOCK_COLUMNS.some((c) => !c.pinned && restockColumnPrefs.visible[c.id]);
+          if (!anyVisible) {
+            input.checked = true;
+            restockColumnPrefs.visible[id] = true;
+            return;
+          }
+          saveRestockColumnPrefs();
+          renderRestockRows();
+        });
+      });
+    }
+
+    function openRestockColumnsPanel() {
+      renderRestockColumnsPanelList();
+      restockColumnsPanel.classList.add('open');
+    }
+
+    function closeRestockColumnsPanel() {
+      restockColumnsPanel.classList.remove('open');
+    }
+
+    restockColumnPrefs = loadRestockColumnPrefs();
+    renderRestockHeader();
+
+    if (restockColumnsBtn && restockColumnsPanel) {
+      restockColumnsBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (restockColumnsPanel.classList.contains('open')) closeRestockColumnsPanel();
+        else openRestockColumnsPanel();
+      });
+      restockColumnsReset.addEventListener('click', () => {
+        restockColumnPrefs = defaultRestockColumnPrefs();
+        saveRestockColumnPrefs();
+        renderRestockColumnsPanelList();
+        renderRestockRows();
+      });
+      document.addEventListener('click', (e) => {
+        if (!restockColumnsPanel.classList.contains('open')) return;
+        if (e.target.closest('#restock-columns-wrap')) return;
+        closeRestockColumnsPanel();
+      });
+    }
+
+    function renderRestockRows() {
+      const ctx = restockRenderCtx();
+      const cols = getVisibleRestockColumns();
+      renderRestockHeader(ctx);
+      restockBodyEl.innerHTML = '';
+      const showAll = restockShowNoDemandEl.checked;
+      const hideNonBuyable = restockHideNonBuyableEl.checked;
+      const q = (restockSearchEl.value || '').trim().toLowerCase();
 
       let visible = showAll
         ? restockCache
@@ -3795,7 +4525,6 @@
         );
       }
 
-      const totalHidden = restockCache.length - visible.length;
       const tailParts = [];
       if (!showAll) {
         const noDemandHidden = restockCache.filter(r => isNoDemand(r)).length;
@@ -3827,133 +4556,39 @@
         const notBuyableBadge = isBuyable
           ? ''
           : ` <span class="not-buyable-badge" title="${escapeHtml(notBuyableTip)}">🚫 not buyable</span>`;
-        const docCls = urgencyClass(row.days_of_cover);
         const inboundCount = row.inbound_shipments_count ?? 0;
-        const inboundTip = inboundCount
-          ? `${inboundCount} in-flight shipment${inboundCount === 1 ? '' : 's'} feeding the projection`
-          : 'No in-flight shipments — projection uses on-hand + demand only';
-        const nextArrivalCell = row.next_shipment_eta
-          ? `<span class="next-arrival"><strong>${row.next_shipment_qty ?? 0}</strong> by ${row.next_shipment_eta}` +
-            (inboundCount > 1 ? ` <span class="next-arrival-more">+${inboundCount - 1} more</span>` : '') +
-            `</span>`
-          : `<span class="next-arrival-none">—</span>`;
-        const airTip = `Dispatch by this date — ${row.air_transit_days ?? 10}d air transit to Amazon FC`;
-        const oceanTip = `Dispatch by this date — ${row.ocean_transit_days ?? 45}d ocean transit to Amazon FC`;
-        tr.innerHTML = `
-          <td class="sku-cell" title="${escapeHtml(row.sku)}${notBuyableTip ? '\n' + escapeHtml(notBuyableTip) : ''}">
-            <span class="sku-name">${escapeHtml(truncateSku(row.sku))}</span>${notBuyableBadge}
-          </td>
-          <td title="${escapeHtml(row.asin || '')}">${escapeHtml(row.asin || '—')}</td>
-          <td title="${escapeHtml(row.fnsku || '')}">${escapeHtml(row.fnsku || '—')}</td>
-          <td class="num">${fmtRestockNum(row.on_hand ?? 0)}</td>
-          <td class="num" title="${(function(){
-            const cust = Number(row.reserved_customer_order || 0);
-            const fc = Number(row.reserved_fc_processing || 0);
-            const total = Number(row.reserved || 0);
-            const unaccounted = Math.max(0, total - cust - fc);
-            const lines = [
-              `Total reserved: ${total}`,
-              `  Pending customer order: ${cust}`,
-              `  FC processing: ${fc}`,
-            ];
-            if (unaccounted > 0) lines.push(`  Other / uncategorised: ${unaccounted}`);
-            return lines.join('\n');
-          })()}">${(function(){
-            const cust = Number(row.reserved_customer_order || 0);
-            const fc = Number(row.reserved_fc_processing || 0);
-            const total = Number(row.reserved || 0);
-            // Show inline bifurcation as "total (cust + fc)". Total is
-            // preserved as the primary number so sort order + eye scan
-            // don't shift. Falls back to plain total when the bifurcation
-            // fields are missing (older cached response) or when total
-            // is 0 (no reservation at all — no need to clutter with 0+0).
-            if (total === 0) return fmtRestockNum(0);
-            if (cust === 0 && fc === 0) return fmtRestockNum(total);
-            const brk = `<span class="reserved-brk">(${fmtRestockNum(cust)}+${fmtRestockNum(fc)})</span>`;
-            return `${fmtRestockNum(total)} ${brk}`;
-          })()}</td>
-          <td class="num">${fmtRestockNum(row.sent_to_fba ?? 0)}</td>
-          <td class="num">${fmtRestockNum(row.inbound_working ?? 0)}</td>
-          <td class="num">${fmtRestockNum(row.fc_transfer ?? 0)}</td>
-          <td class="num">${fmtRestockNum(row.awd_inbound ?? 0)}</td>
-          <td class="num">${fmtRestockNum(row.unfulfillable ?? 0)}</td>
-          <!-- <td class="num" title="${inboundTip}">${fmtRestockNum(row.inbound ?? 0)}</td> -->
-          <td title="${inboundTip}">${nextArrivalCell}</td>
-          <td class="num">${fmtRestockNum(row.weighted_velocity ?? 0, 2)}</td>
-          <td>${(() => {
-            const MODEL_LABELS = {
-              naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
-              xgb: 'XGBoost', ensemble: 'Ensemble',
-              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
-            };
-            const name = row.best_model_name;
-            const acc = row.best_model_accuracy_pct;
-            if (!name && acc == null) return '<span style="color:#888;">—</span>';
-            const label = MODEL_LABELS[name] || name || '—';
-            const accStr = acc == null ? '—' : `${acc}%`;
-            const cls = acc == null ? 'low' : (acc >= 75 ? 'ok' : acc >= 40 ? 'mid' : 'low');
-            return `<span class="best-model-cell best-model-${cls}"><strong>${escapeHtml(label)}</strong> ${accStr}</span>`;
-          })()}</td>
-          <td data-q4-sku="${escapeHtml(row.sku)}">${(() => {
-            const MODEL_LABELS = {
-              naive: 'Naive', prophet: 'Prophet', lgbm: 'LightGBM',
-              xgb: 'XGBoost', ensemble: 'Ensemble',
-              deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
-            };
-            const acc = row.q4_accuracy_pct;
-            const name = row.q4_best_name;
-            const year = row.q4_year;
-            // Distinguish "we could not score this" from "the model scored
-            // badly" — both used to render as a bare dash or a 0%.
-            if (row.q4_not_scorable) {
-              const why = row.q4_not_scorable === 'no_pre_q4_history'
-                ? `No sales signal before Q4${year ? ' ' + year : ''} — no recorded pre-window sales, so no model had anything to train on. Not a model failure.`
-                : `No recorded sales in Q4${year ? ' ' + year : ''} — accuracy is undefined when actual units are zero.`;
-              return `<span style="color:#888;" title="${escapeHtml(why)}">n/a</span>`;
-            }
-            if (acc == null) return '<span style="color:#888;">—</span>';
-            const label = row.q4_best_source === 'model'
-              ? (MODEL_LABELS[name] || name || '—')
-              : `Cfg: ${name || '—'}`;
-            const cls = acc >= 75 ? 'ok' : acc >= 40 ? 'mid' : 'low';
-            return `<span class="best-model-cell best-model-${cls}" title="Q4 ${year} · actual=${row.q4_actual_units} units"><strong>${escapeHtml(label)}</strong> ${acc}%</span>`;
-          })()}</td>
-          <td class="num">${fmtRestockNum((row[ordersField] ?? 0) / ordersWindow, 2)}</td>
-          <!-- <td class="num restock-units-cell">${fmtRestockNum(row.units_30d ?? 0)}</td> -->
-          <td class="num">${fmtRestockNum(row.next_30_day_forecast ?? 0, 1)}</td>
-          <td class="num">${(() => {
-            const fs = futureSalesUnits(row, futureDays);
-            if (!fs) return '<span style="color:#888;" title="No daily forecast series on this row — click Refresh forecasts.">—</span>';
-            const val = fmtRestockNum(fs.units, 1);
-            if (fs.daysUsed < futureDays) {
-              return `<span style="color:#b45309;" title="Forecast only extends ${fs.daysUsed} days — this is the ${fs.daysUsed}d total, not ${futureDays}d.">${val}*</span>`;
-            }
-            return `<span title="Predicted units, next ${futureDays} days">${val}</span>`;
-          })()}</td>
-          <td><span class="urgency-pill ${docCls}">${fmtDaysOfCover(row.days_of_cover)}</span></td>
-          <td class="num" title="Historical days of supply (Amazon). Grey when the Inventory Planning report hasn't been generated in the last 24h — open the Profitability tab to warm the cache.">${row.historical_days_of_supply == null ? '<span style="color:#888;">—</span>' : fmtRestockNum(row.historical_days_of_supply, 1)}</td>
-          <td class="date-cell">${fmtRestockDate(row.stockout_date)}</td>
-          <td class="date-cell" title="${airTip}">${fmtRestockDate(row.reorder_by_date_air)}</td>
-          <td class="date-cell" title="${oceanTip}">${fmtRestockDate(row.reorder_by_date_ocean ?? row.reorder_by_date_sea)}</td>
-          <td class="num">${fmtDaysUntil(row.days_until_next_order)}</td>
-          <td class="num num-strong">${isBuyable ? fmtRestockNum(row.recommended_po_qty ?? 0) : '—'}</td>
-          <!-- <td class="num">${row.amazon_recommended_ship_qty == null ? '—' : fmtRestockNum(row.amazon_recommended_ship_qty)}</td> -->
-          <td class="num">${fmtRestockNum(row.ordered ?? 0)}</td>
-          <td class="num">${row.stock_value > 0 ? '$' + fmtRestockNum(row.stock_value, 2) : '—'}</td>
-          <td class="num">${row.missed_profit_est > 0 ? '$' + fmtRestockNum(row.missed_profit_est, 2) : '$0.00'}</td>
-          <td class="comment-cell" title="${escapeHtml(row.comment || '')}">${escapeHtml(row.comment ? (row.comment.length > 30 ? row.comment.slice(0, 30) + '…' : row.comment) : '—')}</td>
-          <td class="actions-cell"><button class="actions-btn" data-sku="${escapeHtml(row.sku)}" title="Product settings">⋯</button></td>
-        `;
+        const rowCtx = {
+          ...ctx,
+          rawRow,
+          isBuyable,
+          notBuyableTip,
+          notBuyableBadge,
+          docCls: urgencyClass(row.days_of_cover),
+          inboundTip: inboundCount
+            ? `${inboundCount} in-flight shipment${inboundCount === 1 ? '' : 's'} feeding the projection`
+            : 'No in-flight shipments — projection uses on-hand + demand only',
+          nextArrivalCell: row.next_shipment_eta
+            ? `<span class="next-arrival"><strong>${row.next_shipment_qty ?? 0}</strong> by ${row.next_shipment_eta}` +
+              (inboundCount > 1 ? ` <span class="next-arrival-more">+${inboundCount - 1} more</span>` : '') +
+              `</span>`
+            : `<span class="next-arrival-none">—</span>`,
+          airTip: `Dispatch by this date — ${row.air_transit_days ?? 10}d air transit to Amazon FC`,
+          oceanTip: `Dispatch by this date — ${row.ocean_transit_days ?? 45}d ocean transit to Amazon FC`,
+        };
+        tr.innerHTML = cols.map((col) => col.cell(row, rowCtx)).join('');
         // Row click opens the forecast drawer; the Actions button opens
         // the settings modal instead (stopPropagation so it doesn't do both).
         tr.addEventListener('click', (ev) => {
           if (ev.target.closest('.actions-btn')) return;
           openSkuDrawer(row.sku);
         });
-        tr.querySelector('.actions-btn').addEventListener('click', (ev) => {
-          ev.stopPropagation();
-          openProductSettingsModal(row.sku);
-        });
+        const actionsBtn = tr.querySelector('.actions-btn');
+        if (actionsBtn) {
+          actionsBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            openProductSettingsModal(row.sku);
+          });
+        }
         restockBodyEl.appendChild(tr);
       }
     }
@@ -3984,7 +4619,7 @@
         }
         renderRestockRows();
       } catch (err) {
-        restockBodyEl.innerHTML = `<tr><td colspan="11" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
+        restockBodyEl.innerHTML = `<tr><td colspan="${restockColspan()}" style="padding:20px;color:#c62828;">Failed to load: ${escapeHtml(String(err))}</td></tr>`;
       }
     }
 
@@ -6447,6 +7082,17 @@
     }
 
     (async () => {
+      try {
+        await bootstrapTokenFromAurora();
+      } catch (err) {
+        console.error('[embed] bootstrap failed', err);
+        if (isEmbedded) {
+          showLogin();
+          loginError.textContent =
+            (err && err.message) || 'Aurora embed session failed. Reload AI Assistant from Aurora.';
+          return;
+        }
+      }
       if (!getAuthToken()) {
         showLogin();
       } else {
