@@ -4855,17 +4855,6 @@
 
     const profitMoney = (v) => `$${(Number(v) || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 
-    // Stand-in for Amazon's low-inventory-level fee until the real per-SKU
-    // number is available: net units × a flat $0.80. Works for both a row and
-    // the totals object since both carry units / returned_units.
-    const PROFIT_LOW_INV_FEE_PER_UNIT = 0.80;
-    function profitLowInventoryFee(r) {
-      if (!r) return 0;
-      const units = Number(r.units) || 0;
-      const returned = Number(r.returned_units) || 0;
-      return Math.max(0, units - returned) * PROFIT_LOW_INV_FEE_PER_UNIT;
-    }
-
     const PROFIT_COLUMNS = [
       {
         id: 'sku',
@@ -4972,16 +4961,11 @@
       {
         id: 'low_inv',
         label: 'Low Inv',
-        // TEMPORARY placeholder. The Finances API low-inventory-level fee
-        // (r.low_inventory_fee) isn't landing per-SKU yet, so we show a flat
-        // stand-in instead of an empty column: net units × $0.80. To go back
-        // to the real feed, restore profitMoney(r.low_inventory_fee) here and
-        // in total(), and drop profitLowInventoryFee + the migration below.
-        title: 'Estimate, not Amazon data — net units (Units − Returned) × $0.80. Excluded from Net and Margin %. Reverts to the Finances API Low Inventory Level Fee once that feed reports per SKU.',
+        title: 'Low Inventory Level Fee from Finances API (45-day lookback)',
         num: true,
-        defaultVisible: true,
-        cell: (r) => `<td class="num" title="${escapeHtml(`Estimate: (${r.units || 0} units − ${r.returned_units || 0} returned) × $${PROFIT_LOW_INV_FEE_PER_UNIT.toFixed(2)}`)}">${profitMoney(profitLowInventoryFee(r))}</td>`,
-        total: (_r, t) => `<td class="num" title="Estimate — net units × $0.80, summed">${profitMoney(profitLowInventoryFee(t))}</td>`,
+        defaultVisible: false,
+        cell: (r) => `<td class="num">${profitMoney(r.low_inventory_fee)}</td>`,
+        total: (_r, t) => `<td class="num">${profitMoney(t.low_inventory_fee)}</td>`,
       },
       {
         id: 'storage',
@@ -5071,7 +5055,6 @@
       return {
         order: [...PROFIT_DEFAULT_ORDER],
         visible: Object.fromEntries(PROFIT_COLUMNS.map((c) => [c.id, !!c.defaultVisible])),
-        migrations: { lowInvShown: true },
       };
     }
 
@@ -5130,16 +5113,7 @@
         const order = ensureReimbursementBeforeNetMargin(mergeProfitColumnOrder(parsed.order));
         const visible = { ...base.visible, ...(parsed.visible || {}) };
         visible.sku = true;
-        // One-time migration: Low Inv shipped hidden (the Finances feed was
-        // blank), so every existing user has low_inv:false saved and would
-        // never see the new estimate. Force it on once, then respect whatever
-        // they choose from there. Everything else in their prefs is kept.
-        const migrations = { ...(parsed.migrations || {}) };
-        if (!migrations.lowInvShown) {
-          visible.low_inv = true;
-          migrations.lowInvShown = true;
-        }
-        return { order, visible, migrations };
+        return { order, visible };
       } catch {
         return defaultProfitColumnPrefs();
       }
