@@ -587,6 +587,23 @@ async def update_forecasting_settings_endpoint(
     return await update_forecast_settings(body or {})
 
 
+def _q4_predictions_all_zero(q4_doc: dict) -> bool:
+    """True when every model and every weight config in a Q4 result predicted
+    exactly zero units.
+
+    Used only as a fallback for result docs written before `not_scorable`
+    existed. A candidate set that unanimously predicts nothing had no signal
+    to work from — in practice a SKU whose first recorded sale lands inside
+    the holdout — so its 0% is a missing measurement, not a model verdict.
+    Verified against the stored fleet: it selects exactly the SKUs with no
+    pre-cutoff sales rows and none of the SKUs with real history.
+    """
+    preds = [m.get("predicted_q4") for m in (q4_doc.get("models") or {}).values()]
+    preds += [c.get("predicted_q4") for c in (q4_doc.get("per_config") or [])]
+    preds = [p for p in preds if p is not None]
+    return bool(preds) and all(float(p) == 0.0 for p in preds)
+
+
 @app.get("/forecasting/restock")
 async def forecasting_restock(
     user: dict = Depends(protect),
@@ -770,6 +787,10 @@ async def forecasting_restock(
         reorder = c.get("reorder") or {}
         forecast = c.get("forecast") or []
         next30 = sum(float(r.get("p50", 0)) for r in forecast[:30])
+        # Daily p50 series, capped at the cached 90-day horizon. Shipped as-is
+        # so the Future sales column can sum an arbitrary window client-side
+        # without a refetch; next_30_day_forecast stays for older frontends.
+        forecast_p50_daily = [round(float(r.get("p50", 0) or 0), 2) for r in forecast[:90]]
 
         # Prefer the fresh Aurora snapshot for the 5 SP-API-sourced counts;
         # fall back to the forecast cache when the SKU isn't in `inv_map`
@@ -918,6 +939,7 @@ async def forecasting_restock(
         if wv > 0:
             scale = min(1.0, wv_net / wv) if wv_net >= 0 else 0.0
             returns_view["next_30_day_forecast"] = round(next30 * scale, 1)
+            returns_view["forecast_scale"] = round(scale, 4)
             if wv_net > 0:
                 days_of_cover_net = round(stock_forward / wv_net, 1)
                 stockout_date_net_obj = today + timedelta(days=int(stock_forward / wv_net))
@@ -939,6 +961,7 @@ async def forecasting_restock(
                 returns_view["reorder_by_date_ocean"] = None
         else:
             returns_view["next_30_day_forecast"] = round(next30, 1)
+            returns_view["forecast_scale"] = 1.0
             returns_view["days_of_cover"] = days_of_cover_val
             returns_view["stockout_date"] = stockout_date_iso
             returns_view["reorder_by_date_air"] = reorder_by_date_air_iso
@@ -966,6 +989,21 @@ async def forecasting_restock(
         q4_accuracy_pct = _q4_winner.get("accuracy_pct")
         q4_actual_units = _q4.get("actual_q4_units")
         q4_year = _q4.get("year")
+        # Why there is no score, when there is no score. Result docs written
+        # before `not_scorable` existed still describe the zero-demand case
+        # well enough to derive it here, so those blanks get an explanation
+        # without waiting for a re-run.
+        q4_not_scorable = _q4.get("not_scorable")
+        if q4_not_scorable is None and _q4:
+            if _q4.get("skipped"):
+                q4_not_scorable = "no_pre_q4_history"
+            elif not _q4_winner and q4_actual_units == 0:
+                q4_not_scorable = "no_q4_demand"
+            elif (
+                _q4_winner.get("accuracy_pct") == 0
+                and _q4_predictions_all_zero(_q4)
+            ):
+                q4_not_scorable = "no_pre_q4_history"
 
         rows.append({
             "sku": sku,
@@ -979,6 +1017,7 @@ async def forecasting_restock(
             "q4_accuracy_pct": q4_accuracy_pct,
             "q4_actual_units": q4_actual_units,
             "q4_year": q4_year,
+            "q4_not_scorable": q4_not_scorable,  # null | "no_pre_q4_history" | "no_q4_demand"
             "is_buyable": is_buyable,
             "status": inv_row.get("status"),
             "listing_status": inv_row.get("listing_status"),
@@ -1001,6 +1040,7 @@ async def forecasting_restock(
             "orders_30d": int(orders_30d_by_sku.get(sku, 0)),
             "orders_60d": int(orders_60d_by_sku.get(sku, 0)),
             "next_30_day_forecast": round(next30, 1),
+            "forecast_p50_daily": forecast_p50_daily,
             "days_of_cover": days_of_cover_val,
             "stockout_date": stockout_date_iso,
             "returns_view": returns_view,
@@ -2264,7 +2304,7 @@ async def start_keyword_matrix(
     user: dict = Depends(protect),
 ):
     try:
-        job_id = keyword_matrix.start_job(
+        job_id = await keyword_matrix.start_job(
             asins=request.asins,
             ad_group_id=request.ad_group_id,
             campaign_id=request.campaign_id,
@@ -2298,14 +2338,16 @@ async def meta_interests(q: str, limit: int = 25, user: dict = Depends(protect))
         raise HTTPException(status_code=400, detail="q required")
     limit = max(1, min(int(limit), 100))
     async with _httpx.AsyncClient(timeout=15) as client:
+        # Authorization header, not a query param — keeps the token out of
+        # URLs that get echoed into exception messages, logs and proxies.
         resp = await client.get(
             "https://graph.facebook.com/v19.0/search",
             params={
                 "type": "adinterest",
                 "q": query[:100],
                 "limit": limit,
-                "access_token": token,
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
     if resp.is_error:
         raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
@@ -2329,7 +2371,7 @@ async def meta_interests(q: str, limit: int = 25, user: dict = Depends(protect))
 
 @app.get("/keyword-matrix/{job_id}")
 async def get_keyword_matrix(job_id: str, user: dict = Depends(protect)):
-    job = keyword_matrix.get_job(job_id)
+    job = await keyword_matrix.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     return job

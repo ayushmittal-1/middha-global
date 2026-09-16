@@ -124,6 +124,21 @@ def _naive_backtest(sku_rows: list[dict], cutoff: datetime,
     return _score_forecast(result, holdout_by_day)
 
 
+def _intermittent_backtest(sku_rows: list[dict], cutoff: datetime,
+                            holdout_by_day: dict[str, int],
+                            method: str) -> dict:
+    """Run Croston or TSB on the training slice and score. Both are
+    closed-form exponential smoothing — zero training cost — so they
+    slot into the compare panel without slowing the drawer down."""
+    from ..intermittent import croston_forecast, tsb_forecast
+    fn = croston_forecast if method == "croston" else tsb_forecast
+    train_rows = [r for r in sku_rows if _row_day_naive(r) < cutoff.replace(tzinfo=None)]
+    series = _build_series_imputed(train_rows, cutoff)
+    result = fn(series, horizon=HOLDOUT_DAYS, today=cutoff)
+    _apply_recovery_bump(result, train_rows, cutoff)
+    return _score_forecast(result, holdout_by_day)
+
+
 def _lgbm_backtest(
     all_user_rows_by_sku: dict[str, list[dict]],
     target_sku: str,
@@ -364,6 +379,19 @@ async def compare_models(sku: str, user: dict = Depends(protect)):
 
     prophet_result = _prophet_backtest(sku_rows, cutoff, holdout_by_day)
     naive_result = _naive_backtest(sku_rows, cutoff, holdout_by_day)
+    # Croston + TSB — intermittent-demand specialists. Both are free
+    # (closed-form exponential smoothing). They only win on genuinely
+    # sparse SKUs; on structured ones the picker will prefer the others.
+    try:
+        croston_result = _intermittent_backtest(sku_rows, cutoff, holdout_by_day, "croston")
+    except Exception as e:
+        log.warning("croston backtest failed for sku=%s: %s", sku, e)
+        croston_result = {"method": "croston_error", "days": [], "metrics": None, "error": str(e)}
+    try:
+        tsb_result = _intermittent_backtest(sku_rows, cutoff, holdout_by_day, "tsb")
+    except Exception as e:
+        log.warning("tsb backtest failed for sku=%s: %s", sku, e)
+        tsb_result = {"method": "tsb_error", "days": [], "metrics": None, "error": str(e)}
     try:
         lgbm_result = _lgbm_backtest(rows_by_sku, sku, cutoff, holdout_by_day)
     except Exception as e:
@@ -402,7 +430,7 @@ async def compare_models(sku: str, user: dict = Depends(protect)):
     # too when their cached backtest days are available.
     ensemble_result = _ensemble_backtest(
         [prophet_result, naive_result, lgbm_result, xgb_result,
-         deepar_result, tft_result],
+         deepar_result, tft_result, croston_result, tsb_result],
         holdout_by_day,
     )
 
@@ -419,6 +447,8 @@ async def compare_models(sku: str, user: dict = Depends(protect)):
         "deepar": deepar_result,
         "tft": tft_result,
         "naive": naive_result,
+        "croston": croston_result,
+        "tsb": tsb_result,
         "ensemble": ensemble_result,
     }
 
