@@ -6436,47 +6436,33 @@
           ${(() => {
             const bt = data.backtest;
             if (!bt || !bt.metrics) return '';
-            // If the dev-only multi-model comparison is available, promote
-            // the highest-accuracy_pct model's metrics into this headline
-            // card so users see the achievable ceiling instead of whatever
-            // the shipping model (Prophet) scored. Falls back to the
-            // shipping backtest when compare isn't mounted (LGBM_BENCHMARK
-            // unset in prod).
-            let m = bt.metrics;
-            let methodLabel = bt.method || '?';
-            let holdoutStart = bt.holdout_start;
-            let holdoutEnd = bt.holdout_end;
-            let trainStart = bt.train_start || '?';
-            let trainEnd = bt.train_end;
+            // This is the nightly picker's cached backtest — the exact slice
+            // the restock table's "Best model" column reads, so the drawer
+            // and the row always agree.
+            //
+            // It deliberately does NOT borrow metrics from the dev /compare
+            // card below. That endpoint re-scores every model on its own
+            // 540d-train / 30d-holdout window, so its "Prophet" is a
+            // different measurement than the picker's "Prophet" — promoting
+            // it here made the drawer contradict the row it was opened from
+            // (71.9% in the card vs 93.9% in the table, same SKU, same
+            // model), and it kept the cached holdout dates in the heading
+            // while showing compare's numbers underneath.
+            const m = bt.metrics;
+            const holdoutStart = bt.holdout_start;
+            const holdoutEnd = bt.holdout_end;
+            const trainStart = bt.train_start || '?';
+            const trainEnd = bt.train_end;
             const MODEL_LABELS = {
               naive: 'Naive (velocity)', prophet: 'Prophet', lgbm: 'LightGBM',
               ensemble: 'Ensemble',
               deepar: 'DeepAR', tft: 'TFT', croston: 'Croston', tsb: 'TSB', ewma_short: 'EWMA', damped_ets: 'Damped-ETS',
               xgb: 'XGBoost', catboost: 'CatBoost', chronos: 'Chronos',
             };
-            let bestKey = null;
-            if (compare) {
-              const modelsObj = compare.models || {
-                naive: compare.naive, prophet: compare.prophet,
-                lgbm: compare.lgbm, ensemble: compare.ensemble,
-                deepar: compare.deepar, tft: compare.tft,
-                xgb: compare.xgb,
-                catboost: compare.catboost, chronos: compare.chronos,
-              };
-              const entries = Object.entries(modelsObj)
-                .filter(([, d]) => d && d.metrics && d.metrics.accuracy_pct != null);
-              if (entries.length) {
-                entries.sort((a, b) => b[1].metrics.accuracy_pct - a[1].metrics.accuracy_pct);
-                bestKey = entries[0][0];
-                m = entries[0][1].metrics;
-                methodLabel = MODEL_LABELS[bestKey] || bestKey;
-                if (compare.train_start) trainStart = compare.train_start;
-                if (compare.train_end)   trainEnd   = compare.train_end;
-              }
-            }
+            const methodLabel = MODEL_LABELS[bt.method] || bt.method || '?';
             const biasSign = m.bias > 0 ? 'over-predicting' : m.bias < 0 ? 'under-predicting' : 'unbiased';
             const mapeStr = m.mape_pct == null ? '—' : `${m.mape_pct}%`;
-            const methodSuffix = bestKey ? ' <span style="font-size:10px;color:#059669;">★ best of ' + Object.keys(compare.models || {naive:1,prophet:1,lgbm:1,ensemble:1,deepar:1,tft:1,xgb:1,catboost:1,chronos:1}).length + '</span>' : '';
+            const methodSuffix = ' <span style="font-size:10px;color:#059669;" title="Chosen by the nightly picker\u2019s 30-day holdout backtest across every candidate model. This is the model actually producing the forecast.">\u2605 in production</span>';
             return `
               <div class="sku-backtest" style="margin-top:12px;padding:10px;border:1px solid #e5e7eb;border-radius:6px;background:#f9fafb;">
                 <div style="font-weight:600;font-size:13px;margin-bottom:6px;">Prediction accuracy (holdout ${escapeHtml(holdoutStart)} → ${escapeHtml(holdoutEnd)})</div>
@@ -6570,7 +6556,10 @@
               <div class="sku-model-compare" style="margin-top:12px;padding:10px;border:1px solid #93c5fd;border-radius:6px;background:#eff6ff;">
                 <div style="font-weight:600;font-size:13px;margin-bottom:4px;">Model comparison (dev)</div>
                 <div style="font-size:11px;color:#6b7280;margin-bottom:8px;">
-                  Same 30-day holdout · trained on ${escapeHtml(compare.train_start)} → ${escapeHtml(compare.train_end)} · LightGBM trained across ${compare.n_user_skus} SKUs
+                  Re-scored on its <strong>own</strong> 30-day holdout ${escapeHtml(compare.holdout_start || '?')} → ${escapeHtml(compare.holdout_end || '?')} · trained on ${escapeHtml(compare.train_start)} → ${escapeHtml(compare.train_end)} · LightGBM trained across ${compare.n_user_skus} SKUs
+                </div>
+                <div style="font-size:11px;color:#6b7280;margin-bottom:8px;" title="This card refits every model on a fresh window. The production card above reports the nightly picker's own backtest, so the same model can score differently in the two places.">
+                  Different window from the production backtest above — expect the same model to score differently here.
                 </div>
                 <table style="width:100%;border-collapse:collapse;font-size:12px;">
                   <thead>
