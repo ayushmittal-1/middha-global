@@ -503,7 +503,9 @@
       background: #fff;
       border-radius: 12px;
       border: 1px solid #e2e8f0;
-      overflow-x: hidden;
+      /* Scroll sideways rather than squeezing ~29 columns into the viewport
+         — overflow-x:hidden is what forced every header to clip mid-word. */
+      overflow-x: auto;
       overflow-y: auto;
       flex: 1;
       min-height: 0;
@@ -518,6 +520,32 @@
       border-spacing: 0;
       font-size: 12px;
     }
+    /* Restock-only layout. The shared table.restock rule above uses
+       table-layout:fixed, which splits the container into ~29 equal slivers
+       and clips most headers ("Sent to FB", "Unfulfilla", "Missed pro").
+       Size these columns to their content instead and let the wrapper scroll.
+       min-width:max-content also means the table shrinks back down as soon as
+       columns are hidden from the Columns panel, so it is never wider than
+       the columns actually on screen. */
+    #restock-table-wrap table.restock {
+      table-layout: auto;
+      min-width: max-content;
+    }
+    #restock-table-wrap table.restock thead th {
+      white-space: nowrap;
+      padding: 9px 10px;
+    }
+    #restock-table-wrap table.restock td {
+      padding: 8px 10px;
+    }
+    /* SKUs are long; keep the sticky first column from stretching the table.
+       truncateSku() already caps the text, this caps the box. */
+    #restock-table-wrap table.restock td.sku-cell {
+      width: auto;
+      min-width: 170px;
+      max-width: 260px;
+    }
+
     table.restock thead th {
       background: #f1f5f9;
       color: #334155;
