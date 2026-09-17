@@ -24,6 +24,9 @@ MONGO_URI = os.getenv("MONGO_URI", "")
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 # Aurora's mongoose connection uses the `test` database when the URI has no path.
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "test")
+# Must match auroraBackend signAiEmbedToken / jwtTokens audiences.
+AI_EMBED_AUDIENCE = "aurora-ai-embed"
+JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "aurora-app")
 
 _client: Optional[AsyncIOMotorClient] = None
 
@@ -41,15 +44,48 @@ def _db() -> AsyncIOMotorDatabase:
     return _client[MONGO_DB_NAME or "test"]
 
 
+def _audience_claims(aud) -> set[str]:
+    if aud is None:
+        return set()
+    if isinstance(aud, str):
+        return {aud}
+    try:
+        return {str(item) for item in aud}
+    except TypeError:
+        return {str(aud)}
+
+
 def _verify_token(token: str) -> dict:
+    """Verify JWTs from AI login or Aurora's AI-embed exchange.
+
+    Aurora embed tokens are signed with aud=`aurora-ai-embed` (and iss).
+    PyJWT raises InvalidAudienceError unless that claim is allowed — which
+    previously surfaced as HTTP 401 \"Not authorized, token failed\".
+    Tokens minted by this host's /api/auth/login have no aud/iss.
+    """
     if not JWT_SECRET:
         raise HTTPException(status_code=500, detail="JWT_SECRET not configured")
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        # verify_aud=False so we can accept both embed (aud present) and
+        # local-login (no aud) tokens; audience is checked manually below.
+        decoded = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Not authorized, token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Not authorized, token failed")
+
+    claim_auds = _audience_claims(decoded.get("aud"))
+    if claim_auds:
+        allowed = {AI_EMBED_AUDIENCE, JWT_AUDIENCE}
+        if not claim_auds.intersection(allowed):
+            raise HTTPException(status_code=401, detail="Not authorized, token failed")
+
+    return decoded
 
 
 async def _load_user(user_id: Optional[str]) -> dict:
