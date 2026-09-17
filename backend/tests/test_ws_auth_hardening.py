@@ -101,3 +101,45 @@ async def test_invalid_token_is_rejected():
     assert user is None
     assert err is not None
     assert "verification failed" in err.lower()
+
+
+def test_aurora_embed_audience_token_verifies():
+    """Aurora signAiEmbedToken sets aud=aurora-ai-embed; must not 401."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {
+            "id": "507f1f77bcf86cd799439011",
+            "type": "ai_embed",
+            "iat": now,
+            "exp": now + timedelta(minutes=15),
+            "iss": "aurora-backend",
+            "aud": "aurora-ai-embed",
+        },
+        _TEST_JWT_SECRET,
+        algorithm="HS256",
+    )
+    decoded = auth._verify_token(token)
+    assert decoded["id"] == "507f1f77bcf86cd799439011"
+    assert decoded["aud"] == "aurora-ai-embed"
+
+
+def test_wrong_audience_is_rejected():
+    from datetime import datetime, timedelta, timezone
+    from fastapi import HTTPException
+
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {
+            "id": "507f1f77bcf86cd799439011",
+            "exp": now + timedelta(minutes=15),
+            "aud": "not-a-valid-audience",
+        },
+        _TEST_JWT_SECRET,
+        algorithm="HS256",
+    )
+    with pytest.raises(HTTPException) as exc:
+        auth._verify_token(token)
+    assert exc.value.status_code == 401
+    assert "token failed" in exc.value.detail
