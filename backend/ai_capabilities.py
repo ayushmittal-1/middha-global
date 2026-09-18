@@ -1,6 +1,7 @@
 """AI Assistant feature visibility — mirrors Node aiCapabilities.js.
 
-Fail closed: missing/invalid NODE_ENV → production (core tabs only).
+Fail closed: missing/invalid NODE_ENV → production (core tabs only),
+unless SHOW_AI_ASSISTANT_ALL_TABS is true (all tabs in any environment).
 """
 from __future__ import annotations
 
@@ -52,6 +53,15 @@ def normalize_node_env(raw: str | None) -> str:
     return "production"
 
 
+def _env_flag_true(name: str) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    return v in ("true", "1", "yes", "on")
+
+
+def show_all_ai_tabs() -> bool:
+    return _env_flag_true("SHOW_AI_ASSISTANT_ALL_TABS")
+
+
 def get_ai_environment() -> str:
     return normalize_node_env(os.getenv("NODE_ENV"))
 
@@ -60,8 +70,12 @@ def is_ai_development() -> bool:
     return get_ai_environment() == "development"
 
 
+def _extended_features_unlocked() -> bool:
+    return show_all_ai_tabs() or is_ai_development()
+
+
 def get_enabled_tabs() -> List[str]:
-    if is_ai_development():
+    if _extended_features_unlocked():
         return list(ALL_TABS)
     return list(PRODUCTION_TABS)
 
@@ -73,7 +87,7 @@ def is_tab_enabled(tab_id: str) -> bool:
 def is_feature_enabled(feature: str) -> bool:
     if feature == "core":
         return True
-    if not is_ai_development():
+    if not _extended_features_unlocked():
         return False
     return feature in EXTENDED_TABS
 
