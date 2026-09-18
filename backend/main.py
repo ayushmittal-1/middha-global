@@ -25,6 +25,12 @@ from starlette.types import ASGIApp
 from token_encryption import assert_token_key_configured, _is_production
 
 from agent import stream_response
+from ai_capabilities import (
+    get_ai_capabilities,
+    get_enabled_tabs,
+    is_feature_enabled,
+    is_ai_development,
+)
 from meta_ads import shutdown_browser
 from database import (
     init_db,
@@ -292,6 +298,23 @@ from forecasting.lgbm.routes import mount_if_enabled as _mount_lgbm_benchmark
 _mount_lgbm_benchmark(app)
 
 
+def require_feature(feature: str):
+    """FastAPI dependency — 403 when extended feature is disabled (production)."""
+
+    async def _guard(user: dict = Depends(protect)):
+        if not is_feature_enabled(feature):
+            raise HTTPException(status_code=403, detail="Feature not available")
+        return user
+
+    return _guard
+
+
+@app.get("/api/ai/capabilities")
+async def ai_capabilities_public():
+    """Safe tab list for standalone HTML / diagnostics. No secrets."""
+    return get_ai_capabilities()
+
+
 @app.post("/api/auth/login")
 @limiter.limit(os.getenv("AURORA_LOGIN_RATE_LIMIT", "5/minute"))
 async def login(request: Request, body: LoginRequest):
@@ -377,6 +400,10 @@ async def ws_chat(websocket: WebSocket):
     # Authenticate from handshake headers/subprotocol before accepting so we
     # can negotiate Sec-WebSocket-Protocol: bearer (required by browsers when
     # the client offers subprotocols). Never read tokens from the query string.
+    if not is_feature_enabled("chat"):
+        await websocket.close(code=4403)
+        return
+
     user, auth_error = await authenticate_ws(websocket)
 
     proto_header = websocket.headers.get("sec-websocket-protocol", "")
@@ -419,8 +446,8 @@ async def ws_chat(websocket: WebSocket):
 
 
 @app.post("/chat")
-async def chat(request: Request, user: dict = Depends(protect)):
-    """Legacy SSE endpoint (kept for curl / debug use)."""
+async def chat(request: Request, user: dict = Depends(require_feature("chat"))):
+    """SSE chat stream — used by Node proxy / React (JWT stays server-side)."""
     body = await request.json()
     message = body.get("message", "")
     session_id = body.get("session_id", "default")
@@ -433,10 +460,18 @@ async def chat(request: Request, user: dict = Depends(protect)):
         # streaming task sees the authenticated user.
         current_user.set(user)
         async for event in stream_response(message, session_id=session_id):
-            if event["type"] == "token":
-                yield f"data: {json.dumps({'content': event['content']})}\n\n"
-            elif event["type"] == "error":
-                yield f"data: {json.dumps({'error': event['content']})}\n\n"
+            et = event.get("type")
+            if et == "token":
+                yield f"data: {json.dumps({'type': 'token', 'content': event.get('content', '')})}\n\n"
+            elif et == "tool_start":
+                yield f"data: {json.dumps({'type': 'tool_start', 'name': event.get('name'), 'args': event.get('args')})}\n\n"
+            elif et == "tool_result":
+                yield f"data: {json.dumps({'type': 'tool_result', 'name': event.get('name'), 'result': event.get('result')})}\n\n"
+            elif et == "error":
+                yield f"data: {json.dumps({'type': 'error', 'error': event.get('content', 'error')})}\n\n"
+            else:
+                # Forward unknown event types as JSON for forward-compat
+                yield f"data: {json.dumps(event)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -445,26 +480,26 @@ async def chat(request: Request, user: dict = Depends(protect)):
 # ── Session endpoints ──────────────────────────────────────────────────────
 
 @app.post("/sessions")
-async def create_new_session(user: dict = Depends(protect)):
+async def create_new_session(user: dict = Depends(require_feature("chat"))):
     session_id = str(uuid.uuid4())
     await create_session(session_id)
     return {"session_id": session_id}
 
 
 @app.get("/sessions")
-async def get_sessions(user: dict = Depends(protect)):
+async def get_sessions(user: dict = Depends(require_feature("chat"))):
     sessions = await list_sessions()
     return sessions
 
 
 @app.get("/sessions/{session_id}/messages")
-async def get_session_messages(session_id: str, user: dict = Depends(protect)):
+async def get_session_messages(session_id: str, user: dict = Depends(require_feature("chat"))):
     messages = await get_messages(session_id)
     return [m for m in messages if m.get("role") in ("user", "assistant")]
 
 
 @app.delete("/sessions/{session_id}")
-async def delete_session_endpoint(session_id: str, user: dict = Depends(protect)):
+async def delete_session_endpoint(session_id: str, user: dict = Depends(require_feature("chat"))):
     await delete_session(session_id)
     return {"ok": True}
 
@@ -472,7 +507,7 @@ async def delete_session_endpoint(session_id: str, user: dict = Depends(protect)
 # ── COGS endpoints ─────────────────────────────────────────────────────────
 
 @app.post("/cogs/upload")
-async def upload_cogs(request: Request, user: dict = Depends(protect)):
+async def upload_cogs(request: Request, user: dict = Depends(require_feature("cogs"))):
     """Accept a CSV body (text/csv or text/plain) with columns sku, unit_cost,
     and optionally inbound_shipping_per_unit. Upserts rows into the cogs table.
     """
@@ -525,7 +560,7 @@ async def upsert_cogs_single(
 
 
 @app.delete("/cogs/{sku}")
-async def delete_cogs_endpoint(sku: str, user: dict = Depends(protect)):
+async def delete_cogs_endpoint(sku: str, user: dict = Depends(require_feature("cogs"))):
     removed = await delete_cogs(sku)
     return {"removed": removed, "sku": sku}
 
@@ -1688,7 +1723,7 @@ async def deals_endpoint(
     days_back: int = 90,
     start: str | None = None,
     end: str | None = None,
-    user: dict = Depends(protect),
+    user: dict = Depends(require_feature("deals")),
 ):
     """One endpoint powers the Deals tab. Three sections:
 
@@ -1772,7 +1807,7 @@ async def amazon_orders(
     status: str | None = None,
     marketplace: str | None = None,
     buyer_email: str | None = None,
-    user: dict = Depends(protect),
+    user: dict = Depends(require_feature("orders")),
 ):
     """List orders in the requested window across all pages (no FE pagination).
 
@@ -1840,7 +1875,7 @@ async def amazon_orders(
 
 
 @app.get("/amazon/orders/{order_id}/items")
-async def amazon_order_items(order_id: str, user: dict = Depends(protect)):
+async def amazon_order_items(order_id: str, user: dict = Depends(require_feature("orders"))):
     """Line items for a single order — used to expand a row in the FE table."""
     if ORDERS_SOURCE == "db":
         return await data_resolver.get_order_items_resolved(user, order_id)
@@ -1849,7 +1884,7 @@ async def amazon_order_items(order_id: str, user: dict = Depends(protect)):
 
 
 @app.get("/campaigns/performance")
-async def campaigns_performance(user: dict = Depends(protect)):
+async def campaigns_performance(user: dict = Depends(require_feature("campaigns"))):
     """Structured campaign performance — feeds the Campaigns tab."""
     return await analyze_performance_data(full=True)
 
@@ -2700,6 +2735,38 @@ async def listings_analyze(
     return result
 
 
-# Serve frontend static files
+# Serve frontend — inject enabled tabs into index.html (env-aware).
 frontend_dir = Path(__file__).parent.parent / "frontend"
+_INDEX_HTML_PATH = frontend_dir / "index.html"
+
+
+@app.get("/", response_class=HTMLResponse)
+@app.get("/index.html", response_class=HTMLResponse)
+async def serve_index():
+    raw = _INDEX_HTML_PATH.read_text(encoding="utf-8")
+    tabs_json = json.dumps(get_enabled_tabs())
+    env_json = json.dumps(get_ai_capabilities()["environment"])
+    inject = (
+        f"<script>window.__AURORA_AI_TABS__={tabs_json};"
+        f"window.__AURORA_AI_ENV__={env_json};</script>"
+    )
+    if "</head>" in raw:
+        html = raw.replace("</head>", inject + "</head>", 1)
+    else:
+        html = inject + raw
+    # Replace hardcoded VISIBLE_TABS with injected list (fail closed to production).
+    marker = "const VISIBLE_TABS ="
+    idx = html.find(marker)
+    if idx >= 0:
+        end = html.find(";", idx)
+        if end > idx:
+            html = (
+                html[:idx]
+                + "const VISIBLE_TABS = (window.__AURORA_AI_TABS__ && window.__AURORA_AI_TABS__.length)"
+                + " ? window.__AURORA_AI_TABS__ : ['restock','profit','keywords','listings']"
+                + html[end:]
+            )
+    return HTMLResponse(html)
+
+
 app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")

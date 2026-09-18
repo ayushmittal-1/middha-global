@@ -22,31 +22,86 @@ def _user_key() -> str:
 
 async def fetch_all_campaigns(user: dict | None = None) -> None:
     """Load campaigns for the authenticated user — Aurora Mongo first when
-    AURORA_DATA_SOURCE=db, otherwise Aurora REST API."""
+    AURORA_DATA_SOURCE=db, otherwise Aurora REST API.
+
+    AI-embed JWTs cannot call Aurora's cookie/session `/api/ads` route, so
+    when the request is proxied from Node we stay on the DB path and never
+    surface a 500 if the remote ads API rejects the token.
+    """
     user = user or require_user()
     from aurora_data import aurora_db_enabled, fetch_campaigns
 
+    all_campaigns: list[dict] = []
+    source = "empty"
+
     if aurora_db_enabled():
         all_campaigns = await fetch_campaigns(user)
-        if not all_campaigns:
+        source = "aurora_db"
+        if not all_campaigns and _can_use_aurora_ads_api(user):
             print(f"No campaigns in Aurora DB for {user.get('email')} — trying Aurora API")
             all_campaigns = await _fetch_campaigns_from_api(user)
+            source = "aurora_api" if all_campaigns else "aurora_db_empty"
+        elif not all_campaigns:
+            print(
+                f"No campaigns in Aurora DB for {user.get('email')} — "
+                "skipping Aurora API (AI embed token cannot auth /api/ads)"
+            )
+            source = "aurora_db_empty"
     else:
-        all_campaigns = await _fetch_campaigns_from_api(user)
+        if _can_use_aurora_ads_api(user):
+            all_campaigns = await _fetch_campaigns_from_api(user)
+            source = "aurora_api" if all_campaigns else "aurora_api_empty"
+        else:
+            print(
+                f"Campaigns API skipped for {user.get('email')} — "
+                "AI embed token cannot auth /api/ads; set AURORA_DATA_SOURCE=db"
+            )
+            source = "skipped_embed"
+
+    # Aurora DB uses status Active/Paused/Archived; analysis expects Enabled.
+    for c in all_campaigns:
+        if c.get("status") == "Active":
+            c["status"] = "Enabled"
 
     key = str(user["_id"])
     _user_campaigns[key] = all_campaigns
     _user_summary[key] = _build_summary(all_campaigns)
     print(
-        f"Loaded {len(all_campaigns)} campaigns for user {user.get('email')} "
-        f"({'aurora_db' if aurora_db_enabled() else 'aurora_api'})"
+        f"Loaded {len(all_campaigns)} campaigns for user {user.get('email')} ({source})"
     )
+
+
+def _can_use_aurora_ads_api(user: dict) -> bool:
+    """True when the Bearer token is a normal Aurora session JWT (not ai_embed)."""
+    token = user.get("_token")
+    if not token:
+        return False
+    if user.get("_token_type") == "ai_embed":
+        return False
+    try:
+        import jwt as _jwt
+        from auth import JWT_SECRET
+        decoded = _jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False, "verify_exp": False},
+        )
+        if decoded.get("type") == "ai_embed":
+            return False
+        if decoded.get("aud") in ("aurora-ai-embed", ["aurora-ai-embed"]):
+            return False
+    except Exception:
+        # If we can't inspect, still attempt — _fetch catches HTTP errors.
+        pass
+    return True
 
 
 async def _fetch_campaigns_from_api(user: dict) -> list[dict]:
     token = user.get("_token")
     if not token:
-        raise RuntimeError("Authenticated user has no Bearer token attached")
+        print("[campaigns] no Bearer token — cannot call Aurora ads API")
+        return []
 
     headers = {
         "accept": "*/*",
@@ -58,26 +113,42 @@ async def _fetch_campaigns_from_api(user: dict) -> list[dict]:
     all_campaigns: list[dict] = []
     page = 1
     limit = 100
+    api_url = os.getenv("AURORA_API_URL") or AURORA_API_URL
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        while True:
-            params = {
-                "page": page,
-                "limit": limit,
-                "sortBy": "campaignName",
-                "sortOrder": "asc",
-            }
-            resp = await client.get(AURORA_API_URL, headers=headers, params=params)
-            resp.raise_for_status()
-            data = resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            while True:
+                params = {
+                    "page": page,
+                    "limit": limit,
+                    "sortBy": "campaignName",
+                    "sortOrder": "asc",
+                }
+                resp = await client.get(api_url, headers=headers, params=params)
+                if resp.status_code in (401, 403):
+                    print(
+                        f"[campaigns] Aurora ads API {resp.status_code} — "
+                        "token not accepted for /api/ads; returning empty list"
+                    )
+                    return []
+                if resp.status_code >= 400:
+                    print(
+                        f"[campaigns] Aurora ads API HTTP {resp.status_code}: "
+                        f"{(resp.text or '')[:200]}"
+                    )
+                    return []
+                data = resp.json()
 
-            ads = data.get("ads", [])
-            all_campaigns.extend(ads)
+                ads = data.get("ads", [])
+                all_campaigns.extend(ads)
 
-            total = data.get("pagination", {}).get("total", 0)
-            if len(all_campaigns) >= total or not ads:
-                break
-            page += 1
+                total = data.get("pagination", {}).get("total", 0)
+                if len(all_campaigns) >= total or not ads:
+                    break
+                page += 1
+    except Exception as e:
+        print(f"[campaigns] Aurora ads API failed: {e}")
+        return []
 
     extras = await _load_middha_campaigns(user["_id"])
     if extras:
@@ -332,10 +403,24 @@ async def analyze_performance_data(full: bool = False) -> dict:
     recommendations. When full=True, also includes every campaign with its
     derived ACOS/ROI under `campaigns` — used by the FE table. The LLM tool
     uses full=False so the response stays compact."""
-    await _ensure_loaded()
-    campaigns = _user_campaigns[_user_key()]
+    try:
+        await _ensure_loaded()
+    except Exception as e:
+        print(f"[campaigns] analyze_performance_data load failed: {e}")
+        return {
+            "empty": True,
+            "warning": "Campaign data is temporarily unavailable. Try again after Ads sync.",
+        }
+
+    campaigns = _user_campaigns.get(_user_key(), [])
     if not campaigns:
-        return {"empty": True}
+        return {
+            "empty": True,
+            "warning": (
+                "No campaign rows found for this account yet. "
+                "Open Campaign in Aurora and wait for Ads sync, then refresh."
+            ),
+        }
 
     top_performers: list[dict] = []
     underperformers: list[dict] = []

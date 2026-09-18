@@ -143,3 +143,44 @@ def test_wrong_audience_is_rejected():
         auth._verify_token(token)
     assert exc.value.status_code == 401
     assert "token failed" in exc.value.detail
+
+
+def test_embed_token_wrong_issuer_is_rejected():
+    from datetime import datetime, timedelta, timezone
+    from fastapi import HTTPException
+
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {
+            "id": "507f1f77bcf86cd799439011",
+            "type": "ai_embed",
+            "exp": now + timedelta(minutes=15),
+            "iss": "evil-issuer",
+            "aud": "aurora-ai-embed",
+        },
+        _TEST_JWT_SECRET,
+        algorithm="HS256",
+    )
+    with pytest.raises(HTTPException) as exc:
+        auth._verify_token(token)
+    assert exc.value.status_code == 401
+
+
+def test_embed_token_missing_type_is_rejected():
+    from datetime import datetime, timedelta, timezone
+    from fastapi import HTTPException
+
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {
+            "id": "507f1f77bcf86cd799439011",
+            "exp": now + timedelta(minutes=15),
+            "iss": "aurora-backend",
+            "aud": "aurora-ai-embed",
+        },
+        _TEST_JWT_SECRET,
+        algorithm="HS256",
+    )
+    with pytest.raises(HTTPException) as exc:
+        auth._verify_token(token)
+    assert exc.value.status_code == 401

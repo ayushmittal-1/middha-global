@@ -27,6 +27,7 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "test")
 # Must match auroraBackend signAiEmbedToken / jwtTokens audiences.
 AI_EMBED_AUDIENCE = "aurora-ai-embed"
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "aurora-app")
+JWT_ISSUER = os.getenv("JWT_ISSUER", "aurora-backend")
 
 _client: Optional[AsyncIOMotorClient] = None
 
@@ -84,6 +85,16 @@ def _verify_token(token: str) -> dict:
         allowed = {AI_EMBED_AUDIENCE, JWT_AUDIENCE}
         if not claim_auds.intersection(allowed):
             raise HTTPException(status_code=401, detail="Not authorized, token failed")
+        # Aurora embed JWTs must carry the expected issuer + type. Local
+        # /api/auth/login tokens omit aud/iss and are unchanged below.
+        if AI_EMBED_AUDIENCE in claim_auds:
+            iss = decoded.get("iss")
+            if iss != JWT_ISSUER:
+                raise HTTPException(status_code=401, detail="Not authorized, token failed")
+            if decoded.get("type") != "ai_embed":
+                raise HTTPException(status_code=401, detail="Not authorized, token failed")
+            if not decoded.get("id"):
+                raise HTTPException(status_code=401, detail="Not authorized, no user id in token")
 
     return decoded
 
@@ -112,8 +123,16 @@ async def protect(authorization: Optional[str] = Header(default=None)) -> dict:
     decoded = _verify_token(token)
     user = await _load_user(decoded.get("id"))
     # Stash the raw JWT so downstream code (e.g. calls to Aurora's REST API)
-    # can reuse it without re-signing.
+    # can reuse it without re-signing. Mark embed tokens — they cannot auth
+    # Aurora session routes like GET /api/ads.
     user["_token"] = token
+    aud = decoded.get("aud")
+    is_embed = (
+        decoded.get("type") == "ai_embed"
+        or aud == "aurora-ai-embed"
+        or (isinstance(aud, (list, tuple, set)) and "aurora-ai-embed" in aud)
+    )
+    user["_token_type"] = "ai_embed" if is_embed else (decoded.get("type") or "session")
     current_user.set(user)
     return user
 
