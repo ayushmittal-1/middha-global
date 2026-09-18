@@ -3405,14 +3405,19 @@
     }
     document.querySelectorAll('.tab-btn').forEach(b => {
       if (!VISIBLE_TABS.includes(b.dataset.tab)) b.style.display = 'none';
+      else b.style.display = '';
       b.addEventListener('click', () => setActiveTab(b.dataset.tab));
     });
-    // Chat is hidden, so its sidebar controls go with it. The COGS panel stays —
-    // Profitability depends on those uploads.
+    // Chat sidebar only when Chat tab is enabled for this environment.
     ['new-chat-btn', 'session-list'].forEach(id => {
       const el = document.getElementById(id);
-      if (el) el.style.display = 'none';
+      if (el) el.style.display = VISIBLE_TABS.includes('chat') ? '' : 'none';
     });
+    // Sidebar CSV COGS panel — only when COGS feature is enabled.
+    const cogsPanelEl = document.getElementById('cogs-panel');
+    if (cogsPanelEl) {
+      cogsPanelEl.style.display = VISIBLE_TABS.includes('cogs') ? '' : 'none';
+    }
 
     // ── Listing Optimizer ───────────────────────────────
     let loListLoaded = false;
