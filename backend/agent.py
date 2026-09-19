@@ -3185,6 +3185,17 @@ async def compute_profitability_data(
                     storage_meta["finances_exact_window_pages"] = (
                         fin_storage_exact.get("pages")
                     )
+            except (asyncio.TimeoutError, TimeoutError):
+                # Hitting PROFIT_FINANCES_WAIT_S is a deliberate deferral, not
+                # a failure: the shielded _load_finances task is still walking
+                # and will write put_finances_fee_cache. Reporting it via
+                # _sp_report_warning made a working design look broken
+                # ("report failed (TimeoutError: )").
+                warnings.append(
+                    "Storage: still adding up this window's FBAStorageFee "
+                    "posts in the background — showing $0 for now, it fills "
+                    "in on the next refresh."
+                )
             except Exception as e:
                 warnings.append(
                     _sp_report_warning("Storage (Finances window)", e)
