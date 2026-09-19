@@ -1,4 +1,5 @@
 from ast import List
+import asyncio
 import csv
 import io
 import json
@@ -1231,10 +1232,6 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
         return {"error": f"No forecast for {sku}. Run /forecasting/refresh first."}
     c = cached[0]
 
-    # Chart data — always 90 days of actuals for context.
-    since = datetime.now(timezone.utc) - _td(days=90)
-    raw_history = await get_sales_daily(sku=sku, since=since)
-
     # Live model refresh: recompute the forecast on the same 540-day
     # window the nightly cache job uses, so the top-card method label
     # and the accuracy card's "★ best" model agree. Using 30 days here
@@ -1243,8 +1240,38 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
     now_utc = datetime.now(timezone.utc)
     train_since = now_utc - _td(days=540)
     train_rows = await get_sales_daily(sku=sku, since=train_since)
+
+    # The 540-day training window is a strict superset of the 90-day chart
+    # history, the 180-day velocity window and the 120-day backtest window,
+    # so those are sliced from it in memory instead of re-querying Mongo
+    # three more times for the same SKU. Rows carry naive UTC dates and
+    # arrive unsorted, so each slice filters on a naive cutoff.
+    def _rows_since(days: int) -> list[dict]:
+        # Cutoff snaps to midnight because the underlying aggregation
+        # filters on each order's purchaseDate and then buckets by day:
+        # the boundary day's bucket is legitimately in range even though
+        # its midnight timestamp precedes `now_utc - days`. Comparing
+        # against the raw timestamp would silently drop that day.
+        cutoff = (now_utc - _td(days=days)).replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=None,
+        )
+        out: list[dict] = []
+        for _r in train_rows:
+            _d = _r.get("date")
+            if not isinstance(_d, datetime):
+                continue
+            if _d.tzinfo is not None:
+                _d = _d.astimezone(timezone.utc).replace(tzinfo=None)
+            if _d >= cutoff:
+                out.append(_r)
+        return out
+
+    # Chart data — always 90 days of actuals for context.
+    raw_history = _rows_since(90)
     try:
-        fresh = _forecast_one(train_rows, horizon=90, today=now_utc)
+        fresh = await asyncio.to_thread(
+            _forecast_one, train_rows, horizon=90, today=now_utc,
+        )
         live_forecast = fresh.get("forecast") or c.get("forecast")
         live_drivers = fresh.get("drivers") or c.get("drivers")
     except Exception:
@@ -1258,7 +1285,7 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
 
     # Weighted velocity from the last 180 days of Aurora sales — same
     # blend the restock endpoint uses, per-SKU weights honored.
-    wv_rows = await get_sales_daily(sku=sku, since=now_utc - _td(days=180))
+    wv_rows = _rows_since(180)
     windows = compute_velocity_windows(wv_rows, now_utc)
     sku_settings = await get_product_settings(sku)
     sku_weights = (
@@ -1377,8 +1404,7 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
         }
     backtest: dict | None = None
     try:
-        bt_since = now_utc - _td(days=120)
-        bt_rows = await get_sales_daily(sku=sku, since=bt_since)
+        bt_rows = _rows_since(120)
         cutoff = (now_utc - _td(days=30)).replace(
             hour=0, minute=0, second=0, microsecond=0,
         )
@@ -1404,7 +1430,9 @@ async def forecasting_sku_detail(sku: str, user: dict = Depends(protect)):
                     r.get("units_ordered") or 0,
                 )
 
-        bt_result = _forecast_one(train_rows_bt, horizon=30, today=cutoff)
+        bt_result = await asyncio.to_thread(
+            _forecast_one, train_rows_bt, horizon=30, today=cutoff,
+        )
         bt_days: list[dict] = []
         for r in bt_result.get("forecast") or []:
             d_key = r["date"][:10]

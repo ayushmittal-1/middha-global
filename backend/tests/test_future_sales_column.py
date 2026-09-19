@@ -35,7 +35,10 @@ def test_series_is_capped_at_the_cached_horizon(main_src):
     """The forecast cache is built with horizon=90, so the series must not
     claim to extend further than that."""
     assert "forecast[:90]" in main_src
-    assert "_forecast_one(train_rows, horizon=90" in main_src
+    # Matches both the direct call and the asyncio.to_thread form
+    # (`_forecast_one, train_rows, horizon=90`), so moving the fit off the
+    # event loop doesn't trip the guard while still pinning the horizon.
+    assert re.search(r"_forecast_one[,(]\s*train_rows,\s*horizon=90", main_src)
 
 
 def test_returns_view_exposes_the_scale_factor(main_src):
