@@ -503,7 +503,9 @@
       background: #fff;
       border-radius: 12px;
       border: 1px solid #e2e8f0;
-      overflow-x: hidden;
+      /* Scroll sideways rather than squeezing ~29 columns into the viewport
+         — overflow-x:hidden is what forced every header to clip mid-word. */
+      overflow-x: auto;
       overflow-y: auto;
       flex: 1;
       min-height: 0;
@@ -517,6 +519,21 @@
       border-collapse: separate;
       border-spacing: 0;
       font-size: 12px;
+    }
+    /* Restock-only layout. The shared table.restock rule above uses
+       table-layout:fixed, which splits the container into ~29 equal slivers
+       and clips most headers ("Sent to FB", "Unfulfilla", "Missed pro").
+       Size these columns to their content instead and let the wrapper scroll.
+       min-width:max-content also means the table shrinks back down as soon as
+       columns are hidden from the Columns panel, so it is never wider than
+       the columns actually on screen. */
+    #restock-table-wrap table.restock {
+      table-layout: auto;
+      min-width: max-content;
+    }
+    #restock-table-wrap table.restock thead th {
+      white-space: nowrap;
+      padding: 9px 10px;
     }
     #restock-table-wrap table.restock td {
       padding: 8px 10px;
@@ -613,7 +630,7 @@
     table.restock .date-cell {
       color: #475569;
       white-space: nowrap;
-      font-size: 10px;
+      font-size: 12px;
     }
     table.restock .next-arrival {
       font-size: 12px;
@@ -3335,7 +3352,6 @@
 
     function setActiveTab(tab) {
       if (!VISIBLE_TABS.includes(tab)) tab = VISIBLE_TABS[0];
-      document.body.classList.toggle('ai-show-sidebar', tab === 'chat');
       document.querySelectorAll('.tab-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === tab);
       });
@@ -3389,15 +3405,19 @@
     }
     document.querySelectorAll('.tab-btn').forEach(b => {
       if (!VISIBLE_TABS.includes(b.dataset.tab)) b.style.display = 'none';
+      else b.style.display = '';
       b.addEventListener('click', () => setActiveTab(b.dataset.tab));
     });
-    // Chat is hidden, so its sidebar controls go with it. The COGS panel stays —
-    // Profitability depends on those uploads.
+    // Chat sidebar only when Chat tab is enabled for this environment.
     ['new-chat-btn', 'session-list'].forEach(id => {
       const el = document.getElementById(id);
-      if (el) el.style.display = 'none';
+      if (el) el.style.display = VISIBLE_TABS.includes('chat') ? '' : 'none';
     });
-    setActiveTab(VISIBLE_TABS[0]);
+    // Sidebar CSV COGS panel — only when COGS feature is enabled.
+    const cogsPanelEl = document.getElementById('cogs-panel');
+    if (cogsPanelEl) {
+      cogsPanelEl.style.display = VISIBLE_TABS.includes('cogs') ? '' : 'none';
+    }
 
     // ── Listing Optimizer ───────────────────────────────
     let loListLoaded = false;

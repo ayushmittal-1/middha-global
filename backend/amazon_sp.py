@@ -3484,6 +3484,17 @@ async def download_report_raw(report_id: str, max_polls: int = 30, poll_interval
     if cached is not None:
         return cached
 
+    # Durable second tier. Report bodies never change once DONE, so a hit
+    # here is always correct and skips getReport + getReportDocument + the
+    # object fetch — all throttled endpoints. Imported lazily to keep
+    # amazon_sp free of a module-level dependency on database.
+    from database import get_report_body_cache, put_report_body_cache
+
+    persisted = await get_report_body_cache(report_id)
+    if persisted is not None:
+        _REPORT_TEXT_CACHE[report_id] = persisted
+        return persisted
+
     for _ in range(max_polls):
         status = await get_report(report_id)
         processing_status = status.get("processingStatus", "")
@@ -3506,6 +3517,7 @@ async def download_report_raw(report_id: str, max_polls: int = 30, poll_interval
                 # Drop an arbitrary oldest entry (insertion order in 3.7+).
                 _REPORT_TEXT_CACHE.pop(next(iter(_REPORT_TEXT_CACHE)), None)
             _REPORT_TEXT_CACHE[report_id] = text
+            await put_report_body_cache(report_id, text)
             return text
         if processing_status in ("CANCELLED", "FATAL"):
             raise RuntimeError(f"Report {report_id} failed: {processing_status}")
