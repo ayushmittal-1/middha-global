@@ -183,11 +183,16 @@ def compute_reorder(
     ocean_default = int(settings.get("ocean_transit_days") or OCEAN_TRANSIT_DAYS)
     fba_transit = ps.get("shipping_to_fba_days")
     fba_transit = int(fba_transit) if fba_transit is not None else air_default
-    mfg_time = int(ps.get("manufacturing_time_days") or 0)
     to_prep = int(ps.get("shipping_to_prep_days") or 0) if ps.get("use_prep_center") else 0
     buffer = int(ps.get("fba_buffer_days") or 0)
-    air_lead_days = mfg_time + to_prep + fba_transit + buffer
-    ocean_lead_days = mfg_time + to_prep + ocean_default + buffer
+    # manufacturing_time_days is deliberately NOT part of these. "Ship by" is
+    # a dispatch deadline — the date the goods must physically leave — and
+    # manufacturing happens before dispatch, so folding it in pushed every
+    # ship-by date weeks early. Same reasoning that removed prep_lead_time_days
+    # in b809d12. The field is still stored and editable for PO planning; it
+    # just no longer moves the air/ocean deadlines.
+    air_lead_days = to_prep + fba_transit + buffer
+    ocean_lead_days = to_prep + ocean_default + buffer
 
     moq = int(settings.get("moq", 1))
     target_cover = int(
