@@ -3129,8 +3129,21 @@ async def compute_profitability_data(
     # Payments → Transactions. Never invent neighbor-month report totals.
     storage_from_finances = False
     if float(storage_report_total or 0) <= 0:
+        # This fallback used to sit on the critical path with two unbounded
+        # awaits — `await finances_task`, then a paginate=True walk capped at
+        # 200 pages — placed *after* the deadline gather. That is why a large
+        # seller still waited ~70s even once the gather was bounded to 6s:
+        # the Finances API is throttled and pages 19+ times for a busy
+        # account. Both are now bounded by one shared budget. _load_finances
+        # is shielded so it keeps running and writes put_finances_fee_cache,
+        # which means the next poll takes the cached path instead of walking
+        # Amazon again.
+        fin_budget_s = _env_float("PROFIT_FINANCES_WAIT_S", 5.0)
+        fin_deadline = time.monotonic() + fin_budget_s
         try:
-            await finances_task
+            await asyncio.wait_for(
+                asyncio.shield(finances_task), timeout=fin_budget_s,
+            )
         except Exception:
             pass
         trust_shared_storage = (
@@ -3141,13 +3154,22 @@ async def compute_profitability_data(
         exact_storage_unattr: dict = {}
         if not trust_shared_storage:
             try:
-                fin_storage_exact = await amazon_sp.get_financial_events(
-                    posted_after=placement_posted_after,
-                    posted_before=placement_posted_before,
-                    paginate=True,
-                    max_pages=200,
-                    storage_posted_after=placement_posted_after,
-                    storage_posted_before=placement_posted_before,
+                fin_remaining = max(0.0, fin_deadline - time.monotonic())
+                if fin_remaining <= 0:
+                    raise TimeoutError(
+                        "Finances storage budget exhausted before the "
+                        "exact-window walk could start"
+                    )
+                fin_storage_exact = await asyncio.wait_for(
+                    amazon_sp.get_financial_events(
+                        posted_after=placement_posted_after,
+                        posted_before=placement_posted_before,
+                        paginate=True,
+                        max_pages=200,
+                        storage_posted_after=placement_posted_after,
+                        storage_posted_before=placement_posted_before,
+                    ),
+                    timeout=fin_remaining,
                 )
                 if fin_storage_exact.get("truncated"):
                     warnings.append(
