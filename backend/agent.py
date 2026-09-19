@@ -1985,6 +1985,23 @@ async def _get_report_sem() -> asyncio.Semaphore:
 _BG_TASKS: set[asyncio.Task] = set()
 
 
+# Reading a cache with this TTL returns the entry whatever its age. Used
+# for stale-while-revalidate: a three-week-old removal figure is far more
+# useful to show than $0, and `access_denied` entries still expire after
+# 1h inside _fresh(), so a stale read can never resurrect a denial.
+_STALE_TTL_HOURS = 24 * 365
+
+
+def _env_float(name: str, default: float) -> float:
+    """Deadline knobs are env-tunable so an operator can retune first-paint
+    latency against Amazon's throttling without a redeploy."""
+    try:
+        raw = (os.getenv(name) or "").strip()
+        return float(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _fire_bg(coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
     _BG_TASKS.add(task)
@@ -2451,6 +2468,19 @@ async def compute_profitability_data(
             fin_cached = await get_finances_fee_cache(
                 charges_start_iso, charges_end_iso, max_age_hours=24,
             )
+            if not fin_cached:
+                # Stale Finances beats a $0 "Low Inv" column. The live walk
+                # below still runs and refreshes the cache for the next poll.
+                fin_stale = await get_finances_fee_cache(
+                    charges_start_iso, charges_end_iso,
+                    max_age_hours=_STALE_TTL_HOURS,
+                )
+                if fin_stale:
+                    # No finances_meta dict exists on the response, so the
+                    # staleness signal rides on partial_sections: the live
+                    # walk is still running, so "finances" stays listed as
+                    # incomplete until it lands and the next poll picks it up.
+                    fin_cached = fin_stale
             if fin_cached:
                 fin_by_sku = fin_cached.get("by_sku") or {}
                 unattributed_fees = (
@@ -2761,6 +2791,30 @@ async def compute_profitability_data(
             removal_cache = await get_removal_fees_cache(
                 charges_start_iso, charges_end_iso, max_age_hours=24,
             )
+            # Stale-while-revalidate: publish the last known figure straight
+            # away so the row renders a real number, then fall through to the
+            # live fetch below, which overwrites these nonlocals and rewrites
+            # the cache. The request itself does not wait for that — it is
+            # bounded by critical_deadline_s — so the fresh value lands on the
+            # next poll instead of holding first paint hostage.
+            if not removal_cache:
+                stale = await get_removal_fees_cache(
+                    charges_start_iso, charges_end_iso,
+                    max_age_hours=_STALE_TTL_HOURS,
+                )
+                if stale and not stale.get("access_denied"):
+                    removal_fees_by_sku = _build_removal_fees(
+                        stale.get("per_sku") or {},
+                    )
+                    removal_report_total = round(
+                        float(stale.get("report_total") or 0)
+                        or sum(removal_fees_by_sku.values()),
+                        2,
+                    )
+                    removal_meta["source"] = "charges_cache_stale"
+                    removal_meta["stale"] = True
+                    removal_meta["as_of"] = stale.get("updated_at")
+                    removal_meta["report_total"] = removal_report_total
             if removal_cache and not removal_cache.get("access_denied"):
                 removal_fees_by_sku = _build_removal_fees(
                     removal_cache.get("per_sku") or {},
@@ -2795,10 +2849,14 @@ async def compute_profitability_data(
                 await put_removal_fees_cache(
                     {}, charges_start_iso, charges_end_iso, access_denied=True,
                 )
-            removal_fees_by_sku = {}
+            # Keep any stale figure already published above — zeroing here
+            # would turn "last known value" back into a misleading $0 for
+            # exactly the failure case stale-serving exists to cover.
+            if not removal_meta.get("stale"):
+                removal_fees_by_sku = {}
+                removal_report_total = 0.0
+                removal_meta["source"] = "unavailable"
             removal_fees_trusted = False
-            removal_report_total = 0.0
-            removal_meta["source"] = "unavailable"
 
     async def _load_reimbursements():
         # FBA Reimbursements report (GET_FBA_REIMBURSEMENTS_DATA), approval-date
@@ -2809,6 +2867,18 @@ async def compute_profitability_data(
             reimb_cache = await get_reimbursements_cache(
                 charges_start_iso, charges_end_iso, max_age_hours=24,
             )
+            if not reimb_cache:
+                stale = await get_reimbursements_cache(
+                    charges_start_iso, charges_end_iso,
+                    max_age_hours=_STALE_TTL_HOURS,
+                )
+                if stale and not stale.get("access_denied"):
+                    reimbursement_report_total = round(
+                        float(stale.get("report_total") or 0), 2,
+                    )
+                    reimbursement_meta["source"] = "charges_cache_stale"
+                    reimbursement_meta["stale"] = True
+                    reimbursement_meta["as_of"] = stale.get("updated_at")
             if reimb_cache and not reimb_cache.get("access_denied"):
                 reimbursement_report_total = round(
                     float(reimb_cache.get("report_total") or 0), 2,
@@ -2970,8 +3040,15 @@ async def compute_profitability_data(
     # 2) Critical fee sources (incl. aged charges + storage + removal) await
     #    longer so first paint is usable when Amazon finishes in time;
     #    otherwise the shared bg task + FE auto-reload hits the warmed cache.
-    soft_deadline_s = 5.0
-    critical_deadline_s = 90.0
+    # First paint must not wait on Amazon. The critical tier used to block
+    # for 90s, which is why this endpoint took ~95s wall-clock while still
+    # returning `complete: false` — the report APIs are throttled hard
+    # enough that they rarely finish inside any tolerable request budget.
+    # Now we wait only long enough for cache hits and already-warm tasks to
+    # land; anything slower keeps running in the background (_BG_TASKS holds
+    # a strong ref) and warms the cache for the next poll.
+    soft_deadline_s = _env_float("PROFIT_SOFT_DEADLINE_S", 5.0)
+    critical_deadline_s = _env_float("PROFIT_CRITICAL_DEADLINE_S", 6.0)
     all_tasks = {**critical_tasks, **soft_tasks}
     await asyncio.wait(list(all_tasks.values()), timeout=soft_deadline_s)
     still_critical = [

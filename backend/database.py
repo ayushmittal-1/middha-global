@@ -27,7 +27,9 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 
-from bson import ObjectId
+import gzip
+
+from bson import Binary, ObjectId
 from pymongo import UpdateOne
 from pymongo.errors import DocumentTooLarge
 
@@ -795,6 +797,80 @@ def _fee_window_cache_key(start_iso: str, end_iso: str) -> str:
         + "__"
         + str(end_iso).replace(".", "_").replace("$", "_")
     )
+
+
+# ── Report body cache ────────────────────────────────────────────────────
+# SP-API report bodies are immutable once the report reaches DONE, so they
+# can be cached by reportId with no freshness reasoning at all. This is the
+# durable twin of amazon_sp._REPORT_TEXT_CACHE, which only survives for the
+# lifetime of one process: re-downloading a report costs a getReport +
+# getReportDocument + object fetch, and those endpoints are throttled hard
+# enough that repeated profitability loads were burning the quota on work
+# already done.
+_REPORT_BODY_MAX_BYTES = 12 * 1024 * 1024  # stay well inside Mongo's 16MB cap
+_REPORT_BODY_TTL_DAYS = 45
+_report_body_index_ready = False
+
+
+def _report_body_cache():
+    return _db().reportBodyCache
+
+
+async def _ensure_report_body_index() -> None:
+    """Create the TTL index once per process. Bodies are pure cache, so
+    letting Mongo expire them keeps the collection from growing without
+    bound; failure here is non-fatal because the cache stays correct."""
+    global _report_body_index_ready
+    if _report_body_index_ready:
+        return
+    try:
+        await _report_body_cache().create_index(
+            "createdAt", expireAfterSeconds=_REPORT_BODY_TTL_DAYS * 24 * 3600,
+        )
+    except Exception:
+        pass
+    _report_body_index_ready = True
+
+
+async def get_report_body_cache(report_id: str) -> str | None:
+    """Return a previously downloaded report body, or None."""
+    if not report_id:
+        return None
+    try:
+        doc = await _report_body_cache().find_one(
+            {"userId": _user_oid(), "reportId": str(report_id)},
+        )
+    except Exception:
+        return None
+    if not doc or not doc.get("gz"):
+        return None
+    try:
+        return gzip.decompress(bytes(doc["gz"])).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+async def put_report_body_cache(report_id: str, text: str) -> None:
+    """Persist a DONE report body. Oversized bodies are skipped rather than
+    risking a document-too-large write — the caller still has the text."""
+    if not report_id or not text:
+        return
+    try:
+        blob = gzip.compress(text.encode("utf-8"), compresslevel=6)
+        if len(blob) > _REPORT_BODY_MAX_BYTES:
+            return
+        await _ensure_report_body_index()
+        await _report_body_cache().update_one(
+            {"userId": _user_oid(), "reportId": str(report_id)},
+            {"$set": {
+                "gz": Binary(blob),
+                "chars": len(text),
+                "createdAt": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+    except Exception:
+        pass
 
 
 def _closed_window_ttl_hours(end_iso: str, max_age_hours: int = 24) -> int:
