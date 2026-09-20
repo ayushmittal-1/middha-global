@@ -47,4 +47,8 @@ jobs:
         working-directory: backend
         run: |
           DESELECT=$(grep -v '^#' tests/known_broken.txt | awk '{print "--deselect="$0}')
-          pytest tests/ -q $DESELECT
+          # `python -m pytest`, not the `pytest` script: the -m form puts the
+          # working directory on sys.path, which is how the suite resolves its
+          # flat imports (amazon_sp, auth, aurora_data...). The bare script
+          # does not, and every test module fails to collect.
+          python -m pytest tests/ -q $DESELECT
