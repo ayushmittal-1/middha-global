@@ -274,6 +274,8 @@ async def lifespan(app: FastAPI):
         await shutdown_browser()
 
 
+_STARTED_AT = datetime.now(timezone.utc).isoformat()
+
 app = FastAPI(lifespan=lifespan)
 
 # Rate limiter must be attached to the app + wire the 429 handler.
@@ -2795,6 +2797,35 @@ async def serve_index():
                 + html[end:]
             )
     return HTMLResponse(html)
+
+
+@app.get("/version")
+async def version():
+    """Which commit is actually serving this request.
+
+    Deploys are pull-based (a systemd timer on the instance polls
+    origin/main), so there is no CI job whose green tick proves what landed.
+    This is how you check: curl it and compare the sha to origin/main.
+
+    Unauthenticated on purpose — it has to be callable by a health check or
+    a deploy script that holds no credentials. It returns a short sha and
+    nothing else; no config, no env, no paths.
+    """
+    sha = (os.getenv("GIT_COMMIT") or "").strip()
+    if not sha:
+        # The instance runs from a git checkout, so ask git directly. Any
+        # failure (no git, not a repo, e.g. a container build) just yields
+        # "unknown" rather than breaking the endpoint.
+        try:
+            import subprocess
+            sha = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(Path(__file__).parent.parent),
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except Exception:
+            sha = ""
+    return {"commit": sha or "unknown", "started_at": _STARTED_AT}
 
 
 app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
