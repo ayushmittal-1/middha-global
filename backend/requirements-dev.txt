@@ -9,3 +9,12 @@
 #   pip install -r requirements-dev.txt
 
 -r requirements.txt
+
+# The test runner. Was previously undeclared and only present in local
+# virtualenvs, so CI failed with "pytest: command not found" the first time
+# the suite ran anywhere but a developer's machine.
+pytest==9.1.1
+# 29 of the tests are `async def`; without this plugin pytest reports
+# "async def functions are not natively supported" and skips them —
+# 54 such warnings turned into 27 CI failures before it was declared.
+pytest-asyncio==1.4.0

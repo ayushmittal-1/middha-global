@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main, prod]
+  pull_request:
+    branches: [main, prod]
+
+jobs:
+  tests:
+    name: backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # numpy 2.5.0 requires >=3.12, so 3.11 cannot resolve the pinned set
+      # even though the README says "3.11+". Matches the EC2 interpreter.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Resolve dependencies
+        # Same two deviations the EC2 deploy makes, for the same reasons:
+        # gluonts[torch] + pytorch-lightning pull ~1.5GB of torch that only
+        # loads behind DEEPTS_ENABLED, and xgboost 3.x hard-depends on
+        # nvidia-nccl-cu13 (~250MB of CUDA). Installing what production
+        # actually runs also keeps CI honest.
+        run: |
+          grep -vE '^(gluonts\[torch\]|pytorch-lightning)==' backend/requirements.txt \
+            | sed 's/^xgboost==/xgboost-cpu==/' > backend/requirements-ci.txt
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements-ci.txt
+          # The test-runner pins (pytest, pytest-asyncio) live in
+          # requirements-dev.txt, but that file re-includes
+          # requirements.txt, so install the pin directly rather than the file:
+          # the include is not followed, and pytest's own small deps (pluggy,
+          # iniconfig, packaging) still resolve. --no-deps would skip those and
+          # leave pytest unimportable.
+          pip install $(grep -E '^pytest' backend/requirements-dev.txt | tr '\n' ' ')
+
+      - name: Run tests
+        # The suite needs no .env and no secrets — verified by running it
+        # with the file absent and the environment cleared.
+        working-directory: backend
+        run: |
+          DESELECT=$(grep -v '^#' tests/known_broken.txt | awk '{print "--deselect="$0}')
+          # `python -m pytest`, not the `pytest` script: the -m form puts the
+          # working directory on sys.path, which is how the suite resolves its
+          # flat imports (amazon_sp, auth, aurora_data...). The bare script
+          # does not, and every test module fails to collect.
+          python -m pytest tests/ -q $DESELECT
