@@ -34,10 +34,12 @@ jobs:
             | sed 's/^xgboost==/xgboost-cpu==/' > backend/requirements-ci.txt
           python -m pip install --upgrade pip
           pip install -r backend/requirements-ci.txt
-          # pytest lives in requirements-dev.txt, which re-includes
-          # requirements.txt — install it with --no-deps so it cannot pull
-          # the untrimmed torch stack back in behind our backs.
-          pip install --no-deps $(grep -E '^pytest==' backend/requirements-dev.txt)
+          # pytest lives in requirements-dev.txt, but that file re-includes
+          # requirements.txt, so install the pin directly rather than the file:
+          # the include is not followed, and pytest's own small deps (pluggy,
+          # iniconfig, packaging) still resolve. --no-deps would skip those and
+          # leave pytest unimportable.
+          pip install $(grep -E '^pytest==' backend/requirements-dev.txt)
 
       - name: Run tests
         # The suite needs no .env and no secrets — verified by running it
