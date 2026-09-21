@@ -1136,7 +1136,18 @@ def _multimodel_forecast(
                         "falling back to naive", sku, e)
             refit_choice = "naive"
             fwd = _naive_forecast(full_fit, horizon, today)
-    elif refit_choice in ("croston", "tsb", "ewma_short", "damped_ets") or refit_choice.startswith("naive_tail"):
+    # `refit_choice` is `bt_winner`, which is None when the backtest found no
+    # scorable candidate. None matches no branch above, and the `in` test here
+    # is False, so evaluation fell through to .startswith() on None and raised
+    # AttributeError. That exception was caught by the caller's
+    # `except Exception: continue`, so the SKU was silently skipped and its
+    # previous forecastCache row survived untouched — which is why some SKUs
+    # showed forecasts months out of date. Guarding lets None reach the final
+    # `else`, which already does the right thing (naive forecast).
+    elif refit_choice and (
+        refit_choice in ("croston", "tsb", "ewma_short", "damped_ets")
+        or refit_choice.startswith("naive_tail")
+    ):
         # All intermittent + regime-rescue methods are closed-form —
         # refit is free.
         from .intermittent import (
