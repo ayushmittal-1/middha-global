@@ -2,21 +2,32 @@
 Keyword sourcing → scoring → 3x3 matrix journey.
 
 Given a list of ASINs, this module:
-  1. Sources keywords from three paths (per source, per ASIN, deduped):
-       - Amazon suggested keywords (Ads API, seeded by ASIN)
-       - Meta ad interests (Marketing API, seeded by product title) [TODO token]
-       - Amazon autocomplete (public endpoint, seeded by product title)
-  2. Enriches every keyword with Brand Analytics (SFR, click share,
+  1. Builds a `keyword_relevance.ProductProfile` per ASIN from the SP-API
+     catalog — item type, browse node, product type. This is what the
+     product IS, as opposed to how its title markets it, and everything
+     below depends on it.
+  2. Sources keywords from three paths (per source, per ASIN, deduped):
+       - Amazon suggested keywords (Ads API, seeded by ASIN). Runs first
+         and alone: it is the strongest relevance evidence available, and
+         both the seeds and the vocabulary below are built from it.
+       - Meta ad interests (Marketing API, seeded by product concepts)
+       - Amazon autocomplete (public endpoint, seeded by phrases anchored
+         on the product's head noun)
+  3. Drops keywords that are about a different product, scored against a
+     weighted vocabulary of the product's own terms. Sources differ in how
+     they are filtered — see `_RELEVANCE_GATED_SOURCES`.
+  4. Enriches every survivor with Brand Analytics (SFR, click share,
      conversion share), skipping any keyword the report doesn't contain.
-  3. Enriches with Amazon Ads bid recommendations (CPC). Requires an
+  5. Enriches with Amazon Ads bid recommendations (CPC). Requires an
      ad_group_id — if none is supplied, this step is skipped and CPC stays
      null in the final matrix.
-  4. Computes a composite score per keyword — equal-weighted normalized
-     inverted-SFR + click share + conversion share (each rescaled to 0..1
-     within the source pool). Every cell in the matrix keeps the raw
-     SFR / click share / conversion share alongside the composite so the
-     user can see what's driving the ranking.
-  5. Lays out a 3x3 matrix: rows = Top / Medium / Low, cols = Amazon (ASIN
+  6. Computes a composite score per keyword — relevance and demand, weighted
+     by `_RELEVANCE_WEIGHT` / `_DEMAND_WEIGHT`, where demand is the mean of
+     the three normalized Brand Analytics signals (each rescaled to 0..1
+     within the source pool). Every cell keeps the raw SFR / click share /
+     conversion share and its relevance alongside the composite, so the user
+     can see what is driving the ranking.
+  7. Lays out a 3x3 matrix: rows = Top / Medium / Low, cols = Amazon (ASIN
      suggestions) / Meta / Amazon Searchbar. Within a source, we take the
      top-15 by composite and slice into three tiers of five.
 
@@ -644,18 +655,14 @@ def _redact(text: object) -> str:
     return out
 
 
-# Title tokens that are never a useful Meta seed: marketing adjectives,
-# packaging/unit nouns, and filler. Measured against the live API — these
-# either return nothing or return interests about something else entirely
-# ("sticks" -> Mozzarella sticks, "box" -> Xbox).
-_META_STOPWORDS = {
-    "and", "assorted", "best", "box", "boxes", "combo", "count", "for",
-    "fragrance", "free", "hand", "include", "including", "kit", "large",
-    "made", "medium", "mesmerizing", "natural", "new", "organic", "original",
-    "pack", "packs", "piece", "pieces", "premium", "pure", "quality",
-    "rolled", "scented", "set", "sets", "size", "small", "stick", "sticks",
-    "the", "value", "variety", "with",
-}
+# There used to be a `_META_STOPWORDS` list here — packaging and unit nouns
+# that had been measured to return interests about something else entirely
+# ("sticks" -> Mozzarella sticks, "box" -> Xbox). It is gone because the
+# conjunctive gate in `_source_meta` subsumes it and does so without guessing:
+# "Mozzarella sticks" is rejected on "mozzarella" and "Xbox" on "xbox", since
+# neither is a word that describes the product. Blocking the *seed* also meant
+# blocking those nouns for products that genuinely are sticks or boxes, which
+# the gate does not.
 
 # Meta tags each interest with a `topic`. These ones are about films, bands,
 # athletes and celebrities that merely share a word with a product term —

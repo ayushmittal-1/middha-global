@@ -59,9 +59,10 @@ JOURNAL = kr.ProductProfile(
         "Diary(Size 10x7, Pack of 4, Tan Brown Dekcled Pages)"
     ),
     brand="NAQSH",
-    item_type="journals",
-    browse_node="Journals",
-    product_type="NOTEBOOK",
+    # As SP-API actually files it — a shelf name, not the product's name.
+    item_type="hardcover-executive-notebooks",
+    browse_node="Hardcover Executive Notebooks",
+    product_type="BLANK_BOOK",
 )
 
 
@@ -73,7 +74,11 @@ def test_head_noun_comes_from_amazons_item_type_not_the_title():
     # what actually names the product.
     assert INCENSE.head_noun == "incense"
     assert RUG.head_noun == "rug"
-    assert JOURNAL.head_noun == "journal"
+    # A shelf name, not the product's name. Amazon files this handmade
+    # leather travel journal under "hardcover-executive-notebooks", so the
+    # column it produces is school notebooks — on-topic for the category
+    # Amazon assigned, wrong for what the seller actually sells.
+    assert JOURNAL.head_noun == "notebook"
 
 
 def test_head_noun_falls_back_through_browse_node_then_product_type():
