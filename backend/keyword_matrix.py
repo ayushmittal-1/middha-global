@@ -2,21 +2,32 @@
 Keyword sourcing → scoring → 3x3 matrix journey.
 
 Given a list of ASINs, this module:
-  1. Sources keywords from three paths (per source, per ASIN, deduped):
-       - Amazon suggested keywords (Ads API, seeded by ASIN)
-       - Meta ad interests (Marketing API, seeded by product title) [TODO token]
-       - Amazon autocomplete (public endpoint, seeded by product title)
-  2. Enriches every keyword with Brand Analytics (SFR, click share,
+  1. Builds a `keyword_relevance.ProductProfile` per ASIN from the SP-API
+     catalog — item type, browse node, product type. This is what the
+     product IS, as opposed to how its title markets it, and everything
+     below depends on it.
+  2. Sources keywords from three paths (per source, per ASIN, deduped):
+       - Amazon suggested keywords (Ads API, seeded by ASIN). Runs first
+         and alone: it is the strongest relevance evidence available, and
+         both the seeds and the vocabulary below are built from it.
+       - Meta ad interests (Marketing API, seeded by product concepts)
+       - Amazon autocomplete (public endpoint, seeded by phrases anchored
+         on the product's head noun)
+  3. Drops keywords that are about a different product, scored against a
+     weighted vocabulary of the product's own terms. Sources differ in how
+     they are filtered — see `_RELEVANCE_GATED_SOURCES`.
+  4. Enriches every survivor with Brand Analytics (SFR, click share,
      conversion share), skipping any keyword the report doesn't contain.
-  3. Enriches with Amazon Ads bid recommendations (CPC). Requires an
+  5. Enriches with Amazon Ads bid recommendations (CPC). Requires an
      ad_group_id — if none is supplied, this step is skipped and CPC stays
      null in the final matrix.
-  4. Computes a composite score per keyword — equal-weighted normalized
-     inverted-SFR + click share + conversion share (each rescaled to 0..1
-     within the source pool). Every cell in the matrix keeps the raw
-     SFR / click share / conversion share alongside the composite so the
-     user can see what's driving the ranking.
-  5. Lays out a 3x3 matrix: rows = Top / Medium / Low, cols = Amazon (ASIN
+  6. Computes a composite score per keyword — relevance and demand, weighted
+     by `_RELEVANCE_WEIGHT` / `_DEMAND_WEIGHT`, where demand is the mean of
+     the three normalized Brand Analytics signals (each rescaled to 0..1
+     within the source pool). Every cell keeps the raw SFR / click share /
+     conversion share and its relevance alongside the composite, so the user
+     can see what is driving the ranking.
+  7. Lays out a 3x3 matrix: rows = Top / Medium / Low, cols = Amazon (ASIN
      suggestions) / Meta / Amazon Searchbar. Within a source, we take the
      top-15 by composite and slice into three tiers of five.
 
@@ -47,7 +58,9 @@ from amazon_ads import (
     fetch_suggested_keywords,
     find_default_ad_group,
 )
+import keyword_relevance
 from auth import _db, require_user
+from keyword_relevance import ProductProfile
 from keywords import fetch_amazon_keywords
 
 # ── Job store ───────────────────────────────────────────────────────────────
@@ -90,6 +103,22 @@ _SOURCE_LABELS = {
     "amazon_searchbar": "Amazon Searchbar",
 }
 STEPS = ("sourcing", "brand_analytics", "cpc", "scoring", "done")
+
+# Sources whose output is filtered against the product vocabulary. The two
+# that are absent are absent on purpose:
+#
+#   amazon_asin — these ARE the vocabulary. Amazon returns them for this exact
+#     ASIN, so gating them against terms partly derived from them is circular,
+#     and it costs real keywords: it dropped "dhoop", "encens" and "insence",
+#     the Hindi, French and misspelled names for the product being sold.
+#
+#   meta — Meta returns audience interests, not search queries, and it needs
+#     the opposite filter rather than none. This gate asks "does the keyword
+#     contain a product term", which every Meta result passes by construction
+#     (each is matched to a product-word seed) — `California Pizza Kitchen`
+#     included. `_source_meta` applies the conjunctive test instead: *every*
+#     word must be a product word. See its docstring.
+_RELEVANCE_GATED_SOURCES = ("amazon_searchbar", "google")
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -252,31 +281,64 @@ def _mark_if_stale(job: dict) -> dict:
 async def _run_job(job: dict) -> None:
     heart = asyncio.create_task(_heartbeat(job["job_id"]))
     try:
-        # Titles are needed by both Meta and Amazon Searchbar sourcing, so
-        # resolve them once upfront rather than twice inside those functions.
+        # Catalog profiles describe what each ASIN *is* (item type, browse
+        # node, product type) rather than how it is marketed. Every downstream
+        # step depends on them: they seed Meta and Searchbar, and they build
+        # the vocabulary that decides which keywords belong in the matrix.
         job["step"] = "sourcing"
-        job["titles"] = await _fetch_titles_for_asins(job["asins"])
+        profiles = await _fetch_product_profiles(job["asins"])
+        job["titles"] = {asin: p.title for asin, p in profiles.items()}
+        job["products"] = {asin: _profile_summary(p) for asin, p in profiles.items()}
+        profile_list = list(profiles.values())
 
-        # Fan out the sourcing paths concurrently — none of them share
-        # state and each hits a different API.
-        asin_res, meta_res, sb_res = await asyncio.gather(
-            _source_amazon_asin(job["asins"]),
-            _source_meta(list(job["titles"].values())),
-            _source_amazon_searchbar(list(job["titles"].values())),
+        # Amazon's own recommendations run FIRST and alone, rather than in the
+        # fan-out below. They are the strongest relevance evidence we have —
+        # Amazon telling us which words this category converts on — so both
+        # the seeds handed to the other two sources and the vocabulary that
+        # grades every keyword are built from them.
+        asin_res = await _gather_one(_source_amazon_asin(job["asins"]))
+        _apply_source_result(job, "amazon_asin", asin_res)
+        suggested = job["sources"]["amazon_asin"]["keywords"]
+
+        vocabulary = keyword_relevance.build_vocabulary(profile_list, suggested)
+        job["vocabulary"] = _vocabulary_summary(vocabulary)
+        if not vocabulary:
+            for source in SOURCES:
+                job["sources"][source]["notes"].append(
+                    "no catalog data or Amazon suggestions for these ASINs — "
+                    "relevance filtering is off, results may be unrelated"
+                )
+
+        # Meta and Searchbar hit different APIs and share no state, so they
+        # still fan out concurrently.
+        meta_res, sb_res = await asyncio.gather(
+            _source_meta(profile_list, vocabulary),
+            _source_amazon_searchbar(profile_list, suggested),
             return_exceptions=True,
         )
         for name, res in (
-            ("amazon_asin", asin_res),
             ("meta", meta_res),
             ("amazon_searchbar", sb_res),
         ):
-            if isinstance(res, Exception):
-                job["sources"][name]["notes"].append(_redact(f"error: {res}"))
-                job["sources"][name]["keywords"] = []
-            else:
-                job["sources"][name]["keywords"] = res["keywords"]
-                job["sources"][name]["notes"].extend(
-                    _redact(n) for n in res.get("notes", [])
+            _apply_source_result(job, name, res)
+
+        # Relevance gate. Runs before enrichment so we neither spend Brand
+        # Analytics lookups nor CPC calls on keywords that are about a
+        # different product, and so the ranking below can never promote one.
+        for source in SOURCES:
+            src = job["sources"][source]
+            gated = source in _RELEVANCE_GATED_SOURCES
+            kept, rel, dropped = _filter_by_relevance(
+                src["keywords"], vocabulary, gated=gated
+            )
+            src["keywords"] = kept
+            src["relevance"] = rel
+            src["dropped_irrelevant"] = len(dropped)
+            if dropped:
+                sample = ", ".join(dropped[:5])
+                src["notes"].append(
+                    f"{len(dropped)} keyword(s) dropped as unrelated to this "
+                    f"product (e.g. {sample})"
                 )
 
         job["step"] = "brand_analytics"
@@ -304,7 +366,9 @@ async def _run_job(job: dict) -> None:
                     )
         for source in SOURCES:
             src = job["sources"][source]
-            enriched, coverage = _enrich_with_brand_analytics(src["keywords"], term_map)
+            enriched, coverage = _enrich_with_brand_analytics(
+                src["keywords"], term_map, src.get("relevance") or {}
+            )
             src["enriched"] = enriched
             src["ba_coverage"] = coverage
 
@@ -353,7 +417,9 @@ async def _run_job(job: dict) -> None:
             src = job["sources"][source]
             src["scored"] = _score(src["enriched"])
 
-        job["matrix"] = _build_matrix(job["sources"])
+        job["matrix"] = _build_matrix(
+            job["sources"], job.get("products"), job.get("vocabulary")
+        )
         job["step"] = "done"
         job["status"] = "done"
         job["finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -369,12 +435,19 @@ async def _run_job(job: dict) -> None:
         await _save(job)
 
 
-# ── Title resolution (SP-API catalog) ───────────────────────────────────────
+# ── Product profiles (SP-API catalog) ───────────────────────────────────────
+
+# Everything the relevance model needs from the catalog. `summaries` carries
+# the title and brand; `classifications` the browse tree; `attributes` the
+# `item_type_keyword` slug, which is Amazon's own name for the product type
+# and the single best relevance anchor available. `productTypes` is the
+# coarse fallback when a listing carries neither of the other two.
+_CATALOG_INCLUDED_DATA = "summaries,productTypes,classifications,attributes"
 
 
-async def _fetch_titles_for_asins(asins: list[str]) -> dict[str, str]:
-    """Return {asin: title}. ASINs the catalog can't resolve map to an empty
-    string — downstream sourcing degrades gracefully when the title is blank.
+async def _fetch_product_profiles(asins: list[str]) -> dict[str, ProductProfile]:
+    """Return {asin: ProductProfile}. ASINs the catalog can't resolve map to
+    an empty profile — sourcing still runs, it just has less to anchor on.
 
     Uses the user's PRIMARY marketplace only. Passing the full marketplace
     list causes a 400 ("operation not supported for fulfillment only
@@ -384,7 +457,7 @@ async def _fetch_titles_for_asins(asins: list[str]) -> dict[str, str]:
     """
     user = require_user()
     primary = amazon_sp._user_primary_marketplace_id(user)
-    titles: dict[str, str] = {}
+    profiles: dict[str, ProductProfile] = {}
 
     async def _one(asin: str) -> None:
         try:
@@ -393,23 +466,120 @@ async def _fetch_titles_for_asins(asins: list[str]) -> dict[str, str]:
                 f"/catalog/2022-04-01/items/{asin}",
                 params={
                     "marketplaceIds": primary,
-                    "includedData": "summaries",
+                    "includedData": _CATALOG_INCLUDED_DATA,
                 },
             )
-            summaries = data.get("summaries") if isinstance(data, dict) else None
-            title = ""
-            if summaries:
-                title = summaries[0].get("itemName") or ""
-            titles[asin] = title
+            profiles[asin] = keyword_relevance.build_profile(
+                asin, data if isinstance(data, dict) else {}
+            )
         except Exception as e:
-            print(f"[keyword_matrix] title lookup failed for {asin}: {e}")
-            titles[asin] = ""
+            print(f"[keyword_matrix] catalog lookup failed for {asin}: {e}")
+            profiles[asin] = ProductProfile(asin=asin)
 
     # Sequential is fine — catalog is a rare call and 429 backoff is built
     # into `_sp_request`. Parallelizing risks tripping the 2 req/s bucket.
     for asin in asins:
         await _one(asin)
-    return titles
+    return profiles
+
+
+def _profile_summary(profile: ProductProfile) -> dict:
+    """The parts of a profile worth persisting and showing — enough for a
+    user to see *why* the matrix decided the product is what it is, which is
+    the first thing to check when a column looks off."""
+    return {
+        "title": profile.title,
+        "brand": profile.brand,
+        "item_type": profile.item_type,
+        "browse_node": profile.browse_node,
+        "product_type": profile.product_type,
+        "head_noun": profile.head_noun,
+    }
+
+
+def _vocabulary_summary(vocabulary: dict[str, float], limit: int = 20) -> list[dict]:
+    """Top-weighted product terms, for display. The whole vocabulary is a few
+    hundred low-weight title and attribute tokens; only the terms that can
+    actually admit a keyword are worth showing."""
+    ranked = sorted(vocabulary.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [
+        {"term": term, "weight": round(weight, 2)}
+        for term, weight in ranked[:limit]
+        if weight >= keyword_relevance.W_STRONG
+    ]
+
+
+async def _gather_one(coro):
+    """Await one sourcing coroutine, returning the exception instead of
+    raising — same contract as `asyncio.gather(..., return_exceptions=True)`
+    so `_apply_source_result` handles both call sites identically."""
+    try:
+        return await coro
+    except Exception as e:
+        return e
+
+
+def _apply_source_result(job: dict, name: str, res) -> None:
+    """Fold one sourcing result (or the exception it raised) into the job."""
+    if isinstance(res, Exception):
+        job["sources"][name]["notes"].append(_redact(f"error: {res}"))
+        job["sources"][name]["keywords"] = []
+        return
+    job["sources"][name]["keywords"] = res["keywords"]
+    job["sources"][name]["notes"].extend(_redact(n) for n in res.get("notes", []))
+
+
+def _interleave(by_seed: dict[str, list[str]]) -> list[str]:
+    """Flatten per-seed result lists round-robin, so every seed reaches the
+    matrix before any seed's second-tier results do.
+
+    Sources answer a seed with a long, self-similar run — twenty flavours of
+    yoga, forty alphabetical autocomplete completions — and only fifteen slots
+    per column survive. Concatenating in seed order spends all of them on the
+    first seed; round-robin spends them across the product's whole seed set.
+    """
+    lists = [v for v in by_seed.values() if v]
+    out: list[str] = []
+    for i in range(max((len(v) for v in lists), default=0)):
+        for values in lists:
+            if i < len(values):
+                out.append(values[i])
+    return out
+
+
+def _filter_by_relevance(
+    keywords: list[str],
+    vocabulary: dict[str, float],
+    *,
+    gated: bool,
+) -> tuple[list[str], dict[str, float], list[str]]:
+    """Split keywords into (kept, {kept keyword: relevance}, dropped).
+
+    `gated=False` keeps every keyword and floors its relevance at
+    `RELEVANCE_FLOOR` — the source already vouched for it (see
+    `_RELEVANCE_GATED_SOURCES`), so it must not be ranked as if it were
+    off-topic just because it uses a word the product vocabulary lacks.
+
+    With no vocabulary there is nothing to be relevant to, so everything is
+    kept and scored 0 — the job notes say relevance filtering is off. Silently
+    dropping every keyword would look like the sources returned nothing.
+    """
+    if not vocabulary:
+        return list(keywords), {kw: 0.0 for kw in keywords}, []
+    kept: list[str] = []
+    relevance: dict[str, float] = {}
+    dropped: list[str] = []
+    for kw in keywords:
+        rel = keyword_relevance.score(kw, vocabulary)
+        if not gated:
+            kept.append(kw)
+            relevance[kw] = round(max(rel, keyword_relevance.RELEVANCE_FLOOR), 3)
+        elif rel >= keyword_relevance.RELEVANCE_FLOOR:
+            kept.append(kw)
+            relevance[kw] = round(rel, 3)
+        else:
+            dropped.append(kw)
+    return kept, relevance, dropped
 
 
 # ── Source 1: Amazon suggested keywords (Ads API) ───────────────────────────
@@ -485,18 +655,14 @@ def _redact(text: object) -> str:
     return out
 
 
-# Title tokens that are never a useful Meta seed: marketing adjectives,
-# packaging/unit nouns, and filler. Measured against the live API — these
-# either return nothing or return interests about something else entirely
-# ("sticks" -> Mozzarella sticks, "box" -> Xbox).
-_META_STOPWORDS = {
-    "and", "assorted", "best", "box", "boxes", "combo", "count", "for",
-    "fragrance", "free", "hand", "include", "including", "kit", "large",
-    "made", "medium", "mesmerizing", "natural", "new", "organic", "original",
-    "pack", "packs", "piece", "pieces", "premium", "pure", "quality",
-    "rolled", "scented", "set", "sets", "size", "small", "stick", "sticks",
-    "the", "value", "variety", "with",
-}
+# There used to be a `_META_STOPWORDS` list here — packaging and unit nouns
+# that had been measured to return interests about something else entirely
+# ("sticks" -> Mozzarella sticks, "box" -> Xbox). It is gone because the
+# conjunctive gate in `_source_meta` subsumes it and does so without guessing:
+# "Mozzarella sticks" is rejected on "mozzarella" and "Xbox" on "xbox", since
+# neither is a word that describes the product. Blocking the *seed* also meant
+# blocking those nouns for products that genuinely are sticks or boxes, which
+# the gate does not.
 
 # Meta tags each interest with a `topic`. These ones are about films, bands,
 # athletes and celebrities that merely share a word with a product term —
@@ -515,44 +681,31 @@ _META_BLOCKED_TOPICS = {
 _META_TOKEN_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
 _META_HAS_DIGIT_RE = re.compile(r"\d")
 
-# Meta returns at most a handful of usable interests per product; this caps
-# the request count per title so a long title can't fan out unboundedly.
-_META_MAX_SEEDS_PER_TITLE = 8
+# Interest names past this length are over-specific brands and regional
+# franchises that happen to contain the seed — "California Fitness & Yoga
+# Centers Vietnam" for the seed "yoga". Nothing targetable for a US seller.
+_META_MAX_INTEREST_WORDS = 4
 
 
-def _meta_seeds(title: str) -> list[str]:
-    """Single-word Meta seeds derived from a product title.
+def _meta_seeds(profile: ProductProfile) -> list[str]:
+    """Single-word Meta seeds for one product, head noun first.
 
     Meta's ad-interest search only matches its own interest taxonomy, and
     measurement against the live API shows multi-word queries essentially
-    never hit: the full title, every `_seed_candidates` fragment and every
-    adjacent word pair all returned zero interests, while single words
-    returned results. So this deliberately does NOT reuse `_seed_candidates`
-    (which is tuned for Amazon autocomplete and only emits 2+ word seeds).
+    never hit: full titles, title fragments and adjacent word pairs all
+    returned zero interests, while single words returned results. So the seeds
+    stay single words.
 
-    Tokens are dropped when they are short, numeric ("6x20", "15g"), or
-    marketing/packaging filler — each of those matches wildly unrelated
-    interests. The leading token goes too: Amazon titles start with the brand,
-    and a brand token pulls in interests about unrelated famous people
-    ("Satya" -> Satya Nadella, Microsoft). That does mean a genuinely
-    targetable brand interest is missed for big-name brands; worth revisiting
-    if this ever runs over a catalogue where that matters.
+    Which words is the part that used to go wrong. Seeding from every title
+    token meant "Long Lasting" produced the seed "long", and "long" matched
+    `long island` and `long hair (haircare)` — two interests with nothing to
+    do with incense. `keyword_relevance.meta_seeds` restricts the seeds to the
+    product's head noun plus the taxonomy and title words that survive the
+    generic-token list, and skips brand tokens (a brand word pulls interests
+    about unrelated famous people: "Satya" -> Satya Nadella).
     """
-    words = _META_TOKEN_SPLIT_RE.split(title or "")
-    seeds: list[str] = []
-    for raw in words[1:]:  # skip the brand
-        w = raw.strip().lower()
-        if (
-            len(w) < 4
-            or w in _META_STOPWORDS
-            or _META_HAS_DIGIT_RE.search(w)
-            or w in seeds
-        ):
-            continue
-        seeds.append(w)
-        if len(seeds) >= _META_MAX_SEEDS_PER_TITLE:
-            break
-    return seeds
+    seeds = keyword_relevance.meta_seeds(profile)
+    return [s for s in seeds if len(s) >= 4 and not _META_HAS_DIGIT_RE.search(s)]
 
 
 def _meta_error_summary(exc: Exception) -> tuple[str, str]:
@@ -590,13 +743,27 @@ def _meta_interest_matches_seed(seed: str, name: str) -> bool:
     return seed in _META_TOKEN_SPLIT_RE.split(name.lower())
 
 
-async def _source_meta(titles: list[str]) -> dict:
-    """Ad-interest suggestions seeded by each ASIN's product title.
+async def _source_meta(
+    profiles: list[ProductProfile],
+    vocabulary: dict[str, float] | None = None,
+) -> dict:
+    """Ad-interest suggestions seeded by each ASIN's catalog profile.
 
-    Seeds are single words (see `_meta_seeds`) and results are filtered to
-    interests that actually contain the seed as a word. Meta's taxonomy is
-    genuinely sparse for niche products, so a small, relevant set here is the
-    expected outcome rather than a failure.
+    Seeds are single words (see `_meta_seeds`) and results are filtered three
+    ways: the interest must contain the seed as a whole word, must not carry a
+    blocked topic, and must be made entirely of words that describe the
+    product (`keyword_relevance.all_terms_known`).
+
+    That last filter is strict on purpose, and stricter than the one the
+    Searchbar column uses. Meta answers a correct product word with whatever
+    shares its spelling — "kitchen" returns `California Pizza Kitchen`,
+    "protection" returns `Symantec Endpoint Protection`, "mask" returns
+    `King of Mask Singer` — so a filter that asks "does this contain a product
+    term" passes all of them. Asking "is every word here a product word" is
+    what actually separates `kitchen cabinet` from `Popeyes Louisiana Kitchen`.
+
+    Meta's taxonomy is genuinely sparse for niche products, so a small,
+    relevant set here is the expected outcome rather than a failure.
     """
     token = os.getenv("META_ACCESS_TOKEN", "").strip()
     if not token:
@@ -605,22 +772,24 @@ async def _source_meta(titles: list[str]) -> dict:
             "notes": ["META_ACCESS_TOKEN not set — Meta interest sourcing skipped"],
         }
     seen: set[str] = set()
-    keywords: list[str] = []
+    # Per-seed buckets, interleaved at the end. Meta answers a broad seed with
+    # twenty near-identical interests ("yoga" alone returns Hatha, Bikram,
+    # Kundalini, Ashtanga, Yin, Karma, Kriya, Raja...), which in seed order
+    # fills all fifteen matrix slots with one seed's results and buries the
+    # aromatherapy and home-fragrance audiences entirely.
+    by_seed: dict[str, list[str]] = {}
     notes: list[str] = []
     queried: set[str] = set()
     failures: dict[str, list] = {}  # key -> [count, first detail seen]
     ok_queries = 0
     dropped = 0
     async with httpx.AsyncClient(timeout=15) as client:
-        for title in titles:
-            if not title:
-                notes.append("empty title — skipped Meta lookup for one ASIN")
-                continue
-            seeds = _meta_seeds(title)
+        for profile in profiles:
+            seeds = _meta_seeds(profile)
             if not seeds:
                 notes.append(
-                    f"no usable Meta seed in title '{title[:40]}' — "
-                    "all tokens were brand, filler or numeric"
+                    f"no usable Meta seed for {profile.asin} — the catalog and "
+                    "title gave only brand, filler or numeric tokens"
                 )
                 continue
             for seed in seeds:
@@ -661,10 +830,24 @@ async def _source_meta(titles: list[str]) -> dict:
                     if topic in _META_BLOCKED_TOPICS:
                         dropped += 1
                         continue
+                    # Strip Meta's trailing topic hint — "Yoga (spirituality)"
+                    # — before measuring length, so the cap counts the
+                    # interest's own words rather than the annotation.
+                    bare = re.sub(r"\s*\([^)]*\)\s*$", "", name).strip()
+                    if len(bare.split()) > _META_MAX_INTEREST_WORDS:
+                        dropped += 1
+                        continue
+                    # Measured on `bare` too — the topic hint is Meta's own
+                    # annotation ("(home and garden)"), not part of the
+                    # interest, and its words are not product words.
+                    if not keyword_relevance.all_terms_known(bare, vocabulary or {}):
+                        dropped += 1
+                        continue
                     lowered = name.lower()
                     if lowered not in seen:
                         seen.add(lowered)
-                        keywords.append(lowered)
+                        by_seed.setdefault(seed, []).append(lowered)
+    keywords = _interleave(by_seed)
     for _key, (count, detail) in sorted(failures.items(), key=lambda kv: -kv[1][0]):
         seed_word = "seed" if count == 1 else "seeds"
         notes.append(f"Meta lookup failed for {count} {seed_word} — {detail}")
@@ -686,61 +869,46 @@ async def _source_meta(titles: list[str]) -> dict:
 # ── Source 3: Amazon autocomplete ───────────────────────────────────────────
 
 
-_TITLE_SPLIT_RE = re.compile(r"[|,\-–—\(\)\[\]/]+")
+async def _source_amazon_searchbar(
+    profiles: list[ProductProfile],
+    suggested_keywords: list[str] | None = None,
+) -> dict:
+    """Autocomplete keywords seeded by each ASIN's catalog profile.
 
+    Seeds come from `keyword_relevance.seed_phrases`, and every one of them
+    contains the product's head noun. That is the whole fix for this source:
+    autocomplete *expands* a seed, it never corrects one, so seed quality is a
+    hard ceiling on result quality. Seeding from title fragments — the old
+    behaviour — turned "…Back Flow Masala Cones" into the seed "back flow" and
+    returned plumbing valves, gaming laptops and `garam masala`, none of which
+    any amount of downstream ranking can rescue.
 
-def _seed_candidates(title: str) -> list[str]:
-    """Derive multiple autocomplete seeds from a product title.
-
-    `fetch_amazon_keywords` trims from the right until a prefix returns
-    results — great for titles like "Kiwi Shoe Polish Black" (head term first),
-    terrible for "Premium Cotton 5 Pack — Face Mask" (head term at the end).
-    We extract a handful of candidate seeds so both structures work.
-    """
-    seeds: list[str] = []
-    title = title.strip()
-    if not title:
-        return seeds
-    # Full title (existing behaviour).
-    seeds.append(title)
-    # Split on Amazon's title separators — "|", commas, dashes, parens — and
-    # feed each fragment to autocomplete. This surfaces the head term when it
-    # lives in the last segment (e.g. "... | Medium Size Face Mask").
-    for frag in _TITLE_SPLIT_RE.split(title):
-        frag = frag.strip()
-        if len(frag.split()) >= 2 and frag not in seeds:
-            seeds.append(frag)
-    # Also try the last 2 / 3 words of the raw title as a fallback for titles
-    # with no separators (e.g. "Cotton Linen Unisex Face Masks").
-    words = title.split()
-    for n in (3, 2):
-        if len(words) > n:
-            tail = " ".join(words[-n:])
-            if tail not in seeds:
-                seeds.append(tail)
-    return seeds
-
-
-async def _source_amazon_searchbar(titles: list[str]) -> dict:
-    """Autocomplete keywords seeded by each ASIN's product title.
-
-    We fan out a small set of seeds per title (full, title fragments, tail
-    words) rather than a single seed, so head terms that live at the end of a
-    marketing-style title still make it into the pool.
+    `fetch_amazon_keywords` is asked not to trim below the head noun, so a seed
+    that returns nothing degrades to the bare product noun instead of to a
+    brand fragment ("naqsh" -> "nash" -> `patricia nash handbags`).
     """
     seen: set[str] = set()
-    keywords: list[str] = []
+    # Per-seed buckets, interleaved at the end — autocomplete returns each
+    # seed's results alphabetically, so in seed order the first seed's "a"
+    # words take every slot before the second seed is reached.
+    by_seed: dict[str, list[str]] = {}
     notes: list[str] = []
-    for title in titles:
-        if not title:
-            notes.append("empty title — skipped autocomplete for one ASIN")
+    for profile in profiles:
+        seeds = keyword_relevance.seed_phrases(profile, suggested_keywords)
+        if not seeds:
+            notes.append(
+                f"no autocomplete seed for {profile.asin} — neither the catalog "
+                "nor Amazon's suggestions identified the product"
+            )
             continue
         found_any = False
-        for seed in _seed_candidates(title):
+        for seed in seeds:
             try:
-                results = await fetch_amazon_keywords(seed)
+                results = await fetch_amazon_keywords(
+                    seed, keep_terms=[profile.head_noun] if profile.head_noun else None
+                )
             except Exception as e:
-                notes.append(f"autocomplete failed for '{seed[:40]}...': {e}")
+                notes.append(f"autocomplete failed for '{seed[:40]}': {e}")
                 continue
             if not results:
                 continue
@@ -749,32 +917,38 @@ async def _source_amazon_searchbar(titles: list[str]) -> dict:
                 norm = kw.strip().lower()
                 if norm and norm not in seen:
                     seen.add(norm)
-                    keywords.append(norm)
+                    by_seed.setdefault(seed, []).append(norm)
         if not found_any:
-            notes.append(f"no autocomplete for '{title[:40]}...'")
-    return {"keywords": keywords, "notes": notes}
+            notes.append(
+                f"no autocomplete results for {profile.asin} "
+                f"(seeds: {', '.join(seeds[:3])})"
+            )
+    return {"keywords": _interleave(by_seed), "notes": notes}
 
 
-async def _source_google_autocomplete(titles: list[str]) -> dict:
-    """Google Search autocomplete — buyer-intent queries for each title.
+async def _source_google_autocomplete(
+    profiles: list[ProductProfile],
+    suggested_keywords: list[str] | None = None,
+) -> dict:
+    """Google Search autocomplete — buyer-intent queries for each product.
 
-    Same seed-fanout strategy as `_source_amazon_searchbar`: multiple seeds
-    per title so head terms that live at the tail of a marketing-style title
-    still make it in. Google returns real typed user queries, which score
-    fairly against the Brand Analytics data — unlike Meta's ad interests,
-    which are broad audience categories that rarely appear in BA.
+    Same head-noun-anchored seeds as `_source_amazon_searchbar`. Google
+    returns real typed user queries, which score fairly against the Brand
+    Analytics data — unlike Meta's ad interests, which are broad audience
+    categories that rarely appear in BA.
     """
     from google_autocomplete import fetch_google_suggestions
 
     seen: set[str] = set()
     keywords: list[str] = []
     notes: list[str] = []
-    for title in titles:
-        if not title:
-            notes.append("empty title — skipped Google autocomplete for one ASIN")
+    for profile in profiles:
+        seeds = keyword_relevance.seed_phrases(profile, suggested_keywords)
+        if not seeds:
+            notes.append(f"no Google seed for {profile.asin}")
             continue
         found_any = False
-        for seed in _seed_candidates(title):
+        for seed in seeds:
             results = await fetch_google_suggestions(seed)
             if not results:
                 continue
@@ -785,7 +959,7 @@ async def _source_google_autocomplete(titles: list[str]) -> dict:
                     seen.add(norm)
                     keywords.append(norm)
         if not found_any:
-            notes.append(f"no Google suggestions for '{title[:40]}...'")
+            notes.append(f"no Google suggestions for {profile.asin}")
     return {"keywords": keywords, "notes": notes}
 
 
@@ -1105,18 +1279,24 @@ async def _ensure_ba_week(user_key: str) -> tuple[str, str] | None:
 
 
 def _enrich_with_brand_analytics(
-    keywords: list[str], term_map: dict[str, dict]
+    keywords: list[str],
+    term_map: dict[str, dict],
+    relevance: dict[str, float],
 ) -> tuple[list[dict], dict]:
     """Attach SFR + click share + conversion share to each keyword.
 
     `term_map` is the output of `_ba_lookup_terms` — a small dict containing
     only the terms Mongo returned (i.e. only the ones present in the report).
     Keywords not in the map are still returned but with all metrics None.
+
+    `relevance` rides along from the gate so `_score` can weigh it without
+    rebuilding the vocabulary.
     """
     enriched: list[dict] = []
     hits = 0
     for kw in keywords:
         row = term_map.get(kw)
+        rel = relevance.get(kw, 0.0)
         if not row:
             enriched.append(
                 {
@@ -1125,6 +1305,7 @@ def _enrich_with_brand_analytics(
                     "click_share": None,
                     "conversion_share": None,
                     "cpc": None,
+                    "relevance": rel,
                     "in_report": False,
                 }
             )
@@ -1137,6 +1318,7 @@ def _enrich_with_brand_analytics(
                 "click_share": row.get("click_share"),
                 "conversion_share": row.get("conversion_share"),
                 "cpc": None,
+                "relevance": rel,
                 "in_report": True,
             }
         )
@@ -1195,17 +1377,41 @@ def _norm(values: list[float | None]) -> list[float | None]:
     return [None if v is None else (v - lo) / (hi - lo) for v in values]
 
 
+# How the composite splits between "is this keyword about the product" and
+# "do shoppers search it". Demand still leads — between two keywords that are
+# both genuinely about the product, the higher-volume one belongs on top — but
+# relevance carries enough weight to separate a category term from a keyword
+# that merely shares a word with the title.
+_RELEVANCE_WEIGHT = 0.35
+_DEMAND_WEIGHT = 0.65
+
+# Keywords Brand Analytics has no row for are scored on relevance alone and
+# damped, so they rank below every keyword with real demand data (see the
+# sort key in `_score`) and fill the tail of a thin column rather than leaving
+# it empty. The damping keeps their displayed score visibly lower too, which
+# matches the "—" the UI shows for their SFR and click share.
+_NO_DEMAND_DAMPING = 0.5
+
+
 def _score(enriched: list[dict]) -> list[dict]:
-    """Attach a composite score to every scorable keyword and sort desc.
+    """Attach a composite score to every keyword and sort best-first.
 
-    Composite = mean of the three normalized signals (inverted SFR, click
-    share, conversion share). We normalize *within the source pool* — the
-    tiers are relative rankings within a source, not absolute quality
-    scores. That matches how the matrix is used: "top-5 keywords from Meta"
-    is a comparison inside Meta, not vs. Amazon.
+    Composite = `_RELEVANCE_WEIGHT` x relevance + `_DEMAND_WEIGHT` x demand,
+    where demand is the mean of the three normalized signals (inverted SFR,
+    click share, conversion share). Demand is normalized *within the source
+    pool* — the tiers are relative rankings within a source, not absolute
+    quality scores. That matches how the matrix is used: "top-5 keywords from
+    Meta" is a comparison inside Meta, not vs. Amazon.
 
-    Keywords missing all three signals are excluded from the ranking but
-    kept in the returned list so the caller can display the drop count.
+    Demand alone was the old ranking, and it is exactly backwards for the
+    thing the matrix is for. Search volume is a property of the *keyword*, not
+    of its fit to the product, so ranking a mixed pool by volume promotes
+    whatever off-topic term is most popular. Relevance in the composite makes
+    a keyword earn its place twice.
+
+    Keywords with no Brand Analytics row keep a relevance-only score and sort
+    after every keyword that has one, so they fill out a thin column without
+    ever displacing a keyword backed by real demand data.
     """
     # Invert SFR (lower rank = more search volume = better) by negating.
     sfr_raw = [(-e["sfr"] if e.get("sfr") is not None else None) for e in enriched]
@@ -1217,13 +1423,19 @@ def _score(enriched: list[dict]) -> list[dict]:
     conv_n = _norm(conv_raw)
 
     for i, e in enumerate(enriched):
+        rel = e.get("relevance") or 0.0
         parts = [v for v in (sfr_n[i], click_n[i], conv_n[i]) if v is not None]
-        e["composite"] = sum(parts) / len(parts) if parts else None
+        if parts:
+            demand = sum(parts) / len(parts)
+            e["demand"] = demand
+            e["composite"] = _RELEVANCE_WEIGHT * rel + _DEMAND_WEIGHT * demand
+        else:
+            e["demand"] = None
+            e["composite"] = _RELEVANCE_WEIGHT * rel * _NO_DEMAND_DAMPING
 
-    # Sort scorable keywords desc by composite; unscored ones drop to the end.
     return sorted(
         enriched,
-        key=lambda e: (e["composite"] is None, -(e["composite"] or 0.0)),
+        key=lambda e: (e.get("demand") is None, -(e["composite"] or 0.0)),
     )
 
 
@@ -1231,11 +1443,12 @@ def _score(enriched: list[dict]) -> list[dict]:
 
 
 def _tier_split(scored: list[dict], per_tier: int = 5) -> dict[str, list[dict]]:
-    """Take the top 15 scorable keywords and split into three tiers of 5.
+    """Take the top 15 scored keywords and split into three tiers of 5.
 
-    Anything below 15 pads short — we return empty slots rather than
-    pulling from the next source, so each column shows what its source
-    actually produced.
+    `_score` has already ordered the list: Brand-Analytics-backed keywords
+    first by composite, then relevance-only ones. Anything below 15 pads short
+    — we return empty slots rather than pulling from the next source, so each
+    column shows what its source actually produced.
     """
     ranked = [e for e in scored if e.get("composite") is not None]
     top15 = ranked[: per_tier * 3]
@@ -1246,8 +1459,18 @@ def _tier_split(scored: list[dict], per_tier: int = 5) -> dict[str, list[dict]]:
     }
 
 
-def _build_matrix(sources: dict[str, dict]) -> dict:
-    """Assemble the final 3x3 matrix payload the frontend will render."""
+def _build_matrix(
+    sources: dict[str, dict],
+    products: dict[str, dict] | None = None,
+    vocabulary: list[dict] | None = None,
+) -> dict:
+    """Assemble the final 3x3 matrix payload the frontend will render.
+
+    `products` and `vocabulary` are carried through so the UI can show what
+    the matrix decided the product *is* and which terms admitted a keyword.
+    When a column looks wrong, that is the first thing to check — a bad head
+    noun explains a bad column far faster than reading the keywords does.
+    """
     matrix: dict[str, dict[str, list[dict]]] = {
         "top": {},
         "medium": {},
@@ -1264,8 +1487,9 @@ def _build_matrix(sources: dict[str, dict]) -> dict:
             "label": _SOURCE_LABELS[source],
             "raw_count": len(src.get("keywords") or []),
             "scorable_count": len(
-                [e for e in scored if e.get("composite") is not None]
+                [e for e in scored if e.get("demand") is not None]
             ),
+            "dropped_irrelevant": src.get("dropped_irrelevant") or 0,
             "ba_coverage": src.get("ba_coverage"),
             "notes": src.get("notes") or [],
         }
@@ -1275,4 +1499,6 @@ def _build_matrix(sources: dict[str, dict]) -> dict:
         "col_labels": _SOURCE_LABELS,
         "cells": matrix,
         "sources": per_source_summary,
+        "products": products or {},
+        "vocabulary": vocabulary or [],
     }

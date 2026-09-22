@@ -2040,6 +2040,18 @@
       color: #b71c1c; font-size: 11px; margin-top: 2px;
     }
 
+    /* What the matrix matched each ASIN on, shown above the source strip. */
+    #kw-products {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+    }
+    #kw-products .kw-note { color: #6b7280; }
+    .kw-terms { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+    .kw-term {
+      background: #eef2ff; color: #3730a3; border-radius: 10px;
+      padding: 1px 8px; font-size: 11px;
+    }
+
     /* Matrix */
     #kw-matrix {
       background: #fff; border: 1px solid #e5e5e5; border-radius: 6px;
@@ -2551,6 +2563,7 @@
       <div id="kw-body">
         <div id="kw-error"></div>
         <div id="kw-stepper" style="display:none;"></div>
+        <div id="kw-products" style="display:none;"></div>
         <div id="kw-source-strip" style="display:none;"></div>
         <div id="kw-matrix" style="display:none;"></div>
       </div>
@@ -3342,6 +3355,7 @@
     const kwStatusEl = document.getElementById('kw-status');
     const kwStepperEl = document.getElementById('kw-stepper');
     const kwStripEl = document.getElementById('kw-source-strip');
+    const kwProductsEl = document.getElementById('kw-products');
     const kwMatrixEl = document.getElementById('kw-matrix');
     const kwErrorEl = document.getElementById('kw-error');
     let kwPollTimer = null;
@@ -5885,18 +5899,58 @@
         const covLine = cov
           ? `<div>Brand Analytics: <b>${cov.in_report}/${cov.total}</b> matched</div>`
           : '';
-        const notes = (s.notes || []).map(n => `<div class="kw-note">• ${n}</div>`).join('');
+        const notes = (s.notes || []).map(n => `<div class="kw-note">• ${escapeHtml(n)}</div>`).join('');
+        const droppedLine = s.dropped_irrelevant
+          ? `<div>Filtered as off-topic: <b>${s.dropped_irrelevant}</b></div>`
+          : '';
         return `
           <div class="kw-source-card">
             <h4>${s.label}</h4>
             <div>Raw keywords: <b>${s.raw_count}</b></div>
             <div>Scorable: <b>${s.scorable_count}</b></div>
+            ${droppedLine}
             ${covLine}
             ${notes}
           </div>`;
       }).join('');
       kwStripEl.innerHTML = html;
       kwStripEl.style.display = 'grid';
+    }
+
+    // What the matrix decided each ASIN *is*, and the terms that admit a
+    // keyword into it. When a column looks wrong this is the thing to read
+    // first — a bad head noun explains a bad column faster than the keywords
+    // themselves do.
+    function renderKwProducts(matrix) {
+      const products = matrix?.products || {};
+      const asins = Object.keys(products);
+      if (!asins.length) { kwProductsEl.style.display = 'none'; return; }
+      const cards = asins.map(asin => {
+        const p = products[asin];
+        const facts = [
+          ['Product type', p.item_type || p.product_type],
+          ['Category', p.browse_node],
+          ['Brand', p.brand],
+        ].filter(([, v]) => v)
+         .map(([k, v]) => `<div>${k}: <b>${escapeHtml(v)}</b></div>`).join('');
+        return `
+          <div class="kw-source-card">
+            <h4>${escapeHtml(asin)} — matched on “${escapeHtml(p.head_noun || '?')}”</h4>
+            <div class="kw-note">${escapeHtml(p.title || '')}</div>
+            ${facts}
+          </div>`;
+      }).join('');
+      const vocab = (matrix.vocabulary || [])
+        .map(v => `<span class="kw-term">${escapeHtml(v.term)}</span>`).join('');
+      const vocabCard = vocab
+        ? `<div class="kw-source-card">
+             <h4>Relevance terms</h4>
+             <div class="kw-note">A keyword needs one of these to enter the matrix.</div>
+             <div class="kw-terms">${vocab}</div>
+           </div>`
+        : '';
+      kwProductsEl.innerHTML = cards + vocabCard;
+      kwProductsEl.style.display = 'grid';
     }
 
     function renderKwCell(entries) {
@@ -5907,12 +5961,13 @@
         const kw = e.keyword || '';
         return `
           <div class="kw-cell-item">
-            <div class="kw-cell-kw">${kw}</div>
+            <div class="kw-cell-kw">${escapeHtml(kw)}</div>
             <div class="kw-cell-metrics">
               <span>SFR <b>${fmtKwSfr(e.sfr)}</b></span>
               <span>Click <b>${fmtKwPct(e.click_share)}</b></span>
               <span>Conv <b>${fmtKwPct(e.conversion_share)}</b></span>
               <span>CPC <b>${e.cpc == null ? '—' : '$' + fmtKwNum(e.cpc)}</b></span>
+              <span>Rel <b>${fmtKwNum(e.relevance)}</b></span>
               <span>Score <b>${fmtKwNum(e.composite)}</b></span>
             </div>
           </div>`;
@@ -5956,7 +6011,7 @@
         kwStatusEl.textContent = (job.status === 'done'
           ? 'Done.'
           : `Running (${job.step})…`) + adGroupNote;
-        if (job.matrix) renderKwSourceStrip(job.matrix.sources);
+        if (job.matrix) { renderKwProducts(job.matrix); renderKwSourceStrip(job.matrix.sources); }
         if (job.status === 'done') {
           renderKwMatrix(job.matrix);
           kwRunBtn.disabled = false;
@@ -5993,6 +6048,7 @@
       kwErrorEl.textContent = '';
       kwMatrixEl.style.display = 'none';
       kwStripEl.style.display = 'none';
+      kwProductsEl.style.display = 'none';
       kwRunBtn.disabled = true;
       kwStatusEl.textContent = 'Starting…';
       if (kwPollTimer) { clearTimeout(kwPollTimer); kwPollTimer = null; }

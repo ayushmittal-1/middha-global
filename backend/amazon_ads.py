@@ -310,8 +310,26 @@ async def fetch_suggested_keywords(
     }
     url = f"{_ads_base(user)}/sp/targets/keywords/recommendations"
     print(f"[amazon_ads] -> POST keywordRecommendations {url} asin={asin}")
+    # Same 429 schedule as bid recommendations. Worth having here too: these
+    # suggestions are the keyword matrix's best source *and* the evidence its
+    # relevance filter is built from, so one throttled call used to cost the
+    # whole Amazon column and degrade the other two.
+    retry_waits = (1.5, 4.0, 10.0)
     async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(url, headers=headers, json=body)
+        for attempt in range(len(retry_waits) + 1):
+            resp = await client.post(url, headers=headers, json=body)
+            if resp.status_code != 429 or attempt >= len(retry_waits):
+                break
+            ra = resp.headers.get("Retry-After")
+            try:
+                wait = float(ra) if ra else retry_waits[attempt]
+            except ValueError:
+                wait = retry_waits[attempt]
+            print(
+                f"[amazon_ads] <- keywordRecommendations 429 — "
+                f"waiting {wait:.1f}s (attempt {attempt + 1}/{len(retry_waits)})"
+            )
+            await asyncio.sleep(wait)
         if resp.is_error:
             print(f"[amazon_ads] <- keywordRecommendations FAILED status={resp.status_code} body={resp.text}")
             resp.raise_for_status()
