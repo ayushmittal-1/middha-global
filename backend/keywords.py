@@ -45,18 +45,34 @@ async def _fetch_keywords_for_seed(seed: str) -> list[str]:
     return sorted(keywords)
 
 
-async def fetch_amazon_keywords(seed_keyword: str) -> list[str]:
+async def fetch_amazon_keywords(
+    seed_keyword: str,
+    keep_terms: list[str] | None = None,
+) -> list[str]:
     """Fetch keyword suggestions from Amazon Autocomplete for a seed keyword.
 
     If the full phrase returns no results, progressively tries shorter
     versions (dropping words from the end) until results are found.
     Returns a deduplicated, sorted list capped at 25.
+
+    `keep_terms` guards that fallback. Trimming from the right eventually
+    reaches the first word of the seed, and for an Amazon title that word is
+    the brand — "NAQSH Hand Rolled Incense Cones" trims down to "naqsh", which
+    Amazon fuzzy-matches to Nash and answers with `patricia nash handbags` and
+    `crosby stills nash and young cd`. Those outranked every real keyword in
+    the matrix because they are genuinely high-volume searches. Passing the
+    product's head noun here stops the trim at the last prefix that still
+    contains it, so a seed that finds nothing returns nothing instead of
+    returning results about a different product.
     """
     words = seed_keyword.strip().split()
+    keep = [t.lower() for t in (keep_terms or []) if t]
 
     # Try full phrase first, then progressively shorter
     for end in range(len(words), 0, -1):
         shortened = " ".join(words[:end])
+        if keep and not any(t in shortened.lower() for t in keep):
+            break
         results = await _fetch_keywords_for_seed(shortened)
         if results:
             return results[:25]
