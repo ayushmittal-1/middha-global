@@ -74,7 +74,7 @@ import aurora_data
 import data_resolver
 from aurora_data import aurora_db_enabled
 from agent import compute_profitability_data
-from campaigns import analyze_performance_data
+from campaigns import analyze_performance_data, create_campaign
 from amazon_ads import (
     exchange_auth_code,
     fetch_suggested_keywords,
@@ -1917,6 +1917,99 @@ async def amazon_order_items(order_id: str, user: dict = Depends(require_feature
 async def campaigns_performance(user: dict = Depends(require_feature("campaigns"))):
     """Structured campaign performance — feeds the Campaigns tab."""
     return await analyze_performance_data(full=True)
+
+
+class CreateCampaignRequest(BaseModel):
+    """Body for POST /campaigns/create — see the endpoint docstring."""
+
+    campaign_name: str
+    budget: float
+    country: str = "US"
+    campaign_type: str = "Sponsored Products"
+    targeting_type: str = "MANUAL"
+    keywords: list[str] = []
+    negative_keywords: list[str] = []
+    sku: str | None = None
+    asin: str | None = None
+
+
+# A MANUAL campaign with no keywords cannot serve, and the Ads API accepts it
+# silently — so reject it here rather than let a user spend a day wondering
+# why their campaign has no impressions.
+_MAX_CAMPAIGN_KEYWORDS = 1000
+
+
+@app.post("/campaigns/create")
+async def campaigns_create(
+    body: CreateCampaignRequest,
+    user: dict = Depends(require_feature("campaigns")),
+):
+    """Create a Sponsored Products campaign from an explicit request body.
+
+    Exists so the chat tab's keyword picker can send the exact selection the
+    user ticked. The same flow is reachable through the assistant's
+    `create_campaign` tool, but that route has the model retype every value
+    on the way through, and a fifty-keyword list does not survive that
+    reliably. This endpoint spends real ad budget, so it validates rather
+    than coercing: a request that does not describe a servable campaign is
+    rejected, not quietly fixed up.
+    """
+    name = (body.campaign_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Campaign name is required.")
+    if not (body.budget and body.budget > 0):
+        raise HTTPException(status_code=400, detail="Daily budget must be greater than 0.")
+
+    targeting = (body.targeting_type or "MANUAL").upper()
+    if targeting not in ("AUTO", "MANUAL"):
+        raise HTTPException(
+            status_code=400, detail="targeting_type must be AUTO or MANUAL."
+        )
+
+    keywords = [k.strip() for k in (body.keywords or []) if k and k.strip()]
+    # Dedupe case-insensitively but keep the user's original casing and order.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for kw in keywords:
+        low = kw.lower()
+        if low not in seen:
+            seen.add(low)
+            deduped.append(kw)
+    keywords = deduped
+
+    if targeting == "MANUAL" and not keywords:
+        raise HTTPException(
+            status_code=400,
+            detail="A MANUAL campaign needs at least one keyword — it cannot "
+                   "serve without one. Select keywords, or use AUTO targeting.",
+        )
+    if len(keywords) > _MAX_CAMPAIGN_KEYWORDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many keywords ({len(keywords)}); the limit is "
+                   f"{_MAX_CAMPAIGN_KEYWORDS}.",
+        )
+    if not (body.sku or "").strip() and not (body.asin or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="A seller SKU is required — without a product ad the "
+                   "campaign will not serve.",
+        )
+
+    result = await create_campaign({
+        "campaign_name": name,
+        "campaign_type": body.campaign_type or "Sponsored Products",
+        "budget": float(body.budget),
+        "country": (body.country or "US").upper(),
+        "targeting_type": targeting,
+        "keywords": keywords,
+        "negative_keywords": [
+            k.strip() for k in (body.negative_keywords or []) if k and k.strip()
+        ],
+        "sku": (body.sku or "").strip() or None,
+        "asin": (body.asin or "").strip() or None,
+    })
+    return {"result": result, "keyword_count": len(keywords)}
 
 
 @app.get("/profitability")
