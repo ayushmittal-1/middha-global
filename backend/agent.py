@@ -52,6 +52,7 @@ SYSTEM_PROMPT = (
     "- **get_keywords**: Fetch keyword suggestions from Amazon Autocomplete for a seed keyword.\n"
     "- **get_negative_keywords**: Get negative keyword suggestions to exclude wasteful/irrelevant terms from a campaign.\n"
     "- **analyze_campaign_performance**: Analyze campaign health — ACOS, ROI, and actionable recommendations.\n"
+    "- **open_campaign_keyword_picker**: Show an interactive keyword matrix + campaign form for a MANUAL campaign. Handles keyword selection AND creation.\n"
     "- **create_campaign**: Create a campaign with a product ad (only after user approves keywords, ASIN/SKU & details).\n\n"
     "## Campaign creation flow (STRICT — follow every step)\n"
     "1. Ask about the product or seed keyword.\n"
@@ -61,11 +62,17 @@ SYSTEM_PROMPT = (
     "MANUAL = user provides a curated keyword list and Amazon bids only "
     "on those (more control, better for scaling proven keywords). "
     "Default to AUTO if the user has no preference.\n"
-    "3. If **MANUAL**: call get_keywords to fetch suggestions, ALWAYS list "
-    "them in your response, and ask which to keep + whether to fetch "
-    "negatives.\n"
-    "   If **AUTO**: SKIP get_keywords entirely — Amazon discovers the "
-    "keywords itself. You may still ask for optional negative keywords.\n"
+    "3. If **MANUAL**: call open_campaign_keyword_picker IMMEDIATELY, passing "
+    "any details you already have. It shows the user a relevance-ranked "
+    "keyword matrix with checkboxes plus a campaign form, and creates the "
+    "campaign itself when they confirm. Then STOP and wait — do not list "
+    "keywords in text, do not ask for the SKU, and do not call "
+    "create_campaign. The picker collects all of it. The user will tell you "
+    "if they would rather pick keywords in chat; only then fall back to "
+    "get_keywords and the step-by-step flow below.\n"
+    "   If **AUTO**: SKIP keyword sourcing entirely — Amazon discovers the "
+    "keywords itself. You may still ask for optional negative keywords, then "
+    "continue with steps 4-6.\n"
     "4. Collect campaign details (name, type, budget, country) if not already provided.\n"
     "5. **ALWAYS ask the user for the product's seller SKU (merchant SKU).** This is a SELLER account, so the product ad MUST use the SKU — an ASIN will be rejected. A campaign cannot serve ads without a product ad, so you MUST collect the SKU before creating. Explain this if the user is unsure.\n"
     "6. **NEVER call create_campaign until the user explicitly approves the SKU and campaign details** (and the keyword list, if MANUAL). When you call create_campaign, pass the approved sku (not asin) and set targeting_type explicitly to \"AUTO\" or \"MANUAL\".\n\n"
@@ -176,8 +183,56 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "open_campaign_keyword_picker",
+            "description": (
+                "Open an interactive keyword picker for a MANUAL Sponsored "
+                "Products campaign. Shows the user a relevance-ranked 3x3 "
+                "keyword matrix with checkboxes and a campaign form, and "
+                "creates the campaign itself once they confirm. Call this as "
+                "soon as the user says they want a MANUAL campaign — it "
+                "replaces get_keywords and create_campaign for that flow. "
+                "Pass whatever details you already know so the form is "
+                "prefilled; all arguments are optional. After calling it, "
+                "wait for the user — do NOT call create_campaign yourself."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "campaign_name": {
+                        "type": "string",
+                        "description": "Campaign name, if the user has given one.",
+                    },
+                    "budget": {
+                        "type": "number",
+                        "description": "Daily budget in USD, if the user has given one.",
+                    },
+                    "country": {
+                        "type": "string",
+                        "description": "Target country code, e.g. 'US'. Defaults to US.",
+                    },
+                    "sku": {
+                        "type": "string",
+                        "description": "Seller/merchant SKU to advertise, if known.",
+                    },
+                    "asins": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "ASINs to research keywords for, if the user has "
+                            "named them. The picker asks for these itself when "
+                            "omitted, so do not interrogate the user for them."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_campaign",
-            "description": "Create a new advertising campaign. Only call this after the user has approved the keywords and provided campaign details.",
+            "description": "Create a new advertising campaign. Only call this after the user has approved the keywords and provided campaign details. For MANUAL campaigns prefer open_campaign_keyword_picker, which collects the keywords and creates the campaign in one interactive step.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -471,6 +526,60 @@ async def _get_negative_keywords(seed_keyword: str) -> str:
         return "No negative keyword suggestions found."
     lines = [f"- {n['keyword']} ({n['reason']})" for n in negatives[:20]]
     return "Negative keyword suggestions:\n" + "\n".join(lines)
+
+
+# Marker the chat client looks for in a tool result to swap the plain text
+# output for an interactive component. Kept as a one-line JSON prefix rather
+# than a new SSE event type so the transcript stays a list of strings — the
+# stream, the Mongo history and the replay path all keep working unchanged,
+# and a client that does not know the marker just shows the human-readable
+# text that follows it.
+UI_DIRECTIVE_PREFIX = "@@AURORA_UI@@"
+
+
+def _ui_directive(component: str, payload: dict, fallback: str) -> str:
+    """Wrap a tool result so a UI-aware client can render `component`.
+
+    `fallback` is what every other client shows, so it has to read as a
+    complete answer on its own.
+    """
+    return f"{UI_DIRECTIVE_PREFIX}{json.dumps({'component': component, **payload})}\n{fallback}"
+
+
+async def _open_campaign_keyword_picker(
+    campaign_name: str | None = None,
+    budget: float | None = None,
+    country: str | None = None,
+    sku: str | None = None,
+    asins: list[str] | None = None,
+) -> str:
+    """Hand the user an interactive keyword matrix instead of a wall of text.
+
+    Returns a UI directive rather than keywords. A manual campaign needs a
+    curated list, and curating one in chat means the assistant pastes fifty
+    keywords and the user replies with prose about which to keep — slow, and
+    lossy in both directions. The picker shows the same 3x3 relevance matrix
+    as the Keywords tab with checkboxes, then posts the exact selection to
+    `POST /campaigns/create`.
+
+    Whatever the assistant has already collected is passed through to prefill
+    the form, so the user is not asked twice for a budget they just gave.
+    """
+    prefill = {
+        "campaign_name": campaign_name or "",
+        "budget": budget,
+        "country": country or "US",
+        "sku": sku or "",
+        "asins": [a.strip().upper() for a in (asins or []) if a and a.strip()],
+    }
+    return _ui_directive(
+        "campaign_keyword_picker",
+        {"prefill": prefill},
+        "I've opened the keyword picker above. Enter the ASIN(s) to research, "
+        "tick the keywords you want, fill in the campaign details, and hit "
+        "Create campaign — I'll confirm once Amazon accepts it. "
+        "Tell me if you'd rather pick keywords here in chat instead.",
+    )
 
 
 async def _create_campaign(
@@ -4191,6 +4300,7 @@ TOOL_FUNCTIONS = {
     "get_keywords": _get_keywords,
     "get_negative_keywords": _get_negative_keywords,
     "analyze_campaign_performance": _analyze_campaign_performance,
+    "open_campaign_keyword_picker": _open_campaign_keyword_picker,
     "create_campaign": _create_campaign,
     "search_meta_ads": _search_meta_ads,
     "get_orders": _get_orders,
