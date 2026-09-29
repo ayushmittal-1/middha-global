@@ -569,6 +569,7 @@ async def create_campaign(payload: dict) -> str:
     """
     from datetime import datetime
     from auth import require_user
+    from ads_bidding import bidding_strategy_for_budget, describe_bidding_strategy
     from amazon_ads import (
         create_sp_campaign,
         create_ad_group,
@@ -586,11 +587,16 @@ async def create_campaign(payload: dict) -> str:
     sku = payload.get("sku") or None
     asin = payload.get("asin") or None
     targeting_type = (payload.get("targeting_type") or "AUTO").upper()
+    # Per-keyword bids from the picker, plus the bid strategy the daily
+    # budget implies. See `ads_bidding` for why the budget decides this.
+    keyword_bids = payload.get("keyword_bids") or {}
+    bidding_strategy = bidding_strategy_for_budget(budget)
     start_date = datetime.utcnow().strftime("%Y-%m-%d")
 
     print(
         f"[create_campaign] START name={name!r} budget={budget} "
-        f"targeting={targeting_type} keywords={len(keywords)} "
+        f"targeting={targeting_type} strategy={bidding_strategy} "
+        f"keywords={len(keywords)} "
         f"negatives={len(negative_kws)} sku={sku!r} asin={asin!r}"
     )
 
@@ -613,6 +619,7 @@ async def create_campaign(payload: dict) -> str:
         print(f"[create_campaign] -> creating SP campaign {name!r}...")
         camp_resp = await create_sp_campaign(
             name, budget, start_date, targeting_type=targeting_type,
+            bidding_strategy=bidding_strategy,
         )
         campaign_id = _extract_id(camp_resp, "campaigns", "campaignId")
         if not campaign_id:
@@ -631,7 +638,11 @@ async def create_campaign(payload: dict) -> str:
             )
         print(f"[create_campaign] <- ad group created. adGroupId={ad_group_id}")
 
-        results = [f"Campaign '{name}' created. Campaign ID: {campaign_id}"]
+        results = [
+            f"Campaign '{name}' created. Campaign ID: {campaign_id}",
+            f"Bidding: {describe_bidding_strategy(bidding_strategy)} "
+            f"(from the ${budget:g}/day budget).",
+        ]
 
         if sku or asin:
             target = f"SKU {sku}" if sku else f"ASIN {asin}"
@@ -687,10 +698,18 @@ async def create_campaign(payload: dict) -> str:
                     "if you want keyword-level control."
                 )
         elif keywords:
-            print(f"[create_campaign] -> adding {len(keywords)} keyword(s)...")
-            await add_keywords(campaign_id, ad_group_id, keywords)
-            print(f"[create_campaign] <- keywords added")
-            results.append(f"Added {len(keywords)} keyword(s).")
+            print(
+                f"[create_campaign] -> adding {len(keywords)} keyword(s) "
+                f"({len(keyword_bids)} with an explicit bid)..."
+            )
+            await add_keywords(campaign_id, ad_group_id, keywords, bids=keyword_bids)
+            print("[create_campaign] <- keywords added")
+            custom = sum(1 for k in keywords if k.strip().lower() in
+                         {b.strip().lower() for b in keyword_bids})
+            results.append(
+                f"Added {len(keywords)} keyword(s)"
+                + (f", {custom} with a custom bid." if custom else ".")
+            )
 
         if negative_kws:
             print(f"[create_campaign] -> adding {len(negative_kws)} negative keyword(s)...")

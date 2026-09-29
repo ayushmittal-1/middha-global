@@ -74,6 +74,8 @@ import aurora_data
 import data_resolver
 from aurora_data import aurora_db_enabled
 from agent import compute_profitability_data
+import ads_keyword_performance
+from ads_bidding import bidding_strategy_for_budget
 from campaigns import analyze_performance_data, create_campaign
 from amazon_ads import (
     exchange_auth_code,
@@ -1931,12 +1933,22 @@ class CreateCampaignRequest(BaseModel):
     negative_keywords: list[str] = []
     sku: str | None = None
     asin: str | None = None
+    # {keyword: bid}. Keywords absent from the map fall back to the ad
+    # group's default bid. Ignored for AUTO campaigns, which have no
+    # keywords to price.
+    keyword_bids: dict[str, float] = {}
 
 
 # A MANUAL campaign with no keywords cannot serve, and the Ads API accepts it
 # silently — so reject it here rather than let a user spend a day wondering
 # why their campaign has no impressions.
 _MAX_CAMPAIGN_KEYWORDS = 1000
+
+# Amazon's own floor is $0.02; the ceiling is ours. No Sponsored Products
+# keyword is worth $100 a click on this catalogue, so a value that high is a
+# typo — almost always a bid entered in cents.
+_MIN_KEYWORD_BID = 0.02
+_MAX_KEYWORD_BID = 100.0
 
 
 @app.post("/campaigns/create")
@@ -1996,6 +2008,27 @@ async def campaigns_create(
                    "campaign will not serve.",
         )
 
+    # Bids are priced per click and charged for real, so a fat-fingered
+    # value is expensive in a way a bad keyword is not. Reject rather than
+    # clamp: silently turning a mistyped 250 into 2.50 would be worse.
+    bids: dict[str, float] = {}
+    for raw_kw, raw_bid in (body.keyword_bids or {}).items():
+        kw = (raw_kw or "").strip()
+        if not kw:
+            continue
+        # Pydantic has already parsed these to floats and rejected anything
+        # unparseable with a 422, so the only bad values that reach here are
+        # numeric ones: out of range, or NaN/inf (which pydantic permits and
+        # which fail the comparison below, as they should).
+        value = float(raw_bid)
+        if not (_MIN_KEYWORD_BID <= value <= _MAX_KEYWORD_BID):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Bid for '{kw}' is ${value:g} — bids must be between "
+                       f"${_MIN_KEYWORD_BID:g} and ${_MAX_KEYWORD_BID:g}.",
+            )
+        bids[kw] = round(value, 2)
+
     result = await create_campaign({
         "campaign_name": name,
         "campaign_type": body.campaign_type or "Sponsored Products",
@@ -2003,13 +2036,63 @@ async def campaigns_create(
         "country": (body.country or "US").upper(),
         "targeting_type": targeting,
         "keywords": keywords,
+        "keyword_bids": bids,
         "negative_keywords": [
             k.strip() for k in (body.negative_keywords or []) if k and k.strip()
         ],
         "sku": (body.sku or "").strip() or None,
         "asin": (body.asin or "").strip() or None,
     })
-    return {"result": result, "keyword_count": len(keywords)}
+    return {
+        "result": result,
+        "keyword_count": len(keywords),
+        "bidding_strategy": bidding_strategy_for_budget(float(body.budget)),
+    }
+
+
+class KeywordPerformanceRequest(BaseModel):
+    """Body for POST /campaigns/keyword-performance."""
+
+    asins: list[str] = []
+    sku: str | None = None
+
+
+@app.post("/campaigns/keyword-performance")
+async def campaigns_keyword_performance(
+    body: KeywordPerformanceRequest,
+    user: dict = Depends(require_feature("campaigns")),
+):
+    """Judge the keywords this product's existing campaigns already run.
+
+    Answers the question the picker cannot otherwise ask: has this seller
+    bid on this term before, and did it earn anything? Campaign-level
+    metrics cannot tell you — a campaign can look healthy in aggregate while
+    individual keywords quietly spend with nothing to show.
+
+    Backed by Amazon's asynchronous `spTargeting` report, so the first call
+    for a given window can take a couple of minutes while Amazon builds it;
+    the rows are then cached and shared across every ASIN asked about in
+    that window.
+    """
+    asins = [a.strip().upper() for a in (body.asins or []) if a and a.strip()]
+    sku = (body.sku or "").strip() or None
+    if not asins and not sku:
+        raise HTTPException(
+            status_code=400, detail="Provide at least one ASIN or a SKU."
+        )
+    try:
+        return await ads_keyword_performance.evaluate_for_product(asins, sku)
+    except Exception as e:
+        # The picker works fine without this — it is advisory. Surface the
+        # reason rather than failing the whole flow with a 500.
+        print(f"[keyword-performance] failed: {e}")
+        return {
+            "scope": "error",
+            "verdicts": {},
+            "summary": {"evaluated": 0, "wasting": 0, "ok": 0, "unproven": 0,
+                        "wasted_spend": 0.0},
+            "note": f"Could not check existing keyword performance: {e}",
+        }
 
 
 @app.get("/profitability")

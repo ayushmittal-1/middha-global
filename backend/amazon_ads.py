@@ -555,6 +555,7 @@ async def create_sp_campaign(
     start_date: str,
     state: str = "ENABLED",
     targeting_type: str = "AUTO",
+    bidding_strategy: str | None = None,
 ) -> dict:
     """Create a Sponsored Products campaign.
 
@@ -563,6 +564,11 @@ async def create_sp_campaign(
     for the chat-tool flow. Pass targeting_type="MANUAL" from the caller
     if you specifically want the manual keyword-list flow (need to also
     call `add_keywords` and skip `create_auto_targets` in that case).
+
+    `bidding_strategy` is an Amazon strategy id — see `ads_bidding` for the
+    mapping from daily budget and what the console calls each one. Defaults
+    to down-only dynamic bidding, under which Amazon may lower a bid but
+    never raise it above what was asked for.
     """
     payload = {
         "campaigns": [
@@ -570,7 +576,7 @@ async def create_sp_campaign(
                 "name": name,
                 "targetingType": targeting_type,
                 "state": state,
-                "dynamicBidding": {"strategy": "LEGACY_FOR_SALES"},
+                "dynamicBidding": {"strategy": bidding_strategy or "LEGACY_FOR_SALES"},
                 "budget": {"budgetType": "DAILY", "budget": budget},
                 "startDate": start_date,
             }
@@ -604,8 +610,17 @@ async def add_keywords(
     keywords: list[str],
     match_type: str = "BROAD",
     bid: float = 0.75,
+    bids: dict[str, float] | None = None,
 ) -> dict:
-    """Add keyword targets to an ad group."""
+    """Add keyword targets to an ad group.
+
+    `bids` sets a per-keyword bid, looked up case-insensitively; `bid` is the
+    fallback for anything it does not name. Amazon prices each keyword's
+    auction separately, so a single flat bid across a whole list either
+    overpays for the cheap terms or loses every auction for the expensive
+    ones — which is why the picker collects a bid per keyword.
+    """
+    by_keyword = {k.strip().lower(): v for k, v in (bids or {}).items() if v}
     payload = {
         "keywords": [
             {
@@ -614,7 +629,7 @@ async def add_keywords(
                 "state": "ENABLED",
                 "keywordText": kw,
                 "matchType": match_type,
-                "bid": bid,
+                "bid": float(by_keyword.get(kw.strip().lower(), bid)),
             }
             for kw in keywords
         ]
