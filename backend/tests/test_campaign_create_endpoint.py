@@ -141,3 +141,72 @@ async def test_country_is_normalized_and_defaults_are_applied():
 async def test_response_reports_the_count_actually_sent():
     resp, sent = await _call(_body(keywords=["a keyword", "A Keyword", "another"]))
     assert resp["keyword_count"] == len(sent["keywords"]) == 2
+
+
+# ── Per-keyword bids ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_bids_reach_amazon_keyed_to_their_keyword():
+    _resp, sent = await _call(
+        _body(keywords=["incense", "incense burner"],
+              keyword_bids={"incense": 0.75, "incense burner": 1.2})
+    )
+    assert sent["keyword_bids"] == {"incense": 0.75, "incense burner": 1.2}
+
+
+@pytest.mark.asyncio
+async def test_keywords_without_a_bid_are_simply_absent_from_the_map():
+    """They fall back to the ad group default rather than to zero."""
+    _resp, sent = await _call(_body(keywords=["a", "b"], keyword_bids={"a": 0.5}))
+    assert sent["keyword_bids"] == {"a": 0.5}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [0, 0.01, 250, -1])
+async def test_an_out_of_range_bid_is_rejected_not_clamped(bad):
+    """A mistyped bid is charged per click. Silently turning 250 into 2.50
+    would be worse than refusing it."""
+    with pytest.raises(HTTPException) as exc:
+        await _call(_body(keyword_bids={"incense cones": bad}))
+    assert exc.value.status_code == 400
+    assert "incense cones" in exc.value.detail
+
+
+def test_a_non_numeric_bid_is_rejected_by_the_request_model():
+    """Caught a layer earlier than the range check — pydantic refuses to
+    parse it, which FastAPI turns into a 422 before the handler runs."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _body(keyword_bids={"incense cones": "one dollar"})
+
+
+@pytest.mark.asyncio
+async def test_nan_slips_past_parsing_and_is_caught_by_the_range_check():
+    """Pydantic accepts NaN as a float. It must not reach Amazon as a bid."""
+    with pytest.raises(HTTPException) as exc:
+        await _call(_body(keyword_bids={"incense cones": float("nan")}))
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_bids_are_rounded_to_cents():
+    _resp, sent = await _call(_body(keyword_bids={"incense cones": 0.7777}))
+    assert sent["keyword_bids"]["incense cones"] == 0.78
+
+
+# ── Bid strategy follows the budget ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget,expected", [
+    (5, "LEGACY_FOR_SALES"),
+    (10, "MANUAL"),
+    (20, "MANUAL"),
+    (25, "MANUAL"),
+    (40, "LEGACY_FOR_SALES"),
+])
+async def test_the_response_reports_the_strategy_the_budget_implies(budget, expected):
+    resp, _sent = await _call(_body(budget=budget))
+    assert resp["bidding_strategy"] == expected
