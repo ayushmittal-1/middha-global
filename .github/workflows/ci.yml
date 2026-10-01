@@ -53,3 +53,96 @@ jobs:
           # flat imports (amazon_sp, auth, aurora_data...). The bare script
           # does not, and every test module fails to collect.
           python -m pytest tests/ -q $DESELECT
+
+  # ── CD ────────────────────────────────────────────────────────────────────
+  # Verification, not delivery. Deploys here are pull-based: a systemd timer
+  # on the instance polls origin and pulls on its own (see the /version
+  # docstring in backend/main.py). Nothing proved what actually landed, which
+  # is the gap this closes — it does NOT push code, so it cannot race the
+  # timer or half-deploy.
+  #
+  # Fails when the commit never reaches the box inside the window, which is
+  # how you find out the timer is wedged, the instance is down, or its git
+  # remote still points somewhere else.
+  #
+  # One-time setup, per environment (Settings → Environments):
+  #   staging    → variable SERVICE_URL, the base URL main deploys to
+  #   production → variable SERVICE_URL, the base URL prod deploys to
+  # Optional: variable DEPLOY_TIMEOUT_MINUTES (default 20) if the timer's
+  # interval is longer than that.
+  verify-deploy:
+    name: verify deploy
+    needs: tests
+    # Pushes only — a PR has not deployed anywhere, so there is nothing to
+    # verify and the job would fail by design.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: ${{ github.ref_name == 'prod' && 'production' || 'staging' }}
+      url: ${{ vars.SERVICE_URL }}
+    # Never verify two commits against one box at once: the loser would watch
+    # for a SHA the box has already moved past and fail for the wrong reason.
+    # Not cancel-in-progress — a superseded run should finish and report.
+    concurrency:
+      group: verify-deploy-${{ github.ref_name }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Check the environment is configured
+        env:
+          SERVICE_URL: ${{ vars.SERVICE_URL }}
+        run: |
+          if [ -z "$SERVICE_URL" ]; then
+            echo "::error::SERVICE_URL is not set for the '${{ github.ref_name == 'prod' && 'production' || 'staging' }}' environment."
+            echo "Set it under Settings → Environments → <env> → Variables."
+            exit 1
+          fi
+          echo "Watching $SERVICE_URL for ${GITHUB_SHA:0:7}"
+
+      - name: Wait for the instance to serve this commit
+        env:
+          SERVICE_URL: ${{ vars.SERVICE_URL }}
+          TIMEOUT_MINUTES: ${{ vars.DEPLOY_TIMEOUT_MINUTES || '20' }}
+        run: |
+          set -u
+          deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          want="$GITHUB_SHA"
+          last=""
+          attempt=0
+
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            attempt=$((attempt + 1))
+            # /version is unauthenticated on purpose so a credential-less
+            # deploy check can call it. A failed curl is not fatal — the
+            # service may be mid-restart, which is exactly when we are
+            # looking.
+            body="$(curl -fsS --max-time 10 "${SERVICE_URL%/}/version" || true)"
+            got="$(printf '%s' "$body" | jq -r '.commit // empty' 2>/dev/null || true)"
+
+            if [ -n "$got" ] && [ "$got" != "unknown" ]; then
+              # The endpoint reports an abbreviated sha, and git picks the
+              # length, so compare by prefix rather than truncating to 7 and
+              # hoping. Stripping $got off the front changes $want only when
+              # $got really is its prefix.
+              if [ "${want#"$got"}" != "$want" ]; then
+                echo "✓ ${SERVICE_URL} is serving ${got} after ${attempt} check(s)"
+                exit 0
+              fi
+              if [ "$got" != "$last" ]; then
+                echo "… serving ${got}, waiting for ${want:0:7}"
+                last="$got"
+              fi
+            elif [ "$attempt" = "1" ]; then
+              echo "… no answer from ${SERVICE_URL}/version yet, still waiting"
+            fi
+            sleep 30
+          done
+
+          echo "::error::${SERVICE_URL} never reported ${want:0:7} within ${TIMEOUT_MINUTES}m (last seen: ${last:-none})."
+          echo "Check, in order:"
+          echo "  1. the deploy timer is running   — systemctl status <deploy>.timer"
+          echo "  2. the checkout's remote is right — git -C <path> remote -v"
+          echo "     (it must point at this repository, not the pre-migration one)"
+          echo "  3. the service came back          — systemctl status <service>"
+          exit 1
