@@ -739,377 +739,386 @@ async def forecasting_restock(
     except Exception as e:
         print(f"[restock] returned_units_by_sku_daily failed: {e}")
 
-    weighted_by_sku: dict[str, float] = {}
-    weighted_net_by_sku: dict[str, float] = {}
-    orders_7d_by_sku: dict[str, int] = {}
-    orders_30d_by_sku: dict[str, int] = {}
-    orders_60d_by_sku: dict[str, int] = {}
-    orders_7d_net_by_sku: dict[str, int] = {}
-    orders_30d_net_by_sku: dict[str, int] = {}
-    orders_60d_net_by_sku: dict[str, int] = {}
-    returns_7d_by_sku: dict[str, int] = {}
-    returns_30d_by_sku: dict[str, int] = {}
-    returns_60d_by_sku: dict[str, int] = {}
-    stockout_days_by_sku: dict[str, int] = {}
-    # Mongo returns naive UTC datetimes — strip the tz on the cutoff so
-    # `date >= cutoff_90d` doesn't blow up on the naive/aware mismatch.
-    cutoff_90d_naive = (now_utc - timedelta(days=90)).replace(tzinfo=None)
-    for sku_key, sku_rows in sales_by_sku.items():
-        # Use each SKU's persisted velocity_weights if the seller has
-        # customized them in the Actions modal → Forecast tab; otherwise
-        # fall back to the platform default. Windows come from
-        # VELOCITY_WINDOWS (currently 7/14/30/60/90) — no more
-        # hard-coded (3, 7, 30, 60, 180) list that would silently
-        # regress to the old window set even after model.py updated.
-        sku_settings = settings_by_sku.get(sku_key) or {}
-        sku_weights = sku_settings.get("velocity_weights") or default_weights
-        windows = compute_velocity_windows(sku_rows, now_utc)
-        wv = weighted_velocity(windows, sku_weights)
-        weighted_by_sku[sku_key] = float(wv) if wv is not None else 0.0
-        for w in windows:
-            pd_val = int(w.get("period_days") or 0)
-            units = int(w.get("units_sold") or 0)
-            if pd_val == 7:
-                orders_7d_by_sku[sku_key] = units
-            elif pd_val == 30:
-                orders_30d_by_sku[sku_key] = units
-            elif pd_val == 60:
-                orders_60d_by_sku[sku_key] = units
-
-        # Net-of-returns pass — reuse the same window math on rows with
-        # per-day returns subtracted from units_ordered.
-        sku_returns_daily = returns_by_sku_daily.get(sku_key)
-        if sku_returns_daily:
-            net_rows = apply_returns_to_daily_rows(sku_rows, sku_returns_daily)
-            net_windows = compute_velocity_windows(net_rows, now_utc)
-            wv_net = weighted_velocity(net_windows, sku_weights)
-            weighted_net_by_sku[sku_key] = float(wv_net) if wv_net is not None else 0.0
-            gross_units_by_pd = {int(w["period_days"]): int(w["units_sold"]) for w in windows}
-            for w in net_windows:
+    # Everything below is pure CPU — velocity windows, reorder math and
+    # row assembly across the catalogue, with no I/O of any kind. It runs
+    # in a worker thread because uvicorn serves this app with a single
+    # worker: inline, one seller with a large catalogue blocks the event
+    # loop and every other request queues behind it.
+    def _compute_rows() -> list[dict]:
+        weighted_by_sku: dict[str, float] = {}
+        weighted_net_by_sku: dict[str, float] = {}
+        orders_7d_by_sku: dict[str, int] = {}
+        orders_30d_by_sku: dict[str, int] = {}
+        orders_60d_by_sku: dict[str, int] = {}
+        orders_7d_net_by_sku: dict[str, int] = {}
+        orders_30d_net_by_sku: dict[str, int] = {}
+        orders_60d_net_by_sku: dict[str, int] = {}
+        returns_7d_by_sku: dict[str, int] = {}
+        returns_30d_by_sku: dict[str, int] = {}
+        returns_60d_by_sku: dict[str, int] = {}
+        stockout_days_by_sku: dict[str, int] = {}
+        # Mongo returns naive UTC datetimes — strip the tz on the cutoff so
+        # `date >= cutoff_90d` doesn't blow up on the naive/aware mismatch.
+        cutoff_90d_naive = (now_utc - timedelta(days=90)).replace(tzinfo=None)
+        for sku_key, sku_rows in sales_by_sku.items():
+            # Use each SKU's persisted velocity_weights if the seller has
+            # customized them in the Actions modal → Forecast tab; otherwise
+            # fall back to the platform default. Windows come from
+            # VELOCITY_WINDOWS (currently 7/14/30/60/90) — no more
+            # hard-coded (3, 7, 30, 60, 180) list that would silently
+            # regress to the old window set even after model.py updated.
+            sku_settings = settings_by_sku.get(sku_key) or {}
+            sku_weights = sku_settings.get("velocity_weights") or default_weights
+            windows = compute_velocity_windows(sku_rows, now_utc)
+            wv = weighted_velocity(windows, sku_weights)
+            weighted_by_sku[sku_key] = float(wv) if wv is not None else 0.0
+            for w in windows:
                 pd_val = int(w.get("period_days") or 0)
                 units = int(w.get("units_sold") or 0)
                 if pd_val == 7:
-                    orders_7d_net_by_sku[sku_key] = units
-                    returns_7d_by_sku[sku_key] = max(0, gross_units_by_pd.get(7, 0) - units)
+                    orders_7d_by_sku[sku_key] = units
                 elif pd_val == 30:
-                    orders_30d_net_by_sku[sku_key] = units
-                    returns_30d_by_sku[sku_key] = max(0, gross_units_by_pd.get(30, 0) - units)
+                    orders_30d_by_sku[sku_key] = units
                 elif pd_val == 60:
-                    orders_60d_net_by_sku[sku_key] = units
-                    returns_60d_by_sku[sku_key] = max(0, gross_units_by_pd.get(60, 0) - units)
-        else:
-            # No returns for this SKU — net equals gross.
-            weighted_net_by_sku[sku_key] = weighted_by_sku[sku_key]
-            orders_7d_net_by_sku[sku_key] = orders_7d_by_sku.get(sku_key, 0)
-            orders_30d_net_by_sku[sku_key] = orders_30d_by_sku.get(sku_key, 0)
-            orders_60d_net_by_sku[sku_key] = orders_60d_by_sku.get(sku_key, 0)
+                    orders_60d_by_sku[sku_key] = units
 
-        # Live count of stockout-corrected days in the trailing 90d —
-        # get_sales_daily runs `_flag_stockout_runs` on read, so any row
-        # inside the window with the flag set is a missed-sales day.
-        count = 0
-        for r in sku_rows:
-            if not r.get("stockout_corrected"):
-                continue
-            d = r.get("date")
-            if not isinstance(d, datetime):
-                continue
-            d_naive = d.replace(tzinfo=None) if d.tzinfo is not None else d
-            if d_naive >= cutoff_90d_naive:
-                count += 1
-        stockout_days_by_sku[sku_key] = count
+            # Net-of-returns pass — reuse the same window math on rows with
+            # per-day returns subtracted from units_ordered.
+            sku_returns_daily = returns_by_sku_daily.get(sku_key)
+            if sku_returns_daily:
+                net_rows = apply_returns_to_daily_rows(sku_rows, sku_returns_daily)
+                net_windows = compute_velocity_windows(net_rows, now_utc)
+                wv_net = weighted_velocity(net_windows, sku_weights)
+                weighted_net_by_sku[sku_key] = float(wv_net) if wv_net is not None else 0.0
+                gross_units_by_pd = {int(w["period_days"]): int(w["units_sold"]) for w in windows}
+                for w in net_windows:
+                    pd_val = int(w.get("period_days") or 0)
+                    units = int(w.get("units_sold") or 0)
+                    if pd_val == 7:
+                        orders_7d_net_by_sku[sku_key] = units
+                        returns_7d_by_sku[sku_key] = max(0, gross_units_by_pd.get(7, 0) - units)
+                    elif pd_val == 30:
+                        orders_30d_net_by_sku[sku_key] = units
+                        returns_30d_by_sku[sku_key] = max(0, gross_units_by_pd.get(30, 0) - units)
+                    elif pd_val == 60:
+                        orders_60d_net_by_sku[sku_key] = units
+                        returns_60d_by_sku[sku_key] = max(0, gross_units_by_pd.get(60, 0) - units)
+            else:
+                # No returns for this SKU — net equals gross.
+                weighted_net_by_sku[sku_key] = weighted_by_sku[sku_key]
+                orders_7d_net_by_sku[sku_key] = orders_7d_by_sku.get(sku_key, 0)
+                orders_30d_net_by_sku[sku_key] = orders_30d_by_sku.get(sku_key, 0)
+                orders_60d_net_by_sku[sku_key] = orders_60d_by_sku.get(sku_key, 0)
 
-    today = datetime.now(timezone.utc).date()
+            # Live count of stockout-corrected days in the trailing 90d —
+            # get_sales_daily runs `_flag_stockout_runs` on read, so any row
+            # inside the window with the flag set is a missed-sales day.
+            count = 0
+            for r in sku_rows:
+                if not r.get("stockout_corrected"):
+                    continue
+                d = r.get("date")
+                if not isinstance(d, datetime):
+                    continue
+                d_naive = d.replace(tzinfo=None) if d.tzinfo is not None else d
+                if d_naive >= cutoff_90d_naive:
+                    count += 1
+            stockout_days_by_sku[sku_key] = count
 
-    rows = []
-    for c in cached:
-        sku = c["sku"]
-        reorder = c.get("reorder") or {}
-        forecast = c.get("forecast") or []
-        next30 = sum(float(r.get("p50", 0)) for r in forecast[:30])
-        # Daily p50 series, capped at the cached 90-day horizon. Shipped as-is
-        # so the Future sales column can sum an arbitrary window client-side
-        # without a refetch; next_30_day_forecast stays for older frontends.
-        forecast_p50_daily = [round(float(r.get("p50", 0) or 0), 2) for r in forecast[:90]]
+        today = datetime.now(timezone.utc).date()
 
-        # Prefer the fresh Aurora snapshot for the 5 SP-API-sourced counts;
-        # fall back to the forecast cache when the SKU isn't in `inv_map`
-        # (e.g. delisted from Aurora but still in forecast_cache). `inbound`
-        # comes from the shipments collection and stays on `reorder`.
-        inv_row = inv_map.get(sku) or {}
-        # `available` = Amazon's fulfillable (currently sellable) quantity.
-        # Reorder/days-of-cover math below wants this — it explicitly adds
-        # `reserved` back on top to reconstruct total forward-looking stock.
-        available = int(
-            inv_row.get("fulfillable", reorder.get("available", reorder.get("on_hand", 0))) or 0
-        )
-        reserved = int(inv_row.get("reserved", reorder.get("reserved", 0)) or 0)
-        # Bifurcation of `reserved`. Amazon's reservedQuantity is a
-        # composite of pendingCustomerOrder + fcProcessing + pending-
-        # Transshipment; the third gets exposed separately as
-        # `fc_transfer` and folded into on_hand. This exposes the first
-        # two so the Restock UI can answer "why is my inventory locked
-        # up?" — pending sale (will ship soon) vs FC processing (Amazon
-        # is moving/inspecting it).
-        reserved_customer_order = int(inv_row.get("reserved_customer_order") or 0)
-        reserved_fc_processing = int(inv_row.get("reserved_fc_processing") or 0)
-        sent_to_fba = int(inv_row.get("inbound_shipped", reorder.get("sent_to_fba", 0)) or 0)
-        inbound_working = int(inv_row.get("inbound_working", reorder.get("inbound_working", 0)) or 0)
-        unfulfillable = int(inv_row.get("unfulfillable", reorder.get("unfulfillable", 0)) or 0)
-        # Seller Central "On-hand (FBA)" = Available + FC Transfer
-        # (pendingTransshipment). See latest_inventory_for_user.
-        fc_transfer = int(inv_row.get("fc_transfer") or 0)
-        on_hand = int(
-            inv_row.get("on_hand")
-            or (available + fc_transfer)
-            or reorder.get("on_hand", 0)
-            or 0
-        )
+        rows = []
+        for c in cached:
+            sku = c["sku"]
+            reorder = c.get("reorder") or {}
+            forecast = c.get("forecast") or []
+            next30 = sum(float(r.get("p50", 0)) for r in forecast[:30])
+            # Daily p50 series, capped at the cached 90-day horizon. Shipped as-is
+            # so the Future sales column can sum an arbitrary window client-side
+            # without a refetch; next_30_day_forecast stays for older frontends.
+            forecast_p50_daily = [round(float(r.get("p50", 0) or 0), 2) for r in forecast[:90]]
 
-        # Stock value = every unit the seller has capital tied up in ×
-        # landed cost. Same disjoint-sub-bucket composition as stock_forward
-        # below — raw `reserved` overlaps with `fc_transfer` on paper, so
-        # sum the sub-buckets to be safe.
-        cogs = cogs_by_sku.get(sku) or {}
-        unit_cost = float(cogs.get("unit_cost") or 0)
-        unit_ship = float(cogs.get("inbound_shipping_per_unit") or 0)
-        landed_cost = unit_cost + unit_ship
-        stock_units = (
-            available
-            + reserved_customer_order
-            + reserved_fc_processing
-            + fc_transfer
-            + sent_to_fba
-            + inbound_working
-        )
-        stock_value = round(stock_units * landed_cost, 2) if landed_cost > 0 else 0.0
+            # Prefer the fresh Aurora snapshot for the 5 SP-API-sourced counts;
+            # fall back to the forecast cache when the SKU isn't in `inv_map`
+            # (e.g. delisted from Aurora but still in forecast_cache). `inbound`
+            # comes from the shipments collection and stays on `reorder`.
+            inv_row = inv_map.get(sku) or {}
+            # `available` = Amazon's fulfillable (currently sellable) quantity.
+            # Reorder/days-of-cover math below wants this — it explicitly adds
+            # `reserved` back on top to reconstruct total forward-looking stock.
+            available = int(
+                inv_row.get("fulfillable", reorder.get("available", reorder.get("on_hand", 0))) or 0
+            )
+            reserved = int(inv_row.get("reserved", reorder.get("reserved", 0)) or 0)
+            # Bifurcation of `reserved`. Amazon's reservedQuantity is a
+            # composite of pendingCustomerOrder + fcProcessing + pending-
+            # Transshipment; the third gets exposed separately as
+            # `fc_transfer` and folded into on_hand. This exposes the first
+            # two so the Restock UI can answer "why is my inventory locked
+            # up?" — pending sale (will ship soon) vs FC processing (Amazon
+            # is moving/inspecting it).
+            reserved_customer_order = int(inv_row.get("reserved_customer_order") or 0)
+            reserved_fc_processing = int(inv_row.get("reserved_fc_processing") or 0)
+            sent_to_fba = int(inv_row.get("inbound_shipped", reorder.get("sent_to_fba", 0)) or 0)
+            inbound_working = int(inv_row.get("inbound_working", reorder.get("inbound_working", 0)) or 0)
+            unfulfillable = int(inv_row.get("unfulfillable", reorder.get("unfulfillable", 0)) or 0)
+            # Seller Central "On-hand (FBA)" = Available + FC Transfer
+            # (pendingTransshipment). See latest_inventory_for_user.
+            fc_transfer = int(inv_row.get("fc_transfer") or 0)
+            on_hand = int(
+                inv_row.get("on_hand")
+                or (available + fc_transfer)
+                or reorder.get("on_hand", 0)
+                or 0
+            )
 
-        # Missed profit estimate — count stockout-corrected days in the
-        # trailing 90-day history (live from Aurora sales, not the frozen
-        # forecast_cache drivers) and value them at weighted velocity ×
-        # 25% margin. The 25% is a coarse proxy until per-SKU sale price
-        # is threaded through this endpoint.
-        drivers = c.get("drivers") or {}
-        stockout_days = stockout_days_by_sku.get(sku, 0) or int(drivers.get("stockout_days_90d") or 0)
-        velocity = weighted_by_sku.get(sku, 0.0) or float(reorder.get("avg_daily_demand") or 0)
-        missed_units = round(stockout_days * velocity, 1)
-        missed_profit_est = round(missed_units * landed_cost * 0.25, 2) if landed_cost > 0 else 0.0
+            # Stock value = every unit the seller has capital tied up in ×
+            # landed cost. Same disjoint-sub-bucket composition as stock_forward
+            # below — raw `reserved` overlaps with `fc_transfer` on paper, so
+            # sum the sub-buckets to be safe.
+            cogs = cogs_by_sku.get(sku) or {}
+            unit_cost = float(cogs.get("unit_cost") or 0)
+            unit_ship = float(cogs.get("inbound_shipping_per_unit") or 0)
+            landed_cost = unit_cost + unit_ship
+            stock_units = (
+                available
+                + reserved_customer_order
+                + reserved_fc_processing
+                + fc_transfer
+                + sent_to_fba
+                + inbound_working
+            )
+            stock_value = round(stock_units * landed_cost, 2) if landed_cost > 0 else 0.0
 
-        # Override the forecast-cache reorder numbers with values derived
-        # from the weighted velocity so the whole restock row tells one
-        # consistent story: Orders/day, Days of cover, Stockout on, and
-        # both Ship-by dates all trust the same demand signal the seller
-        # sees in the modal. When weighted velocity is 0 (brand new SKU
-        # with no trailing sales), fall through to the Prophet-driven
-        # cached values so we don't clobber a legitimate horizon-based
-        # forecast with zeros.
-        wv = weighted_by_sku.get(sku, 0.0)
-        # stock_forward = everything the seller has that will fulfill demand
-        # over the coming period. Composed from the split sub-buckets rather
-        # than raw `reserved` because Amazon's `reservedQuantity` is a
-        # composite that INCLUDES pendingTransshipment (== fc_transfer);
-        # adding raw `reserved + fc_transfer` would double-count those units
-        # if ingest ever changes to store the raw composite. Sub-buckets
-        # (customer_order + fc_processing + fc_transfer) are guaranteed
-        # disjoint, so summing them + the inbound legs is safe.
-        stock_forward = (
-            available
-            + reserved_customer_order
-            + reserved_fc_processing
-            + fc_transfer
-            + sent_to_fba
-            + inbound_working
-        )
-        days_of_cover_val = reorder.get("days_of_cover")
-        stockout_date_iso = reorder.get("stockout_date")
-        reorder_by_date_air_iso = reorder.get("reorder_by_date_air")
-        reorder_by_date_ocean_iso = reorder.get("reorder_by_date_ocean")
-        if wv > 0:
-            days_of_cover_val = round(stock_forward / wv, 1)
-            stockout_date_obj = today + timedelta(days=int(stock_forward / wv))
-            stockout_date_iso = stockout_date_obj.isoformat()
-            air_transit = int(reorder.get("air_transit_days") or 10)
-            ocean_transit = int(reorder.get("ocean_transit_days") or 45)
-            # Clamp ship-by dates to today when they'd be in the past —
-            # a past date is confusing UI; "ship NOW" is the message.
-            reorder_by_date_air_iso = max(
-                today, stockout_date_obj - timedelta(days=air_transit),
-            ).isoformat()
-            reorder_by_date_ocean_iso = max(
-                today, stockout_date_obj - timedelta(days=ocean_transit),
-            ).isoformat()
+            # Missed profit estimate — count stockout-corrected days in the
+            # trailing 90-day history (live from Aurora sales, not the frozen
+            # forecast_cache drivers) and value them at weighted velocity ×
+            # 25% margin. The 25% is a coarse proxy until per-SKU sale price
+            # is threaded through this endpoint.
+            drivers = c.get("drivers") or {}
+            stockout_days = stockout_days_by_sku.get(sku, 0) or int(drivers.get("stockout_days_90d") or 0)
+            velocity = weighted_by_sku.get(sku, 0.0) or float(reorder.get("avg_daily_demand") or 0)
+            missed_units = round(stockout_days * velocity, 1)
+            missed_profit_est = round(missed_units * landed_cost * 0.25, 2) if landed_cost > 0 else 0.0
 
-        # Days until next-order deadline (based on air ship-by date).
-        days_until_next_order = None
-        if reorder_by_date_air_iso:
-            try:
-                d = datetime.fromisoformat(reorder_by_date_air_iso).date()
-                days_until_next_order = (d - today).days
-            except ValueError:
-                pass
-
-        aged_sup = aged_supplements.get(sku) or {}
-        historical_dos = aged_sup.get("historical_days_of_supply")
-        amazon_rec_qty = aged_sup.get("recommended_ship_in_quantity")
-        amazon_rec_date = aged_sup.get("recommended_ship_in_date")
-
-        ps = settings_by_sku.get(sku) or {}
-        is_buyable = bool(inv_row.get("is_buyable", True))
-        # For non-buyable SKUs, zero the reorder recommendation regardless
-        # of what the forecast says — no point telling the seller to ship
-        # 500 units of an inactive listing.
-        recommended_po_qty = reorder.get("recommended_po_qty", 0) if is_buyable else 0
-
-        # Returns-view overrides — computed off the same stock_forward so
-        # the toggle only changes the demand denominator, not the on-hand
-        # numerator. Forecast + ship-by dates scale by (net/gross); when
-        # net exceeds gross (rare — trailing sales < returns is a data
-        # oddity, not something to boost the forecast for) we clamp the
-        # ratio at 1.0 so the toggle can only ever LOWER demand.
-        wv_net = weighted_net_by_sku.get(sku, weighted_by_sku.get(sku, 0.0))
-        returns_view: dict = {
-            "weighted_velocity": round(wv_net, 2),
-            "orders_7d": int(orders_7d_net_by_sku.get(sku, orders_7d_by_sku.get(sku, 0))),
-            "orders_30d": int(orders_30d_net_by_sku.get(sku, orders_30d_by_sku.get(sku, 0))),
-            "orders_60d": int(orders_60d_net_by_sku.get(sku, orders_60d_by_sku.get(sku, 0))),
-            "returns_7d": int(returns_7d_by_sku.get(sku, 0)),
-            "returns_30d": int(returns_30d_by_sku.get(sku, 0)),
-            "returns_60d": int(returns_60d_by_sku.get(sku, 0)),
-        }
-        if wv > 0:
-            scale = min(1.0, wv_net / wv) if wv_net >= 0 else 0.0
-            returns_view["next_30_day_forecast"] = round(next30 * scale, 1)
-            returns_view["forecast_scale"] = round(scale, 4)
-            if wv_net > 0:
-                days_of_cover_net = round(stock_forward / wv_net, 1)
-                stockout_date_net_obj = today + timedelta(days=int(stock_forward / wv_net))
-                returns_view["days_of_cover"] = days_of_cover_net
-                returns_view["stockout_date"] = stockout_date_net_obj.isoformat()
+            # Override the forecast-cache reorder numbers with values derived
+            # from the weighted velocity so the whole restock row tells one
+            # consistent story: Orders/day, Days of cover, Stockout on, and
+            # both Ship-by dates all trust the same demand signal the seller
+            # sees in the modal. When weighted velocity is 0 (brand new SKU
+            # with no trailing sales), fall through to the Prophet-driven
+            # cached values so we don't clobber a legitimate horizon-based
+            # forecast with zeros.
+            wv = weighted_by_sku.get(sku, 0.0)
+            # stock_forward = everything the seller has that will fulfill demand
+            # over the coming period. Composed from the split sub-buckets rather
+            # than raw `reserved` because Amazon's `reservedQuantity` is a
+            # composite that INCLUDES pendingTransshipment (== fc_transfer);
+            # adding raw `reserved + fc_transfer` would double-count those units
+            # if ingest ever changes to store the raw composite. Sub-buckets
+            # (customer_order + fc_processing + fc_transfer) are guaranteed
+            # disjoint, so summing them + the inbound legs is safe.
+            stock_forward = (
+                available
+                + reserved_customer_order
+                + reserved_fc_processing
+                + fc_transfer
+                + sent_to_fba
+                + inbound_working
+            )
+            days_of_cover_val = reorder.get("days_of_cover")
+            stockout_date_iso = reorder.get("stockout_date")
+            reorder_by_date_air_iso = reorder.get("reorder_by_date_air")
+            reorder_by_date_ocean_iso = reorder.get("reorder_by_date_ocean")
+            if wv > 0:
+                days_of_cover_val = round(stock_forward / wv, 1)
+                stockout_date_obj = today + timedelta(days=int(stock_forward / wv))
+                stockout_date_iso = stockout_date_obj.isoformat()
                 air_transit = int(reorder.get("air_transit_days") or 10)
                 ocean_transit = int(reorder.get("ocean_transit_days") or 45)
-                returns_view["reorder_by_date_air"] = max(
-                    today, stockout_date_net_obj - timedelta(days=air_transit),
+                # Clamp ship-by dates to today when they'd be in the past —
+                # a past date is confusing UI; "ship NOW" is the message.
+                reorder_by_date_air_iso = max(
+                    today, stockout_date_obj - timedelta(days=air_transit),
                 ).isoformat()
-                returns_view["reorder_by_date_ocean"] = max(
-                    today, stockout_date_net_obj - timedelta(days=ocean_transit),
+                reorder_by_date_ocean_iso = max(
+                    today, stockout_date_obj - timedelta(days=ocean_transit),
                 ).isoformat()
+
+            # Days until next-order deadline (based on air ship-by date).
+            days_until_next_order = None
+            if reorder_by_date_air_iso:
+                try:
+                    d = datetime.fromisoformat(reorder_by_date_air_iso).date()
+                    days_until_next_order = (d - today).days
+                except ValueError:
+                    pass
+
+            aged_sup = aged_supplements.get(sku) or {}
+            historical_dos = aged_sup.get("historical_days_of_supply")
+            amazon_rec_qty = aged_sup.get("recommended_ship_in_quantity")
+            amazon_rec_date = aged_sup.get("recommended_ship_in_date")
+
+            ps = settings_by_sku.get(sku) or {}
+            is_buyable = bool(inv_row.get("is_buyable", True))
+            # For non-buyable SKUs, zero the reorder recommendation regardless
+            # of what the forecast says — no point telling the seller to ship
+            # 500 units of an inactive listing.
+            recommended_po_qty = reorder.get("recommended_po_qty", 0) if is_buyable else 0
+
+            # Returns-view overrides — computed off the same stock_forward so
+            # the toggle only changes the demand denominator, not the on-hand
+            # numerator. Forecast + ship-by dates scale by (net/gross); when
+            # net exceeds gross (rare — trailing sales < returns is a data
+            # oddity, not something to boost the forecast for) we clamp the
+            # ratio at 1.0 so the toggle can only ever LOWER demand.
+            wv_net = weighted_net_by_sku.get(sku, weighted_by_sku.get(sku, 0.0))
+            returns_view: dict = {
+                "weighted_velocity": round(wv_net, 2),
+                "orders_7d": int(orders_7d_net_by_sku.get(sku, orders_7d_by_sku.get(sku, 0))),
+                "orders_30d": int(orders_30d_net_by_sku.get(sku, orders_30d_by_sku.get(sku, 0))),
+                "orders_60d": int(orders_60d_net_by_sku.get(sku, orders_60d_by_sku.get(sku, 0))),
+                "returns_7d": int(returns_7d_by_sku.get(sku, 0)),
+                "returns_30d": int(returns_30d_by_sku.get(sku, 0)),
+                "returns_60d": int(returns_60d_by_sku.get(sku, 0)),
+            }
+            if wv > 0:
+                scale = min(1.0, wv_net / wv) if wv_net >= 0 else 0.0
+                returns_view["next_30_day_forecast"] = round(next30 * scale, 1)
+                returns_view["forecast_scale"] = round(scale, 4)
+                if wv_net > 0:
+                    days_of_cover_net = round(stock_forward / wv_net, 1)
+                    stockout_date_net_obj = today + timedelta(days=int(stock_forward / wv_net))
+                    returns_view["days_of_cover"] = days_of_cover_net
+                    returns_view["stockout_date"] = stockout_date_net_obj.isoformat()
+                    air_transit = int(reorder.get("air_transit_days") or 10)
+                    ocean_transit = int(reorder.get("ocean_transit_days") or 45)
+                    returns_view["reorder_by_date_air"] = max(
+                        today, stockout_date_net_obj - timedelta(days=air_transit),
+                    ).isoformat()
+                    returns_view["reorder_by_date_ocean"] = max(
+                        today, stockout_date_net_obj - timedelta(days=ocean_transit),
+                    ).isoformat()
+                else:
+                    # Net velocity zeroed out: no forward demand at all.
+                    returns_view["days_of_cover"] = None
+                    returns_view["stockout_date"] = None
+                    returns_view["reorder_by_date_air"] = None
+                    returns_view["reorder_by_date_ocean"] = None
             else:
-                # Net velocity zeroed out: no forward demand at all.
-                returns_view["days_of_cover"] = None
-                returns_view["stockout_date"] = None
-                returns_view["reorder_by_date_air"] = None
-                returns_view["reorder_by_date_ocean"] = None
-        else:
-            returns_view["next_30_day_forecast"] = round(next30, 1)
-            returns_view["forecast_scale"] = 1.0
-            returns_view["days_of_cover"] = days_of_cover_val
-            returns_view["stockout_date"] = stockout_date_iso
-            returns_view["reorder_by_date_air"] = reorder_by_date_air_iso
-            returns_view["reorder_by_date_ocean"] = reorder_by_date_ocean_iso
+                returns_view["next_30_day_forecast"] = round(next30, 1)
+                returns_view["forecast_scale"] = 1.0
+                returns_view["days_of_cover"] = days_of_cover_val
+                returns_view["stockout_date"] = stockout_date_iso
+                returns_view["reorder_by_date_air"] = reorder_by_date_air_iso
+                returns_view["reorder_by_date_ocean"] = reorder_by_date_ocean_iso
 
-        # Winning model + its backtest accuracy for the "Best model"
-        # column. Sourced from the picker's cached backtest slice so
-        # it stays consistent with the drawer's "Prediction accuracy"
-        # card. Best model can be prophet / naive / lgbm / xgb /
-        # ensemble / deepar / tft depending on which won the last
-        # nightly picker.
-        _bt = c.get("backtest") or {}
-        _bt_metrics = _bt.get("metrics") or {}
-        best_model_name = _bt.get("method") or c.get("method")
-        best_model_accuracy_pct = _bt_metrics.get("accuracy_pct")
+            # Winning model + its backtest accuracy for the "Best model"
+            # column. Sourced from the picker's cached backtest slice so
+            # it stays consistent with the drawer's "Prediction accuracy"
+            # card. Best model can be prophet / naive / lgbm / xgb /
+            # ensemble / deepar / tft depending on which won the last
+            # nightly picker.
+            _bt = c.get("backtest") or {}
+            _bt_metrics = _bt.get("metrics") or {}
+            best_model_name = _bt.get("method") or c.get("method")
+            best_model_accuracy_pct = _bt_metrics.get("accuracy_pct")
 
-        # Q4 backtest join — populated when the user has run
-        # POST /forecasting/q4-backtest for this SKU (either as part of
-        # the fleet run or via the per-SKU button). Null out cleanly
-        # when the SKU hasn't been tested yet — FE renders "—".
-        _q4 = q4_by_sku.get(sku) or {}
-        _q4_winner = _q4.get("winner") or {}
-        q4_best_source = _q4_winner.get("source")
-        q4_best_name = _q4_winner.get("name")
-        q4_accuracy_pct = _q4_winner.get("accuracy_pct")
-        q4_actual_units = _q4.get("actual_q4_units")
-        q4_year = _q4.get("year")
-        # Why there is no score, when there is no score. Result docs written
-        # before `not_scorable` existed still describe the zero-demand case
-        # well enough to derive it here, so those blanks get an explanation
-        # without waiting for a re-run.
-        q4_not_scorable = _q4.get("not_scorable")
-        if q4_not_scorable is None and _q4:
-            if _q4.get("skipped"):
-                q4_not_scorable = "no_pre_q4_history"
-            elif not _q4_winner and q4_actual_units == 0:
-                q4_not_scorable = "no_q4_demand"
-            elif (
-                _q4_winner.get("accuracy_pct") == 0
-                and _q4_predictions_all_zero(_q4)
-            ):
-                q4_not_scorable = "no_pre_q4_history"
+            # Q4 backtest join — populated when the user has run
+            # POST /forecasting/q4-backtest for this SKU (either as part of
+            # the fleet run or via the per-SKU button). Null out cleanly
+            # when the SKU hasn't been tested yet — FE renders "—".
+            _q4 = q4_by_sku.get(sku) or {}
+            _q4_winner = _q4.get("winner") or {}
+            q4_best_source = _q4_winner.get("source")
+            q4_best_name = _q4_winner.get("name")
+            q4_accuracy_pct = _q4_winner.get("accuracy_pct")
+            q4_actual_units = _q4.get("actual_q4_units")
+            q4_year = _q4.get("year")
+            # Why there is no score, when there is no score. Result docs written
+            # before `not_scorable` existed still describe the zero-demand case
+            # well enough to derive it here, so those blanks get an explanation
+            # without waiting for a re-run.
+            q4_not_scorable = _q4.get("not_scorable")
+            if q4_not_scorable is None and _q4:
+                if _q4.get("skipped"):
+                    q4_not_scorable = "no_pre_q4_history"
+                elif not _q4_winner and q4_actual_units == 0:
+                    q4_not_scorable = "no_q4_demand"
+                elif (
+                    _q4_winner.get("accuracy_pct") == 0
+                    and _q4_predictions_all_zero(_q4)
+                ):
+                    q4_not_scorable = "no_pre_q4_history"
 
-        rows.append({
-            "sku": sku,
-            "asin": c.get("asin"),
-            "fnsku": inv_row.get("fnsku"),
-            "method": c.get("method"),
-            "best_model_name": best_model_name,
-            "best_model_accuracy_pct": best_model_accuracy_pct,
-            "q4_best_source": q4_best_source,   # "model" | "config" | null
-            "q4_best_name": q4_best_name,       # e.g. "prophet" or "Mid-balanced"
-            "q4_accuracy_pct": q4_accuracy_pct,
-            "q4_actual_units": q4_actual_units,
-            "q4_year": q4_year,
-            "q4_not_scorable": q4_not_scorable,  # null | "no_pre_q4_history" | "no_q4_demand"
-            "is_buyable": is_buyable,
-            "status": inv_row.get("status"),
-            "listing_status": inv_row.get("listing_status"),
-            "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
-            "on_hand": on_hand,
-            "available": available,
-            "reserved": reserved,
-            "reserved_customer_order": reserved_customer_order,
-            "reserved_fc_processing": reserved_fc_processing,
-            "sent_to_fba": sent_to_fba,
-            "inbound_working": inbound_working,
-            "fc_transfer": fc_transfer,
-            "unfulfillable": unfulfillable,
-            "awd_inbound": int(awd_inbound_by_sku.get(sku, 0)),
-            "inbound": reorder.get("inbound", 0),
-            "ordered": int(ordered_by_sku.get(sku) or 0),
-            "avg_daily_demand": reorder.get("avg_daily_demand", 0),
-            "weighted_velocity": round(weighted_by_sku.get(sku, 0.0), 2),
-            "orders_7d": int(orders_7d_by_sku.get(sku, 0)),
-            "orders_30d": int(orders_30d_by_sku.get(sku, 0)),
-            "orders_60d": int(orders_60d_by_sku.get(sku, 0)),
-            "next_30_day_forecast": round(next30, 1),
-            "forecast_p50_daily": forecast_p50_daily,
-            "days_of_cover": days_of_cover_val,
-            "stockout_date": stockout_date_iso,
-            "returns_view": returns_view,
-            "reorder_by_date": reorder.get("reorder_by_date"),
-            "reorder_by_date_air": reorder_by_date_air_iso,
-            "reorder_by_date_ocean": reorder_by_date_ocean_iso,
-            "reorder_by_date_sea": reorder_by_date_ocean_iso,  # legacy alias
-            "days_until_next_order": days_until_next_order,
-            "air_transit_days": reorder.get("air_transit_days"),
-            "ocean_transit_days": reorder.get("ocean_transit_days"),
-            "inbound_shipments_count": reorder.get("inbound_shipments_count", 0),
-            "next_shipment_eta": reorder.get("next_shipment_eta"),
-            "next_shipment_qty": reorder.get("next_shipment_qty"),
-            "recommended_po_qty": recommended_po_qty,
-            "amazon_recommended_ship_qty": amazon_rec_qty,
-            "amazon_recommended_ship_date": amazon_rec_date,
-            "historical_days_of_supply": historical_dos,
-            "unit_cost": unit_cost,
-            "landed_cost": round(landed_cost, 4),
-            "stock_value": stock_value,
-            "missed_profit_est": missed_profit_est,
-            "comment": ps.get("comment") or "",
-            "drivers": drivers,
-        })
-    # Sort: stockouts first (None or low days_of_cover), then ascending.
-    def _sort_key(r):
-        d = r.get("days_of_cover")
-        return (1, 0) if d is None else (0, d)
-    rows.sort(key=_sort_key)
+            rows.append({
+                "sku": sku,
+                "asin": c.get("asin"),
+                "fnsku": inv_row.get("fnsku"),
+                "method": c.get("method"),
+                "best_model_name": best_model_name,
+                "best_model_accuracy_pct": best_model_accuracy_pct,
+                "q4_best_source": q4_best_source,   # "model" | "config" | null
+                "q4_best_name": q4_best_name,       # e.g. "prophet" or "Mid-balanced"
+                "q4_accuracy_pct": q4_accuracy_pct,
+                "q4_actual_units": q4_actual_units,
+                "q4_year": q4_year,
+                "q4_not_scorable": q4_not_scorable,  # null | "no_pre_q4_history" | "no_q4_demand"
+                "is_buyable": is_buyable,
+                "status": inv_row.get("status"),
+                "listing_status": inv_row.get("listing_status"),
+                "generated_at": c.get("generated_at").isoformat() if c.get("generated_at") else None,
+                "on_hand": on_hand,
+                "available": available,
+                "reserved": reserved,
+                "reserved_customer_order": reserved_customer_order,
+                "reserved_fc_processing": reserved_fc_processing,
+                "sent_to_fba": sent_to_fba,
+                "inbound_working": inbound_working,
+                "fc_transfer": fc_transfer,
+                "unfulfillable": unfulfillable,
+                "awd_inbound": int(awd_inbound_by_sku.get(sku, 0)),
+                "inbound": reorder.get("inbound", 0),
+                "ordered": int(ordered_by_sku.get(sku) or 0),
+                "avg_daily_demand": reorder.get("avg_daily_demand", 0),
+                "weighted_velocity": round(weighted_by_sku.get(sku, 0.0), 2),
+                "orders_7d": int(orders_7d_by_sku.get(sku, 0)),
+                "orders_30d": int(orders_30d_by_sku.get(sku, 0)),
+                "orders_60d": int(orders_60d_by_sku.get(sku, 0)),
+                "next_30_day_forecast": round(next30, 1),
+                "forecast_p50_daily": forecast_p50_daily,
+                "days_of_cover": days_of_cover_val,
+                "stockout_date": stockout_date_iso,
+                "returns_view": returns_view,
+                "reorder_by_date": reorder.get("reorder_by_date"),
+                "reorder_by_date_air": reorder_by_date_air_iso,
+                "reorder_by_date_ocean": reorder_by_date_ocean_iso,
+                "reorder_by_date_sea": reorder_by_date_ocean_iso,  # legacy alias
+                "days_until_next_order": days_until_next_order,
+                "air_transit_days": reorder.get("air_transit_days"),
+                "ocean_transit_days": reorder.get("ocean_transit_days"),
+                "inbound_shipments_count": reorder.get("inbound_shipments_count", 0),
+                "next_shipment_eta": reorder.get("next_shipment_eta"),
+                "next_shipment_qty": reorder.get("next_shipment_qty"),
+                "recommended_po_qty": recommended_po_qty,
+                "amazon_recommended_ship_qty": amazon_rec_qty,
+                "amazon_recommended_ship_date": amazon_rec_date,
+                "historical_days_of_supply": historical_dos,
+                "unit_cost": unit_cost,
+                "landed_cost": round(landed_cost, 4),
+                "stock_value": stock_value,
+                "missed_profit_est": missed_profit_est,
+                "comment": ps.get("comment") or "",
+                "drivers": drivers,
+            })
+        # Sort: stockouts first (None or low days_of_cover), then ascending.
+        def _sort_key(r):
+            d = r.get("days_of_cover")
+            return (1, 0) if d is None else (0, d)
+        rows.sort(key=_sort_key)
+        return rows
+
+    rows = await asyncio.to_thread(_compute_rows)
     return {"count": len(rows), "rows": rows}
 
 
