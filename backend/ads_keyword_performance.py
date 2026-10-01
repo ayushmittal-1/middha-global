@@ -19,6 +19,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -138,11 +139,100 @@ async def _request_report(start: str, end: str) -> str:
             "format": "GZIP_JSON",
         },
     }
-    data = await _post_json("report", "/reporting/reports", _REPORT_CREATE_CT, body)
+    try:
+        data = await _post_json("report", "/reporting/reports", _REPORT_CREATE_CT, body)
+    except httpx.HTTPStatusError as e:
+        existing = _duplicate_report_id(e)
+        if not existing:
+            # `_post_json` logs the body but raises httpx's generic "Client
+            # error '425' for url ..." — which is what the seller saw, and it
+            # says nothing about what went wrong. Amazon's body does.
+            raise RuntimeError(_ads_error_text(e)) from e
+        # 425 Too Early — Amazon already holds a report with this exact
+        # configuration and hands back its id instead of building a second
+        # one. Without this the feature could never recover: the window is
+        # derived from the date, so every retry posts a byte-identical
+        # configuration and earns the same 425 forever.
+        print(f"[ads_kw_perf] 425 duplicate — reusing existing report {existing}")
+        return existing
     report_id = (data or {}).get("reportId") or (data or {}).get("id")
     if not report_id:
         raise RuntimeError(f"Amazon did not return a report id: {data}")
     return str(report_id)
+
+
+# A report id as it appears inside a 425 body. Amazon has used bare UUIDs,
+# short opaque tokens, and dotted resource names (`amzn1.rpt....`) here, so
+# match any of them rather than pinning the shape of something we don't
+# control. Dots are allowed INSIDE the id, which means a sentence-ending
+# period can be swept up — `_clean_report_id` trims it back off.
+_REPORT_ID_RE = re.compile(
+    r"(?:report[ _-]?id\W{0,4})([0-9a-zA-Z][0-9a-zA-Z.\-]{7,63})", re.I
+)
+
+
+def _clean_report_id(value: str | None) -> str | None:
+    cleaned = (value or "").strip().strip(".").strip()
+    return cleaned or None
+
+
+def _ads_error_text(err: httpx.HTTPStatusError) -> str:
+    """Render an Ads API failure as something a seller can act on.
+
+    Amazon puts the useful part in the response body; httpx's own message
+    carries only the status and a link to MDN.
+    """
+    resp = err.response
+    if resp is None:
+        return str(err)
+    detail = ""
+    try:
+        payload = resp.json()
+        if isinstance(payload, dict):
+            for key in ("detail", "details", "message", "error_description"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    detail = value.strip()
+                    break
+    except Exception:
+        pass
+    if not detail:
+        detail = (resp.text or "").strip()
+    if not detail:
+        return f"Amazon Ads returned {resp.status_code}."
+    return f"Amazon Ads returned {resp.status_code}: {detail[:400]}"
+
+
+def _duplicate_report_id(err: httpx.HTTPStatusError) -> str | None:
+    """Pull the existing report's id out of a 425 response, or None.
+
+    Amazon documents 425 as "a report with this configuration was already
+    requested" and returns the original id, but not at a stable key — it has
+    appeared as a JSON field and as prose inside `detail`. Both are read
+    here; anything else returns None so the caller re-raises rather than
+    polling an id it invented.
+    """
+    resp = err.response
+    if resp is None or resp.status_code != 425:
+        return None
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        for key in ("reportId", "report_id", "id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return _clean_report_id(value)
+        # Not a field — look through the human-readable members instead.
+        for key in ("detail", "details", "message", "error"):
+            text = payload.get(key)
+            if isinstance(text, str):
+                found = _REPORT_ID_RE.search(text)
+                if found:
+                    return _clean_report_id(found.group(1))
+    found = _REPORT_ID_RE.search(resp.text or "")
+    return _clean_report_id(found.group(1)) if found else None
 
 
 async def _await_report_url(report_id: str) -> str:
