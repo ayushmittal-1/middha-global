@@ -808,6 +808,12 @@ def _fee_window_cache_key(start_iso: str, end_iso: str) -> str:
 # enough that repeated profitability loads were burning the quota on work
 # already done.
 _REPORT_BODY_MAX_BYTES = 12 * 1024 * 1024  # stay well inside Mongo's 16MB cap
+# Checked BEFORE compressing. Measuring a body by compressing it costs two
+# more full copies of it, which on a Brand Analytics week lands at the worst
+# possible moment — right after the parse, with the rows already resident.
+# Nothing this large could fit under the compressed cap anyway, so refusing
+# it on length alone loses no cache hit we would otherwise have had.
+_REPORT_BODY_MAX_CHARS = 32 * 1024 * 1024
 _REPORT_BODY_TTL_DAYS = 45
 _report_body_index_ready = False
 
@@ -854,6 +860,8 @@ async def put_report_body_cache(report_id: str, text: str) -> None:
     """Persist a DONE report body. Oversized bodies are skipped rather than
     risking a document-too-large write — the caller still has the text."""
     if not report_id or not text:
+        return
+    if len(text) > _REPORT_BODY_MAX_CHARS:
         return
     try:
         blob = gzip.compress(text.encode("utf-8"), compresslevel=6)

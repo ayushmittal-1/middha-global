@@ -41,8 +41,52 @@ _ORDERS_CACHE_TTL_S = 30 * 60
 
 # DONE report bodies never change — cache by reportId so profitability does
 # not re-hit getReportDocument (tight quota) on every Apply / every candidate.
+#
+# Bounded by BYTES as well as entry count. The entry count alone was the
+# original OOM: a Brand Analytics search-terms week is hundreds of MB of
+# text, and 64 of those pinned for the process lifetime kills a small
+# instance long before the count cap ever trips. The reports this cache
+# exists for (settlement, fees, profitability) are a few MB at most, so a
+# per-entry cap keeps every intended user while excluding the one body that
+# was never going to be re-read anyway — a BA week is parsed once and then
+# lives in Mongo as per-term docs.
 _REPORT_TEXT_CACHE: dict[str, str] = {}
 _REPORT_TEXT_CACHE_MAX = 64
+# Chars, not bytes — len() on a str is free, encoding it to measure would
+# cost a second full copy, which is the very thing we are avoiding.
+_REPORT_TEXT_CACHE_MAX_ENTRY_CHARS = 8 * 1024 * 1024
+_REPORT_TEXT_CACHE_MAX_TOTAL_CHARS = 64 * 1024 * 1024
+
+
+def _cache_report_text(report_id: str, text: str) -> None:
+    """Memoize a report body, honouring both the entry and total caps.
+
+    Oversized bodies are skipped, not truncated — a partial report would be
+    silently wrong, and the caller already holds the full text either way.
+    Declining to cache only costs a re-fetch.
+    """
+    if not report_id or text is None:
+        return
+    if len(text) > _REPORT_TEXT_CACHE_MAX_ENTRY_CHARS:
+        print(
+            f"[sp-api] report {report_id} body is {len(text) / 1048576:.1f} MB "
+            f"— too large to memoize, skipping cache"
+        )
+        return
+    # Drop any existing copy first so a re-cache doesn't double-count it.
+    _REPORT_TEXT_CACHE.pop(report_id, None)
+    total = sum(len(v) for v in _REPORT_TEXT_CACHE.values()) + len(text)
+    # Evict oldest-first (dicts preserve insertion order) until the new entry
+    # fits under both caps.
+    while _REPORT_TEXT_CACHE and (
+        total > _REPORT_TEXT_CACHE_MAX_TOTAL_CHARS
+        or len(_REPORT_TEXT_CACHE) >= _REPORT_TEXT_CACHE_MAX
+    ):
+        evicted = _REPORT_TEXT_CACHE.pop(next(iter(_REPORT_TEXT_CACHE)))
+        total -= len(evicted)
+    _REPORT_TEXT_CACHE[report_id] = text
+
+
 # Space document GETs so we don't burn the Reports document rate limit.
 _DOC_GET_LOCK: asyncio.Lock | None = None
 _DOC_GET_LAST_TS = 0.0
@@ -3478,7 +3522,9 @@ async def download_report_raw(report_id: str, max_polls: int = 30, poll_interval
 
     Used by the ingest pipeline, which needs every row (not the
     LLM-friendly truncated summary that `download_report` returns).
-    Caches DONE report bodies by reportId for the process lifetime.
+    Caches DONE report bodies by reportId for the process lifetime, subject
+    to `_cache_report_text`'s size caps — a body too large to memoize is
+    still returned, just re-fetched next time.
     """
     cached = _REPORT_TEXT_CACHE.get(report_id)
     if cached is not None:
@@ -3492,7 +3538,7 @@ async def download_report_raw(report_id: str, max_polls: int = 30, poll_interval
 
     persisted = await get_report_body_cache(report_id)
     if persisted is not None:
-        _REPORT_TEXT_CACHE[report_id] = persisted
+        _cache_report_text(report_id, persisted)
         return persisted
 
     for _ in range(max_polls):
@@ -3509,14 +3555,22 @@ async def download_report_raw(report_id: str, max_polls: int = 30, poll_interval
             async with httpx.AsyncClient(timeout=120) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
-            content = resp.content
+                content = resp.content
+                # httpx memoizes the body on the response object, so dropping
+                # `resp` is what actually frees the compressed copy. On a
+                # Brand Analytics week that copy is hundreds of MB and it is
+                # dead the moment we have decompressed it.
+                del resp
             if doc_info.get("compressionAlgorithm") == "GZIP":
-                content = gzip.decompress(content)
+                decompressed = gzip.decompress(content)
+                del content
+                content = decompressed
+                del decompressed
             text = content.decode("utf-8", errors="replace")
-            if len(_REPORT_TEXT_CACHE) >= _REPORT_TEXT_CACHE_MAX:
-                # Drop an arbitrary oldest entry (insertion order in 3.7+).
-                _REPORT_TEXT_CACHE.pop(next(iter(_REPORT_TEXT_CACHE)), None)
-            _REPORT_TEXT_CACHE[report_id] = text
+            # Free the bytes before anything else allocates — from here on the
+            # str is the only full copy of the report we hold.
+            del content
+            _cache_report_text(report_id, text)
             await put_report_body_cache(report_id, text)
             return text
         if processing_status in ("CANCELLED", "FATAL"):
@@ -3601,16 +3655,49 @@ async def fetch_brand_analytics_search_terms(
         raise RuntimeError(f"Brand Analytics report creation failed: {create_resp}")
 
     raw_text = await download_report_raw(report_id, max_polls=30, poll_interval=10)
+    return _parse_brand_analytics_report(raw_text)
 
+
+def _iter_str_lines(s: str):
+    """Yield `s` one line at a time without materializing all of them.
+
+    `io.StringIO(s)` and `s.splitlines()` both duplicate the whole buffer.
+    On a Brand Analytics week that is a second copy of hundreds of MB, at
+    the exact moment the parsed rows are also being built. Walking the
+    existing string with find() keeps only one line resident at a time.
+    """
+    start, n = 0, len(s)
+    while start < n:
+        nl = s.find("\n", start)
+        if nl == -1:
+            yield s[start:]
+            return
+        yield s[start:nl + 1]
+        start = nl + 1
+
+
+def _parse_brand_analytics_report(raw_text: str) -> list[dict]:
+    """Parse a BA search-terms body into rows, holding as few copies as it can.
+
+    One week is millions of rows and the caller batch-writes them to Mongo
+    straight afterwards, so the body and the parsed rows are unavoidably
+    alive together for a moment. Everything on top of those two is not, and
+    this keeps it that way.
+    """
     try:
         data = json.loads(raw_text)
+    except json.JSONDecodeError:
+        pass
+    else:
         if isinstance(data, list):
             return data
         return data.get("dataByDepartmentAndSearchTerm", [])
-    except json.JSONDecodeError:
-        delimiter = "\t" if "\t" in raw_text else ","
-        reader = csv.DictReader(io.StringIO(raw_text), delimiter=delimiter)
-        return list(reader)
+
+    # Delimited fallback. Sniff the delimiter on the first line rather than
+    # scanning the entire body for a tab.
+    first = next(_iter_str_lines(raw_text), "")
+    delimiter = "\t" if "\t" in first else ","
+    return list(csv.DictReader(_iter_str_lines(raw_text), delimiter=delimiter))
 
 def check_keyword_match_types(target_keywords: list[str], brand_analytics_data: list[dict]) -> dict:
     """
