@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -128,3 +129,101 @@ def test_the_window_ends_yesterday_and_covers_the_attribution_period():
     span = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
     assert span == akp.REPORT_WINDOW_DAYS
     assert span >= 14
+
+
+# ── 425 duplicate-report recovery ───────────────────────────────────────────
+#
+# Amazon returns 425 when a report with this exact configuration was already
+# requested, handing back the original id. The window is derived from the
+# date, so every retry posts a byte-identical configuration — without this
+# the feature could never recover on its own, which is what the seller hit:
+# a permanent "Could not check existing keyword performance" banner.
+
+
+def _http_error(status, payload=None, text=None):
+    """An httpx.HTTPStatusError carrying a real response, as _post_json raises."""
+    request = httpx.Request("POST", "https://advertising-api.amazon.com/reporting/reports")
+    if payload is not None:
+        response = httpx.Response(status, json=payload, request=request)
+    else:
+        response = httpx.Response(status, text=text or "", request=request)
+    return httpx.HTTPStatusError("boom", request=request, response=response)
+
+
+def test_report_id_read_from_a_json_field():
+    err = _http_error(425, {"reportId": "amzn1.rpt.abc-123-def-456"})
+    assert akp._duplicate_report_id(err) == "amzn1.rpt.abc-123-def-456"
+
+
+def test_report_id_read_from_prose_in_detail():
+    """Amazon has also returned it inside the human-readable `detail`."""
+    err = _http_error(425, {
+        "detail": "Duplicate report request. Please use reportId: "
+                  "8f14e45f-ceea-467a-9f47-b6c1d8a2e331",
+    })
+    assert akp._duplicate_report_id(err) == "8f14e45f-ceea-467a-9f47-b6c1d8a2e331"
+
+
+def test_report_id_read_from_a_non_json_body():
+    err = _http_error(425, text="report_id 0c5a1b2c3d4e5f67")
+    assert akp._duplicate_report_id(err) == "0c5a1b2c3d4e5f67"
+
+
+def test_a_425_with_no_recoverable_id_is_not_guessed():
+    """Polling an invented id would hang for the full backoff and then lie
+    about why. Better to surface the failure."""
+    err = _http_error(425, {"detail": "Too many requests in flight."})
+    assert akp._duplicate_report_id(err) is None
+
+
+def test_other_statuses_are_never_treated_as_duplicates():
+    """A 400 body can legitimately mention a reportId; only 425 means
+    'reuse this one'."""
+    err = _http_error(400, {"reportId": "amzn1.rpt.should-not-be-used"})
+    assert akp._duplicate_report_id(err) is None
+
+
+@pytest.mark.asyncio
+async def test_request_report_returns_the_existing_id_on_425():
+    err = _http_error(425, {"reportId": "amzn1.rpt.existing-999"})
+    with patch.object(akp, "_post_json", AsyncMock(side_effect=err)):
+        assert await akp._request_report("2026-09-01", "2026-09-30") == \
+            "amzn1.rpt.existing-999"
+
+
+@pytest.mark.asyncio
+async def test_request_report_surfaces_amazons_own_words_when_it_cannot_recover():
+    """The seller used to see httpx's 'Client error 425 ... check MDN',
+    which says nothing. Amazon's body does."""
+    err = _http_error(425, {"detail": "Report quota exhausted for this profile."})
+    with patch.object(akp, "_post_json", AsyncMock(side_effect=err)):
+        with pytest.raises(RuntimeError) as caught:
+            await akp._request_report("2026-09-01", "2026-09-30")
+    message = str(caught.value)
+    assert "Report quota exhausted for this profile." in message
+    assert "425" in message
+    assert "developer.mozilla.org" not in message
+
+
+@pytest.mark.asyncio
+async def test_a_normal_create_still_returns_the_new_report_id():
+    with patch.object(akp, "_post_json", AsyncMock(return_value={"reportId": "new-1"})):
+        assert await akp._request_report("2026-09-01", "2026-09-30") == "new-1"
+
+
+def test_dotted_resource_ids_in_prose_are_recovered():
+    """Amazon's ids are often dotted resource names, not bare UUIDs. An
+    id-shaped pattern that only allowed [A-Za-z0-9-] silently dropped them
+    and the 425 dead-ended exactly as before the fix."""
+    err = _http_error(425, {
+        "detail": "A report with this configuration is already being "
+                  "generated. reportId: amzn1.rpt.already-building-7f3a",
+    })
+    assert akp._duplicate_report_id(err) == "amzn1.rpt.already-building-7f3a"
+
+
+def test_a_sentence_ending_period_is_not_part_of_the_id():
+    """Dots are legal inside the id, so the trailing one has to be trimmed
+    or we would poll a report that does not exist."""
+    err = _http_error(425, {"detail": "Already building, see reportId 8f14e45f-ceea-467a."})
+    assert akp._duplicate_report_id(err) == "8f14e45f-ceea-467a"
